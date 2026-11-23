@@ -1,0 +1,239 @@
+====================================================================
+GOKU - FINAL SMART MASTER ROADMAP (7 PHASES - ZERO-LIMIT V10 GOD-MODE)
+====================================================================
+
+CORE PHILOSOPHY (UNRESTRICTED HUMAN BRAIN + FULL PHONE BODY)
+------------------------------------------------------------
+- ZERO ARTIFICIAL LIMITS: Goku par koi fixed command list, memory
+  cap, ya artificial restriction nahi hogi. Jaise ek insaan apna
+  dimaag aur haath-aankh use karta hai, waise hi Goku phone ke har
+  corner ko bina kisi limit ke control karega.
+- OFFLINE = ONLINE (IDENTICAL POWER): Bina internet ke bhi Goku
+  bilkul online jaisi natural baat-cheet aur poora kaam karega—full
+  on-device LLM, offline Hindi/Hinglish voice, offline screen vision,
+  aur 100% phone body control ke saath. Internet sirf live web search
+  ke liye hoga, aur online seekha har kaam turant offline brain mein
+  save ho jaayega.
+- MULTI-AGENT SWARM + ZERO-DRAIN EFFICIENCY: Goku Planner-Executor-Critic
+  swarm, Predictive Pre-Fetching, aur Dual-Verification se bina galti
+  kiye 0.1s mein kaam karega, aur 3-tier sleep + token compression se
+  phone ki battery aur storage dono bachayega.
+
+OVERVIEW
+--------
+Goku ek personal Jarvis-style autonomous AI agent hai jo poora phone
+control karta hai. Har phase ke baad ek working Mini-Goku milta hai.
+Har kaam pehle 0.05s Intent Fast-Lane ya Direct Local ADB
+(127.0.0.1:5555) se chalta hai aur ADB band hone par automatic
+AccessibilityService par switch ho jaata hai.
+
+--------------------------------------------------------------------
+PHASE 1: CORE SHELL, KEEP-ALIVE WATCHDOG & "GOKU STOP" SAFETY BASE
+--------------------------------------------------------------------
+- Jarvis-style dark dashboard aur glowing Goku Orb.
+- Android 14/15 Keep-Alive Watchdog Engine:
+  * ForegroundService hardening (microphone + specialUse)
+  * Battery Optimization Exemption & auto-restart via WorkManager /
+    NotificationListener taaki OS Goku ko kabhi kill na kare.
+- Instant Emergency Stop: Sirf "Goku stop" / "Goku ruko" voice
+  command (Volume-Down button trigger nahi rakha gaya hai).
+- Safety Confirmation Layer + Dual-Verification Guardrail:
+  * Calls, messages, ya system commands chalane se pehle 0.05s mein
+    contact/number/syntax verify karna aur Hindi voice confirmation
+    ("Haan" / "Nahi") lena.
+- Identical Offline + Online Hindi/Hinglish voice conversation loop
+  (natural Hinglish prosody + neural noise cancellation ke saath).
+- Emergency SOS & Offline Location Beacon: "Goku, Emergency SOS"
+  bolne par bina internet ke SMS se saved contacts ko exact GPS
+  location aur battery status bhejna.
+
+--------------------------------------------------------------------
+PHASE 2: TRIPLE-ENGINE PHONE BODY, SENSORS & STORAGE/BATTERY DOCTOR
+--------------------------------------------------------------------
+- Unrestricted Phone Body Control (No Limits):
+  * App-Intent & Deep-Link Fast Lane (0.05s): Screen touch ya ADB ke
+    bina direct intents se chats, settings, aur actions turant chalana.
+  * Direct Built-in Local ADB (bina kisi third-party Shizuku app ke):
+    - Floating Pairing Input Overlay: Developer Options ke upar hi
+      direct 6-digit pairing code aur PORT daalne ka floating box.
+    - Reboot ke baad mDNS se port auto-discovery.
+    - Auto sequence: pair -> connect -> tcpip 5555 -> connect 127.0.0.1:5555
+    - Zaroori system permissions aur hidden APIs khud unlock/grant karna.
+  * Full Accessibility Control: Screen padhna, buttons tap karna, typing,
+    scrolling, swipe, aur Home / Back / Notifications control.
+- App-Level Deep Surgery (Auto-Ad/Popup Skipper & OTP Autopilot):
+  * Third-party apps aur videos mein aane wale skip-ads, rating
+    popups, aur cookie banners ko 0.2s mein auto-close/skip karna.
+  * Kisi bhi form ya portal par naam, address, email, aur SMS OTP
+    ko bina keyboard khole seedha Memory Vault se auto-fill karna.
+- Parallel Multi-Tasking (`VirtualDisplay` + ADB): Aapki main screen
+  ko disturb kiye bina background virtual screen par ek saath 3-4
+  apps aur tasks chalana.
+- Hardware & Sensor Reflexes + Pocket Deep Hibernation:
+  * Face-Down & Pocket Hibernation: Phone ulta (face-down) ya jeb
+    (Proximity sensor) mein hote hi Silent + DND ON aur background
+    sync freeze karke battery bachana.
+  * Earphone / Bluetooth Whisper Mode: Earphone connect hote hi
+    notifications aur messages sirf aapke kaan mein padh kar sunana.
+  * Charging Auto-Trigger: Raat ko charger lagate hi Dream Mode aur
+    encrypted backup schedule karna.
+- Auto-Repair Phone, Battery & Storage Doctor (ADB Powered):
+  * ADB Aggressive Doze: Baaki heavy apps par `deviceidle force-idle`
+    aur background restriction lagakar 3x battery bachana.
+  * Zero-Bloat Storage Cleaner: WhatsApp duplicates, empty folders,
+    aur heavy app caches (`pm trim-caches`) roz raat clean karke
+    2GB–10GB storage khali rakhna + temp screenshots/logs ko 5 second
+    mein auto-purge karna.
+  * Smart App Freezer: Slow/heavy apps ko freeze/unfreeze karna.
+- Floating System Overlay Orb (har app ke upar 1-tap control + STOP).
+- Notification, Clipboard & File Brain + Ghost Mode.
+- Anti-Theft & Permission Guard:
+  * 3 galat PIN ya lock screen par airplane mode attempt par silent
+    front camera photo + GPS location alert saved family number par.
+  * Background mein chupchap camera/mic/contacts access karne wale
+    apps ki permissions auto-revoke karna.
+
+--------------------------------------------------------------------
+PHASE 3: 3-TIER LOW-POWER EAR, AMBIENT AWARENESS & PROACTIVE SHIELD
+--------------------------------------------------------------------
+- 3-Tier Brain Sleep Architecture + Sub-Second Speculative Pre-Warming:
+  * Tier 1 (Always-On Mic — <25MB RAM): Sirf ultra-light Sherpa-ONNX /
+    Vosk Wake Word engine chalega; baaki brain soya rahega.
+  * Speculative Pre-Warming (0.2s Response): "Hey Goku" sunte hi
+    (aapke poora sentence bolne se pehle) STT, UI tree, aur required
+    engine warm-up ho jaayenge taaki sentence khatam hote hi turant
+    action shuru ho.
+  * Tier 2 (0.1s Reflex): Simple commands bina heavy LLM jagaye
+    turant execute honge.
+  * Tier 3 (On-Demand LLM Auto-Unload): Complex baat-cheet par local
+    AI load hoga aur baat khatam hone ke 15 second baad RAM se unload
+    hokar battery bachayega.
+- Natural Hinglish Prosody, Neural Noise Cancellation & Barge-In:
+  * Traffic, hawa, ya pankhe ke shor mein bhi neural noise suppression
+    se aapki aawaz saaf sunna aur human-like Hinglish rhythm mein
+    jawab dena.
+  * Aapki aawaz ke tone/speed se mood (gussa, thakan, jaldi) samajh
+    kar usi andaaz mein jawab dena + beech mein bolne par turant rukna.
+- Real-Time Ambient Audio & World Awareness:
+  * Earphone laga hone par aas-paas ki important aawazon (doorbell,
+    bike horn, alarm) ko pehchan kar turant alert dena.
+- Lock Screen Wake Screen & Continuous Talk Mode (bina kisi limit ke).
+- Proactive Multi-Sensory Awareness:
+  * Location & Wi-Fi Geofencing: Ghar se bahar nikalte hi Auto-Outdoor
+    Mode (high volume, Smart Call screening ON) active karna.
+  * Screen-Time & Eye-Care Guardian: Der raat lagatar phone chalane
+    par pyaar se rest ke liye remind karna.
+- Adaptive Battery Thresholds & Deep Focus Shield:
+  * 20% battery par background tasks pause, aur 10% par sirf "Hey Goku"
+    aur Emergency SOS active rakhna.
+  * "Goku, kaam mode ON" bolte hi distraction apps aur alerts block.
+
+--------------------------------------------------------------------
+PHASE 4: MULTI-AGENT SWARM BRAIN, LIVE-EYE & EXPENSE GUARDIAN
+--------------------------------------------------------------------
+- Self-Correcting Multi-Agent Swarm (Planner + Executor + Critic):
+  * Planner: Sabse chhota aur fast action path banata hai.
+  * Executor: Intent / ADB / Accessibility se step-by-step chalata hai.
+  * Critic (Watchdog): Har step ke baad screen verify karta hai ki
+    wahi result aaya ya nahi; 1% gadbad par turant undo/fix karta hai.
+- Unified Multi-Model Brain Engine (Offline = Online, Single Model):
+  * Single Shared 4-Bit Quantized GGUF Model (~1.2–1.5 GB): Alag-alag
+    models ki jagah ek hi compact local model chat, reasoning, aur
+    coding sab sambhalega (storage aur RAM dono ki bachat).
+  * Online Multi-Model Router + Auto-Quota Failover: Internet hone par
+    Gemini, DeepSeek, Qwen, Groq, ya NVIDIA NIM mein auto-switch karna.
+- Adaptive Micro-Prompts & Token Compression (3x Fast Brain):
+  * Screen ke sirf kaam ke buttons aur baaton ke core facts extract
+    karke AI ko bhejna taaki offline LLM 3x fast chale, battery half
+    kharch ho, aur online free API quotas bache rahein.
+- Predictive Pre-Fetching & Intent Anticipation (Bolne Se Pehle Taiyari):
+  * Current screen, time, aur recent activity dekh kar agli 3
+    most-likely actions (jaise GPS link, bill PDF, ya contact) pehle
+    se RAM mein prepare rakhna taaki bolte hi 0.1s mein kaam ho.
+- System-2 Deep Thinking, Dual-Verification & Ambiguity Resolver:
+  * Action se pehle 2-3 paths evaluate karke Confidence Score (0–100%)
+    nikalna + 0.05s Dual-Verification guardrail se contact, file risk,
+    aur command syntax verify karna.
+  * Human-Like Ambiguity Resolver: Double-meaning ya duplicate naam
+    (jaise 2 contacts) hone par andaza lagane ki jagah context se best
+    match suggest karke 2-second mein smart sawaal poochhna.
+- Camera Live-Eye Mode: Kisi bike part, medicine strip, ya document
+  par camera point karne par real-time Hinglish mein samjhana.
+- Autonomous Financial & Bill Guardian (Local Expense Tracker):
+  * SMS aur bill alerts locally padh kar petrol, bijli, grocery,
+    aur OTT subscriptions track karna + auto-debit se 24h pehle alert
+    aur mahine ke end mein 10s Hinglish expense summary dena.
+- Temporal & Causal World Model (Smart Timing + Impact Simulation).
+- Multi-Turn Working Memory Stack + Associative Knowledge Graph.
+- Local RAG + Code & Document Brain + Cross-App Workflow Synthesizer.
+- Chained Goal Planner & Personal Digital Twin (Style Cloning).
+- Zero-Bloat Photographic Visual Memory (Text-Only Zstd Vault):
+  * Screen ka text/context Zstandard (Zstd) compressed SQLite + FTS5
+    mein store karna (1 lakh screens = ~15-20 MB storage) + har 7 din
+    mein auto-summarize karke purana data shrink karna.
+- Offline Semantic Media Finder + Goku Studio Debugger.
+
+--------------------------------------------------------------------
+PHASE 5: SPATIAL VISION PILOT, HEADLESS WEB & AUTO-RECOVERY
+--------------------------------------------------------------------
+- Spatial & Visual UI Grounding (Bina Text Wale Icons Samajhna):
+  * Jin apps/games/players mein Accessibility text zero hota hai,
+    unhein on-device icon & layout vision (X, Y coordinates + icon
+    shapes jaise settings gear, send, delete, close) se pehchan kar
+    insaan ki tarah chalana.
+- Event-Driven Zero-Polling Screen Vision + Multi-Step Failure Recovery:
+  * Sirf UI change (`TYPE_WINDOW_STATE_CHANGED`) ya voice command par
+    screen padhna; Screen OFF hote hi 0% CPU par freeze ho jaana.
+  * Plan-B Auto-Pivot & Loop Breaker: Button kaam na karne, slow net,
+    ya unexpected popup/ad aane par khud popup close karke doosra
+    rasta nikalna; ek hi screen par 3 baar atakne par strategy badalna.
+- Autonomous Headless Web & OTP/Captcha Runner:
+  * Bina Chrome khole background web worker se forms bharna, portals
+    check karna, price compare karna, aur SMS se OTP auto-fill karna.
+- Live Screen Co-Pilot, Mistake Blocker & Zero-Copy App Bridge.
+- Background Task Queue (screen disturb kiye bina heavy kaam).
+
+--------------------------------------------------------------------
+PHASE 6: GOAL-DRIVEN SMART CALL & HABIT PREDICTOR
+--------------------------------------------------------------------
+- Smart Call (30s Auto-Answer & Goal-Driven Autonomous Negotiator):
+  * Call aane par 30 second tak aapka wait karna.
+  * Call na uthane par Half-Duplex Speaker Mode (Echo Cancellation ke
+    saath) par caller se offline/online Hindi AI se baat karna.
+  * Goal-Driven Negotiation: Aapke diye gaye instructions (jaise
+    "delivery wala ho toh gate par rakhne bolna, bank wala ho toh
+    mana kar dena") ke hisab se caller se baat karke sirf kaam ki
+    summary aapko dena.
+  * Auto-SMS / WhatsApp Fallback + Spam/unknown caller alerts.
+- Habit Predictor: Aapke roz ke samay aur aadat samajh kar khud
+  tasks suggest karna ("Time ho gaya hai, shuru kar doon?").
+
+--------------------------------------------------------------------
+PHASE 7: AUTONOMOUS SELF-CODING, R&D DISCOVERY & SYNC
+--------------------------------------------------------------------
+- Self-Evolving Zero-Latency Shortcut Compiler + A/B Skill Benchmarking:
+  * Kisi bhi multi-step kaam ko 3 baar repeat karne par Goku use
+    compile karke ek Zero-Latency Macro bana dega, jo agle din sirf
+    1 word par 0.5 second mein poora ho jayega.
+  * Self-Benchmarking & A/B Skill Testing: Jab ek hi kaam ke 2
+    tareeke (Accessibility vs Intent/ADB) hon, toh speed aur success
+    rate benchmark karke hamesha 100% fastest + safest method default rakhna.
+- Nightly Autonomous App-Intent Discovery & Self-Critique (Dream Mode):
+  * Raat ko charging + Wi-Fi par installed apps ke hidden ADB intents
+    aur shortcuts khud scan/discover karke skill library mein add
+    karna + din bhar ki galtiyon ka self-audit karke rules upgrade
+    karna + storage cache clean karna.
+- Autonomous Multi-Tool & Multi-Model Self-Coding Builder:
+  * Instant In-App Live Plugin Engine (0.1s): Bina APK rebuild kiye
+    JSON/QuickJS scripts live load karna.
+  * One-Click `.goku` Modular Skill Export/Import.
+  * Multi-Tool Dev Router: Google AI Studio Browser Automation +
+    GitHub REST API & Actions CI (auto APK build + ADB install) +
+    Termux Ubuntu Proot & OpenCode CLI.
+  * Multi-Model Coding Router + Self-Heal & Snapshot Rollback.
+- Self-Updating & Self-Healing Skills + Smart Teach-by-Example.
+- Zero-Space Cloud Archive (GitHub / Telegram Encrypted Sync):
+  * Purane backups, `.goku` skills, aur media summaries ko encrypted
+    form mein Private GitHub Repo ya Telegram Saved Messages API par
+    move karke local duplicate delete karna (1-tap restore).
+====================================================================

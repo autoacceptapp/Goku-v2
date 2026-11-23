@@ -1,0 +1,6 @@
+{
+  "name": "Goku",
+  "description": "Zero-Limit V10 autonomous AI assistant with hybrid offline/online brain, Hindi/Hinglish voice loop, Local ADB, Accessibility pilot, and background automation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

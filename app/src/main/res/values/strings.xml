@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">Goku</string>
+    <string name="accessibility_service_label">Goku Phone Body Pilot</string>
+    <string name="accessibility_service_description">Event-driven zero-polling screen vision, ad/popup skipper, OTP autopilot, mistake blocker, and teach-by-example automation for Goku V10.</string>
+    <string name="notification_listener_label">Goku Notification &amp; Expense Brain</string>
+    <string name="keep_alive_channel_name">Goku Core Nervous System</string>
+    <string name="keep_alive_channel_desc">Keeps Goku voice ear, watchdog, and autonomous services active.</string>
+    <string name="alert_channel_name">Goku Safety &amp; Alerts</string>
+    <string name="alert_channel_desc">Emergency stop, mistake blocker, SOS, and expense guardian alerts.</string>
+    <string name="orb_stop_label">STOP</string>
+    <string name="cmd_input_hint">Bolo ya likho... (e.g. Torch on, Expense summary, Open WhatsApp)</string>
+    <string name="tab_core">Core</string>
+    <string name="tab_setup">Setup</string>
+    <string name="tab_studio">Studio</string>
+    <string name="tab_vault">Vault</string>
+</resources>
