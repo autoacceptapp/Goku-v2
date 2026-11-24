@@ -16,8 +16,8 @@ android {
     applicationId = "com.aistudio.goku.xk7m9v"
     minSdk = 24
     targetSdk = 36
-    versionCode = 10
-    versionName = "10.0-godmode"
+    versionCode = 11
+    versionName = "10.1-godmode"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -137,6 +137,8 @@ dependencies {
   implementation("com.google.mediapipe:tasks-genai:0.10.22")
   implementation("org.bouncycastle:bcprov-jdk18on:1.79")
   implementation("org.bouncycastle:bcpkix-jdk18on:1.79")
+  implementation("org.mozilla:rhino:1.7.15")
+  implementation("com.github.luben:zstd-jni:1.5.6-8@aar")
   implementation(libs.mlkit.text.recognition)
   // implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)

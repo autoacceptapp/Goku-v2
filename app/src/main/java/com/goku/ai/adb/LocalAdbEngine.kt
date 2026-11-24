@@ -3,6 +3,10 @@ package com.goku.ai.adb
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
@@ -828,12 +832,227 @@ class AdbConnectionClient(private val keyManager: AdbKeyManager) {
 }
 
 /**
+ * Represents a single invisible background step executed on Goku's offscreen VirtualDisplay.
+ */
+sealed class VirtualDisplayStep {
+    data class Tap(val x: Int, val y: Int) : VirtualDisplayStep()
+    data class Swipe(val x1: Int, val y1: Int, val x2: Int, val y2: Int, val durationMs: Int = 250) : VirtualDisplayStep()
+    data class InputText(val text: String) : VirtualDisplayStep()
+    data class KeyEvent(val keyCode: Int) : VirtualDisplayStep()
+    data class Wait(val millis: Long) : VirtualDisplayStep()
+    data class Shell(val command: String) : VirtualDisplayStep()
+}
+
+/**
+ * V10.1 Invisible Background Task Runner via Android `DisplayManager.createVirtualDisplay`.
+ * Creates an offscreen 1080x2400 @ 320dpi virtual display (`"GokuVirtualScreen"`) backed by an
+ * offscreen `ImageReader` surface and routes Local ADB commands (`am start --display <displayId>`,
+ * `input -d <displayId> tap/swipe/text/keyevent`) so Goku can run multi-step app tasks invisibly
+ * without disturbing the user's active screen.
+ */
+class VirtualDisplayBackgroundRunner(
+    private val context: Context,
+    private val adbEngine: LocalAdbEngine
+) {
+    private val displayManager: DisplayManager? =
+        context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+
+    private val lock = Any()
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+
+    private val _virtualDisplayId = MutableStateFlow<Int?>(null)
+    val virtualDisplayId: StateFlow<Int?> = _virtualDisplayId.asStateFlow()
+
+    private val _isActive = MutableStateFlow(false)
+    val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
+
+    fun ensureVirtualDisplay(
+        width: Int = DEFAULT_WIDTH,
+        height: Int = DEFAULT_HEIGHT,
+        densityDpi: Int = DEFAULT_DPI
+    ): Int? = synchronized(lock) {
+        val existingId = virtualDisplay?.display?.displayId
+        if (existingId != null && existingId > 0) {
+            _virtualDisplayId.value = existingId
+            _isActive.value = true
+            return existingId
+        }
+
+        releaseLocked()
+        val dm = displayManager ?: return null
+
+        return runCatching {
+            val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+            // Attempt PUBLIC + OWN_CONTENT_ONLY first; fall back to OWN_CONTENT_ONLY if restricted
+            val vd = runCatching {
+                dm.createVirtualDisplay(
+                    VIRTUAL_DISPLAY_NAME,
+                    width,
+                    height,
+                    densityDpi,
+                    reader.surface,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+                )
+            }.getOrElse {
+                dm.createVirtualDisplay(
+                    VIRTUAL_DISPLAY_NAME,
+                    width,
+                    height,
+                    densityDpi,
+                    reader.surface,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+                )
+            }
+
+            if (vd == null) {
+                runCatching { reader.close() }
+                return null
+            }
+
+            imageReader = reader
+            virtualDisplay = vd
+            val displayId = vd.display.displayId
+            _virtualDisplayId.value = displayId
+            _isActive.value = true
+            displayId
+        }.getOrElse {
+            releaseLocked()
+            null
+        }
+    }
+
+    suspend fun launchAppInBackground(
+        packageName: String,
+        activityComponent: String? = null
+    ): AdbCommandResult = withContext(Dispatchers.IO) {
+        val start = System.currentTimeMillis()
+        val displayId = ensureVirtualDisplay()
+            ?: return@withContext AdbCommandResult(
+                success = false,
+                output = "Unable to allocate GokuVirtualScreen offscreen display.",
+                viaAdb = false,
+                latencyMs = System.currentTimeMillis() - start
+            )
+
+        val safePkg = packageName.replace(Regex("[^a-zA-Z0-9._]"), "")
+        val component = activityComponent?.replace(Regex("[^a-zA-Z0-9._/$]"), "")
+            ?: resolveLauncherComponent(safePkg)
+
+        val cmd = if (!component.isNullOrBlank()) {
+            "am start --display $displayId -n $component"
+        } else {
+            "am start --display $displayId -a android.intent.action.MAIN -c android.intent.category.LAUNCHER $safePkg"
+        }
+        adbEngine.execShellCommand(cmd)
+    }
+
+    suspend fun tapOnVirtualDisplay(x: Int, y: Int): AdbCommandResult {
+        val displayId = ensureVirtualDisplay()
+            ?: return AdbCommandResult(false, "GokuVirtualScreen unavailable.", false, 0L)
+        return adbEngine.execShellCommand("input -d $displayId tap $x $y")
+    }
+
+    suspend fun swipeOnVirtualDisplay(
+        x1: Int,
+        y1: Int,
+        x2: Int,
+        y2: Int,
+        durationMs: Int = 250
+    ): AdbCommandResult {
+        val displayId = ensureVirtualDisplay()
+            ?: return AdbCommandResult(false, "GokuVirtualScreen unavailable.", false, 0L)
+        return adbEngine.execShellCommand("input -d $displayId swipe $x1 $y1 $x2 $y2 $durationMs")
+    }
+
+    suspend fun inputTextOnVirtualDisplay(text: String): AdbCommandResult {
+        val displayId = ensureVirtualDisplay()
+            ?: return AdbCommandResult(false, "GokuVirtualScreen unavailable.", false, 0L)
+        val escaped = text.replace(" ", "%s").replace("\"", "").replace("'", "")
+        return adbEngine.execShellCommand("input -d $displayId text $escaped")
+    }
+
+    suspend fun pressKeyOnVirtualDisplay(keyCode: Int): AdbCommandResult {
+        val displayId = ensureVirtualDisplay()
+            ?: return AdbCommandResult(false, "GokuVirtualScreen unavailable.", false, 0L)
+        return adbEngine.execShellCommand("input -d $displayId keyevent $keyCode")
+    }
+
+    /**
+     * Runs a complete multi-step app workflow invisibly on `GokuVirtualScreen` without
+     * switching or interrupting the user's active foreground display.
+     */
+    suspend fun runBackgroundTaskSequence(
+        packageName: String,
+        steps: List<VirtualDisplayStep>,
+        releaseAfter: Boolean = false
+    ): List<AdbCommandResult> = withContext(Dispatchers.IO) {
+        val results = mutableListOf<AdbCommandResult>()
+        val launchRes = launchAppInBackground(packageName)
+        results.add(launchRes)
+        if (!launchRes.success) {
+            if (releaseAfter) releaseVirtualDisplay()
+            return@withContext results
+        }
+        delay(650L)
+
+        for (step in steps) {
+            val res = when (step) {
+                is VirtualDisplayStep.Tap -> tapOnVirtualDisplay(step.x, step.y)
+                is VirtualDisplayStep.Swipe -> swipeOnVirtualDisplay(step.x1, step.y1, step.x2, step.y2, step.durationMs)
+                is VirtualDisplayStep.InputText -> inputTextOnVirtualDisplay(step.text)
+                is VirtualDisplayStep.KeyEvent -> pressKeyOnVirtualDisplay(step.keyCode)
+                is VirtualDisplayStep.Wait -> {
+                    delay(step.millis.coerceIn(0L, 10_000L))
+                    AdbCommandResult(true, "Waited ${step.millis}ms", viaAdb = true, latencyMs = step.millis)
+                }
+                is VirtualDisplayStep.Shell -> adbEngine.execShellCommand(step.command)
+            }
+            results.add(res)
+            if (!res.success) break
+        }
+
+        if (releaseAfter) releaseVirtualDisplay()
+        results
+    }
+
+    fun releaseVirtualDisplay() = synchronized(lock) {
+        releaseLocked()
+    }
+
+    private fun releaseLocked() {
+        runCatching { virtualDisplay?.release() }
+        runCatching { imageReader?.close() }
+        virtualDisplay = null
+        imageReader = null
+        _virtualDisplayId.value = null
+        _isActive.value = false
+    }
+
+    private fun resolveLauncherComponent(packageName: String): String? {
+        return runCatching {
+            val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
+            launchIntent?.component?.flattenToShortString()
+        }.getOrNull()
+    }
+
+    companion object {
+        const val VIRTUAL_DISPLAY_NAME = "GokuVirtualScreen"
+        const val DEFAULT_WIDTH = 1080
+        const val DEFAULT_HEIGHT = 2400
+        const val DEFAULT_DPI = 320
+    }
+}
+
+/**
  * Pure-Kotlin Android 11+ Local ADB Engine (Zero Shizuku Required).
  *
  * Includes:
  * - `AdbKeyManager` (BouncyCastle 2048-bit RSA + X.509 cert persisted in `filesDir/adb_keys/`)
  * - `AdbWirelessPairingClient` (TLS 1.3 + Conscrypt Keying Material + Ed25519 SPAKE2 + AES-GCM PeerInfo)
  * - `AdbConnectionClient` (mDNS `_adb-tls-connect._tcp` -> `tcpip:5555` -> persistent `127.0.0.1:5555`)
+ * - `VirtualDisplayBackgroundRunner` (1080x2400 @ 320dpi offscreen VirtualDisplay + `--display` / `input -d` routing)
  * - Full shell executor (`pm disable-user`, `pm enable`, `pm trim-caches`, `dumpsys deviceidle force-idle`,
  *   `input tap/swipe/text`), loop-breaker timeout, and seamless auto-fallback to `GokuAccessibilityService`.
  */
@@ -843,6 +1062,9 @@ class LocalAdbEngine(private val context: Context) {
         context.getSystemService(Context.NSD_SERVICE) as? NsdManager
 
     val keyManager = AdbKeyManager(context.applicationContext)
+    val virtualDisplayRunner: VirtualDisplayBackgroundRunner by lazy {
+        VirtualDisplayBackgroundRunner(context.applicationContext, this)
+    }
     private val pairingClient = AdbWirelessPairingClient(keyManager)
     private val connectionClient = AdbConnectionClient(keyManager)
 

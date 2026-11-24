@@ -2,13 +2,22 @@ package com.goku.ai.body
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.annotation.SuppressLint
 import android.content.Context
+import android.content.res.Resources
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.goku.ai.adb.LocalAdbEngine
 import com.goku.ai.data.GokuVaultRepository
 import com.goku.ai.voice.GokuKillSwitch
@@ -20,9 +29,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
+import kotlin.coroutines.resume
 
 // ============================================================================
 // 1. LIVE OTP BUS, MISTAKE BLOCKER BUS, TEACH RECORDER & ZERO-COPY BRIDGE
@@ -146,6 +159,339 @@ object ZeroCopyAppBridge {
 }
 
 // ============================================================================
+// 1B. SAFE AD-SKIPPER GUARD + SPATIAL ICON NAVIGATOR + HEADLESS WEB WORKER
+// ============================================================================
+
+/**
+ * Bug #5 Fix: Protects banking, UPI, payment, system settings, and security packages
+ * from automatic ad/popup clicking so Goku NEVER auto-clicks "dismiss" or "not now"
+ * inside financial transactions, permissions, or system dialogs.
+ */
+object SafeAdSkipGuard {
+    private val PROTECTED_PACKAGES = setOf(
+        "com.google.android.apps.nbu.paisa.user",
+        "com.phonepe.app",
+        "net.one97.paytm",
+        "in.org.npci.upiapp",
+        "com.android.settings",
+        "com.android.packageinstaller",
+        "com.google.android.packageinstaller",
+        "com.android.permissioncontroller",
+        "com.google.android.permissioncontroller",
+        "com.android.systemui"
+    )
+
+    private val PROTECTED_PACKAGE_TOKENS = listOf(
+        "bank", "upi", "pay", "wallet", "bhim", "sbi", "hdfc", "icici", "axis",
+        "kotak", "cred", "finance", "auth", "security", "knox", "packageinstaller",
+        "permissioncontroller", "settings"
+    )
+
+    private val SENSITIVE_DIALOG_KEYWORDS = listOf(
+        "otp", "upi pin", "enter pin", "mpin", "rupee", "₹", "payment",
+        "transfer", "debit", "credit card", "cvv", "allow", "permission",
+        "password", "biometric", "fingerprint", "factory reset", "uninstall"
+    )
+
+    fun isProtectedPackage(packageName: String): Boolean {
+        val pkg = packageName.lowercase(Locale.ROOT).trim()
+        if (pkg.isEmpty()) return true
+        if (pkg in PROTECTED_PACKAGES) return true
+        return PROTECTED_PACKAGE_TOKENS.any { pkg.contains(it) }
+    }
+
+    fun containsSensitiveDialogContext(screenText: String): Boolean {
+        val low = screenText.lowercase(Locale.ROOT)
+        return SENSITIVE_DIALOG_KEYWORDS.any { low.contains(it) }
+    }
+}
+
+/**
+ * Blueprint Feature — Spatial Icon Coordinate Heuristics:
+ * Locates unlabeled clickable `ImageButton` / `ImageView` / icon-only nodes using semantic
+ * `contentDescription` / `viewIdResourceName` tokens (`send`, `close`, `back`, `search`,
+ * `menu`, `play`, `mic`, `share`, etc.) combined with canonical Android screen-region bounds.
+ */
+object SpatialIconNavigator {
+    private val ICON_SYNONYMS: Map<String, List<String>> = mapOf(
+        "send" to listOf("send", "submit", "post", "bhejo", "reply", "paper_plane", "chat_send"),
+        "close" to listOf("close", "dismiss", "cancel", "clear", "cross", "band", "exit", "ic_close"),
+        "back" to listOf("back", "navigate up", "up", "peeche", "return", "arrow_back"),
+        "search" to listOf("search", "find", "khojo", "magnifier", "query", "ic_search"),
+        "menu" to listOf("menu", "drawer", "navigation", "hamburger", "options", "more"),
+        "play" to listOf("play", "resume", "start", "chala", "watch", "player_play"),
+        "pause" to listOf("pause", "stop", "rok", "player_pause"),
+        "mic" to listOf("mic", "voice", "record", "audio", "speak"),
+        "camera" to listOf("camera", "photo", "capture", "shutter", "snap"),
+        "share" to listOf("share", "forward", "bhejo"),
+        "add" to listOf("add", "new", "compose", "create", "plus", "fab")
+    )
+
+    fun findUnlabeledIconNode(
+        allNodes: List<AccessibilityNodeInfo>,
+        targetQuery: String,
+        screenWidth: Int,
+        screenHeight: Int
+    ): AccessibilityNodeInfo? {
+        val query = targetQuery.lowercase(Locale.ROOT).trim()
+        if (query.isEmpty()) return null
+
+        val canonicalKey = ICON_SYNONYMS.entries.firstOrNull { (k, aliases) ->
+            query == k || aliases.any { query.contains(it) }
+        }?.key
+        val searchTokens = buildList {
+            add(query)
+            if (canonicalKey != null) {
+                add(canonicalKey)
+                addAll(ICON_SYNONYMS[canonicalKey].orEmpty())
+            }
+        }.distinct()
+
+        val w = screenWidth.coerceAtLeast(720).toFloat()
+        val h = screenHeight.coerceAtLeast(1280).toFloat()
+        val rect = Rect()
+
+        var bestNode: AccessibilityNodeInfo? = null
+        var bestScore = 0
+
+        for (node in allNodes) {
+            val cls = node.className?.toString().orEmpty()
+            val isIconClass = cls.contains("ImageButton", ignoreCase = true) ||
+                cls.contains("ImageView", ignoreCase = true) ||
+                cls.contains("FloatingActionButton", ignoreCase = true) ||
+                (node.isClickable && node.text.isNullOrBlank())
+            if (!isIconClass) continue
+
+            node.getBoundsInScreen(rect)
+            if (rect.isEmpty || rect.width() <= 8 || rect.height() <= 8) continue
+            // Skip full-screen background containers
+            if (rect.width() > (w * 0.65f) && rect.height() > (h * 0.35f)) continue
+
+            val desc = node.contentDescription?.toString()?.lowercase(Locale.ROOT).orEmpty()
+            val resId = node.viewIdResourceName?.lowercase(Locale.ROOT)?.substringAfterLast('/').orEmpty()
+
+            var score = 0
+            for (tok in searchTokens) {
+                if (desc == tok || resId == tok) score += 100
+                else if (desc.contains(tok)) score += 65
+                else if (resId.contains(tok)) score += 55
+            }
+
+            // Spatial region heuristics for icon-only buttons lacking descriptive IDs
+            val cx = rect.exactCenterX()
+            val cy = rect.exactCenterY()
+            val regionBonus = when (canonicalKey) {
+                "back", "menu" -> if (cy < h * 0.16f && cx < w * 0.25f) 38 else 0
+                "close" -> if (cy < h * 0.22f && cx > w * 0.72f) 38 else 0
+                "search" -> if (cy < h * 0.18f && cx > w * 0.60f) 32 else 0
+                "send", "mic", "add" -> if (cy > h * 0.68f && cx > w * 0.72f) 38 else 0
+                "play", "pause" -> if (cx in (w * 0.22f)..(w * 0.78f) && cy in (h * 0.20f)..(h * 0.78f)) 28 else 0
+                else -> 0
+            }
+            score += regionBonus
+            if (node.isClickable) score += 10
+
+            // Require at least a real token match OR strong canonical spatial match (>= 45)
+            if (score >= 45 && score > bestScore) {
+                bestScore = score
+                bestNode = node
+            }
+        }
+        return bestNode
+    }
+}
+
+/**
+ * Blueprint Feature — Headless Background WebView Automation Worker:
+ * Runs an offscreen WebView on the main thread with strict security settings (HTTPS-only,
+ * no file/content URI access) to extract clean webpage text or auto-fill saved Memory Vault
+ * profile fields silently in the background.
+ */
+class HeadlessWebAutomationWorker(private val context: Context) {
+
+    @SuppressLint("SetJavaScriptEnabled")
+    suspend fun fetchCleanPageText(url: String, maxChars: Int = 2400): Result<String> {
+        val cleanUrl = normalizeHttpsUrl(url)
+            ?: return Result.failure(IllegalArgumentException("Only HTTPS URLs are supported by HeadlessWebAutomationWorker."))
+
+        return executeOnOffscreenWebView(cleanUrl) { webView, complete ->
+            val js = """
+                (function() {
+                    try {
+                        var title = document.title || '';
+                        var body = (document.body && document.body.innerText) ? document.body.innerText : '';
+                        return (title ? title + ' — ' : '') + body.replace(/\s+/g, ' ').trim();
+                    } catch (e) {
+                        return '';
+                    }
+                })();
+            """.trimIndent()
+            webView.evaluateJavascript(js) { rawJson ->
+                val text = decodeJsString(rawJson).take(maxChars).trim()
+                if (text.isNotBlank()) complete(Result.success(text))
+                else complete(Result.failure(IllegalStateException("Page loaded but contained no readable text.")))
+            }
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    suspend fun autoFillFormFromVault(url: String, vaultFields: Map<String, String>): Result<String> {
+        val cleanUrl = normalizeHttpsUrl(url)
+            ?: return Result.failure(IllegalArgumentException("Only HTTPS URLs are supported by HeadlessWebAutomationWorker."))
+        if (vaultFields.isEmpty()) {
+            return Result.failure(IllegalStateException("Memory Vault mein koi profile fields saved nahi hain."))
+        }
+
+        val fieldsJson = JSONObject().apply {
+            vaultFields.entries.take(25).forEach { (k, v) -> put(k.lowercase(Locale.ROOT), v.take(160)) }
+        }.toString()
+
+        return executeOnOffscreenWebView(cleanUrl) { webView, complete ->
+            val js = """
+                (function() {
+                    try {
+                        var vault = $fieldsJson;
+                        var inputs = document.querySelectorAll('input, textarea');
+                        var filled = [];
+                        for (var i = 0; i < inputs.length; i++) {
+                            var el = inputs[i];
+                            var type = (el.type || '').toLowerCase();
+                            if (type === 'hidden' || type === 'password' || type === 'submit' || el.disabled || el.readOnly) continue;
+                            var meta = ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.autocomplete || '')).toLowerCase();
+                            for (var key in vault) {
+                                if (!vault.hasOwnProperty(key)) continue;
+                                if (meta.indexOf(key) !== -1 ||
+                                    (key.indexOf('email') !== -1 && (type === 'email' || meta.indexOf('mail') !== -1)) ||
+                                    (key.indexOf('phone') !== -1 && (type === 'tel' || meta.indexOf('mobile') !== -1 || meta.indexOf('phone') !== -1)) ||
+                                    (key.indexOf('name') !== -1 && meta.indexOf('name') !== -1)) {
+                                    el.value = vault[key];
+                                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                                    filled.push(key);
+                                    break;
+                                }
+                            }
+                        }
+                        return JSON.stringify({ count: filled.length, fields: filled, title: document.title || '' });
+                    } catch (e) {
+                        return JSON.stringify({ count: 0, error: String(e) });
+                    }
+                })();
+            """.trimIndent()
+            webView.evaluateJavascript(js) { rawJson ->
+                val decoded = decodeJsString(rawJson)
+                val parsed = runCatching { JSONObject(decoded) }.getOrNull()
+                val count = parsed?.optInt("count", 0) ?: 0
+                val title = parsed?.optString("title", "").orEmpty()
+                val fieldsArr = parsed?.optJSONArray("fields")
+                val names = buildList {
+                    if (fieldsArr != null) {
+                        for (i in 0 until fieldsArr.length()) add(fieldsArr.optString(i))
+                    }
+                }.distinct().joinToString(", ")
+                if (count > 0) {
+                    complete(Result.success("Headless WebView ne '$title' par $count fields auto-fill kar diye ($names)."))
+                } else {
+                    complete(Result.success("Headless WebView ne '$title' load kiya, par koi matching editable form field nahi mila."))
+                }
+            }
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun executeOnOffscreenWebView(
+        httpsUrl: String,
+        onLoaded: (WebView, (Result<String>) -> Unit) -> Unit
+    ): Result<String> {
+        return withTimeoutOrNull(16_000L) {
+            withContext(Dispatchers.Main) {
+                suspendCancellableCoroutine<Result<String>> { cont ->
+                    val webView = runCatching { WebView(context.applicationContext) }.getOrNull()
+                    if (webView == null) {
+                        if (cont.isActive) cont.resume(Result.failure(IllegalStateException("WebView unavailable on this device.")))
+                        return@suspendCancellableCoroutine
+                    }
+
+                    var finished = false
+                    fun finishWith(res: Result<String>) {
+                        if (finished) return
+                        finished = true
+                        runCatching {
+                            webView.stopLoading()
+                            webView.loadUrl("about:blank")
+                            webView.destroy()
+                        }
+                        if (cont.isActive) cont.resume(res)
+                    }
+
+                    webView.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        allowFileAccess = false
+                        allowContentAccess = false
+                        cacheMode = WebSettings.LOAD_DEFAULT
+                    }
+
+                    webView.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                            if (finished || loadedUrl == "about:blank") return
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                if (!finished && view != null) {
+                                    onLoaded(view) { res -> finishWith(res) }
+                                }
+                            }, 550L)
+                        }
+
+                        override fun onReceivedError(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            error: WebResourceError?
+                        ) {
+                            if (request?.isForMainFrame == true) {
+                                finishWith(Result.failure(IllegalStateException("WebView load failed: ${error?.description ?: "network error"}")))
+                            }
+                        }
+                    }
+
+                    cont.invokeOnCancellation {
+                        Handler(Looper.getMainLooper()).post {
+                            runCatching {
+                                webView.stopLoading()
+                                webView.destroy()
+                            }
+                        }
+                    }
+
+                    runCatching { webView.loadUrl(httpsUrl) }.onFailure { err ->
+                        finishWith(Result.failure(err))
+                    }
+                }
+            }
+        } ?: Result.failure(IllegalStateException("Headless WebView timed out after 16 seconds."))
+    }
+
+    private fun normalizeHttpsUrl(raw: String): String? {
+        val trimmed = raw.trim()
+        val withScheme = when {
+            trimmed.startsWith("https://", ignoreCase = true) -> trimmed
+            trimmed.startsWith("http://", ignoreCase = true) -> "https://" + trimmed.removePrefix("http://").removePrefix("HTTP://")
+            trimmed.contains(".") && !trimmed.contains(" ") -> "https://$trimmed"
+            else -> return null
+        }
+        return withScheme.takeIf { it.startsWith("https://", ignoreCase = true) }
+    }
+
+    private fun decodeJsString(raw: String?): String {
+        if (raw.isNullOrBlank() || raw == "null") return ""
+        return runCatching {
+            JSONObject("{\"v\":$raw}").optString("v", "")
+        }.getOrElse {
+            raw.trim('"').replace("\\n", " ").replace("\\\"", "\"")
+        }
+    }
+}
+
+// ============================================================================
 // 2. EVENT-DRIVEN ZERO-POLLING ACCESSIBILITY SERVICE (PHONE BODY)
 // ============================================================================
 
@@ -192,12 +538,13 @@ class GokuAccessibilityService : AccessibilityService() {
         ) {
             val root = rootInActiveWindow ?: return
             try {
-                // 1. Auto-Ad & Popup Skipper (0.2s reaction with 1.2s cooldown)
+                // 1. Safe Auto-Ad & Popup Skipper (0.2s reaction with 1.2s cooldown; guarded against financial/system apps)
                 if (vault.settings.autoAdSkipEnabled &&
                     pkg != packageName &&
+                    !SafeAdSkipGuard.isProtectedPackage(pkg) &&
                     System.currentTimeMillis() - lastAdSkipMs > 1200L
                 ) {
-                    if (trySkipAdOrPopup(root)) {
+                    if (trySkipAdOrPopup(root, pkg)) {
                         lastAdSkipMs = System.currentTimeMillis()
                     }
                 }
@@ -243,8 +590,14 @@ class GokuAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    private fun trySkipAdOrPopup(root: AccessibilityNodeInfo): Boolean {
-        val skipLabels = listOf("skip ad", "skip ads", "skip video", "no thanks", "not now", "dismiss")
+    private fun trySkipAdOrPopup(root: AccessibilityNodeInfo, pkg: String): Boolean {
+        if (SafeAdSkipGuard.isProtectedPackage(pkg)) return false
+
+        val explicitAdSkipLabels = listOf("skip ad", "skip ads", "skip video")
+        val softPopupLabels = listOf("no thanks", "not now", "dismiss")
+        val screenContext = extractTreeText(root, maxNodes = 40)
+        val isSensitiveContext = SafeAdSkipGuard.containsSensitiveDialogContext(screenContext)
+
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var visited = 0
@@ -253,8 +606,12 @@ class GokuAccessibilityService : AccessibilityService() {
             val node = queue.removeFirst()
             val label = (node.text?.toString() ?: node.contentDescription?.toString() ?: "")
                 .lowercase(Locale.ROOT).trim()
-            if (label.isNotEmpty() && skipLabels.any { label == it || label.startsWith("skip ad") }) {
-                if (clickNodeOrParent(node)) return true
+            if (label.isNotEmpty()) {
+                val isExplicitAd = explicitAdSkipLabels.any { label == it || label.startsWith("skip ad") }
+                val isSafePopup = !isSensitiveContext && softPopupLabels.any { label == it }
+                if (isExplicitAd || isSafePopup) {
+                    if (clickNodeOrParent(node)) return true
+                }
             }
             for (i in 0 until node.childCount) {
                 node.getChild(i)?.let { queue.add(it) }
@@ -328,6 +685,7 @@ class GokuAccessibilityService : AccessibilityService() {
         val root = rootInActiveWindow ?: return false
         val query = targetQuery.lowercase(Locale.ROOT).trim()
         val allNodes = collectNodes(root, maxNodes = 160)
+        val dm = Resources.getSystem().displayMetrics
 
         val matched = allNodes.firstOrNull {
             it.viewIdResourceName?.lowercase(Locale.ROOT)?.endsWith(query) == true
@@ -337,7 +695,12 @@ class GokuAccessibilityService : AccessibilityService() {
         } ?: allNodes.firstOrNull {
             it.text?.toString()?.lowercase(Locale.ROOT)?.contains(query) == true ||
                 it.contentDescription?.toString()?.lowercase(Locale.ROOT)?.contains(query) == true
-        }
+        } ?: SpatialIconNavigator.findUnlabeledIconNode(
+            allNodes = allNodes,
+            targetQuery = targetQuery,
+            screenWidth = dm.widthPixels,
+            screenHeight = dm.heightPixels
+        )
 
         if (matched != null) {
             if (clickNodeOrParent(matched)) return true
@@ -471,6 +834,26 @@ class UniversalAppPilot(
     private val adbEngine: LocalAdbEngine
 ) {
     private var consecutiveFailures = 0
+    val headlessWebWorker: HeadlessWebAutomationWorker by lazy {
+        HeadlessWebAutomationWorker(context.applicationContext)
+    }
+
+    suspend fun runHeadlessWebRead(url: String): Pair<Boolean, String> {
+        val res = headlessWebWorker.fetchCleanPageText(url)
+        return res.fold(
+            onSuccess = { true to it },
+            onFailure = { false to "Headless Web read failed: ${it.message}" }
+        )
+    }
+
+    suspend fun runHeadlessWebAutoFill(url: String, vault: GokuVaultRepository): Pair<Boolean, String> {
+        val fields = vault.getProfileFieldsMap()
+        val res = headlessWebWorker.autoFillFormFromVault(url, fields)
+        return res.fold(
+            onSuccess = { true to it },
+            onFailure = { false to "Headless Web auto-fill failed: ${it.message}" }
+        )
+    }
 
     suspend fun tapTarget(target: String): Pair<Boolean, String> {
         if (GokuKillSwitch.isStopped.value) return false to "Stopped by GokuKillSwitch"

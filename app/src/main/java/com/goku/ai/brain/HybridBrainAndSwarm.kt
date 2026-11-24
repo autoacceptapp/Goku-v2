@@ -99,22 +99,29 @@ data class OfflineModelPreset(
 val OFFLINE_MODEL_PRESETS = listOf(
     OfflineModelPreset(
         id = "qwen25_1_5b",
-        name = "Qwen2.5 1.5B Instruct",
-        subtitle = "Best Hinglish + JSON actions (Q8)",
+        name = "Qwen2.5 1.5B Instruct (Q8)",
+        subtitle = "Open-access LiteRT — Best Hinglish + JSON actions",
         approxSizeMb = 1560,
         directUrl = "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_seq128_q8_ekv1280.task"
     ),
     OfflineModelPreset(
         id = "qwen25_0_5b",
-        name = "Qwen2.5 0.5B Instruct",
-        subtitle = "Fast & light for 4GB+ RAM phones",
+        name = "Qwen2.5 0.5B Instruct (Q8)",
+        subtitle = "Open-access LiteRT — Fast & light for 4GB+ RAM phones",
         approxSizeMb = 520,
         directUrl = "https://huggingface.co/litert-community/Qwen2.5-0.5B-Instruct/resolve/main/Qwen2.5-0.5B-Instruct_seq128_q8_ekv1280.task"
     ),
     OfflineModelPreset(
+        id = "smollm2_1_7b",
+        name = "SmolLM2 1.7B Instruct (Q8)",
+        subtitle = "Open-access LiteRT — Strong offline reasoning",
+        approxSizeMb = 1720,
+        directUrl = "https://huggingface.co/litert-community/SmolLM2-1.7B-Instruct/resolve/main/SmolLM2-1.7B-Instruct_seq128_q8_ekv1280.task"
+    ),
+    OfflineModelPreset(
         id = "smollm_135m",
-        name = "SmolLM 135M Instruct",
-        subtitle = "Ultra-compact quick test brain",
+        name = "SmolLM 135M Instruct (Q8)",
+        subtitle = "Open-access LiteRT — Ultra-compact quick test brain",
         approxSizeMb = 145,
         directUrl = "https://huggingface.co/litert-community/SmolLM-135M-Instruct/resolve/main/SmolLM-135M-Instruct_seq128_q8_ekv1280.task"
     )
@@ -169,9 +176,18 @@ object DynamicContextCompressor {
 
     fun buildMicroSystemPrompt(screenSummary: String, workingContext: String, memoryHint: String): String {
         val sb = StringBuilder()
-        sb.append("You are Goku V10, a Jarvis-style personal AI on Android. ")
-        sb.append("Reply concisely in natural Hinglish (Hindi+English mix), friendly & practical. ")
-        if (memoryHint.isNotBlank()) sb.append("Vault facts: ").append(memoryHint.take(260)).append(". ")
+        sb.append("You are Goku V10.1 (10.1-godmode), a Jarvis-style personal AI agent on Android. ")
+        sb.append("ALWAYS respond with ONLY a single valid compact JSON object (no markdown fences, no extra text): ")
+        sb.append("{\"action\":\"CHAT|CALL|SMS|OPEN_APP|ALARM|TORCH|VIRTUAL_APP\",\"target\":\"\",\"message\":\"\",\"reply\":\"concise friendly Hinglish reply\"}. ")
+        sb.append("Action rules: ")
+        sb.append("CALL -> target=contact name or phone number; ")
+        sb.append("SMS -> target=contact name or phone number, message=exact SMS text; ")
+        sb.append("OPEN_APP -> target=app name; ")
+        sb.append("VIRTUAL_APP -> target=app name when user asks to run/open an app invisibly or in background; ")
+        sb.append("ALARM -> target=HH:MM (24h); ")
+        sb.append("TORCH -> target=on or off; ")
+        sb.append("CHAT -> general Q&A, memory recall, or when no device action is requested. ")
+        if (memoryHint.isNotBlank()) sb.append("Vault & RAG facts: ").append(memoryHint.take(480)).append(". ")
         if (screenSummary.isNotBlank()) sb.append("Screen: ").append(compressScreenTree(screenSummary, 240)).append(". ")
         if (workingContext.isNotBlank()) sb.append("Recent: ").append(workingContext.take(280))
         return sb.toString()
@@ -184,11 +200,11 @@ object DynamicContextCompressor {
         screenSummary: String
     ): String {
         val sb = StringBuilder()
-        sb.append("System: You are Goku V10, an offline Android AI assistant. ")
+        sb.append("System: You are Goku V10.1 (10.1-godmode), an offline Android AI assistant. ")
         sb.append("Respond ONLY with valid compact JSON: ")
-        sb.append("{\"action\":\"CHAT|CALL|SMS|OPEN_APP|ALARM|TORCH\",\"target\":\"\",\"extra\":\"\",\"reply\":\"concise Hinglish reply\"}. ")
-        sb.append("Use CHAT unless user explicitly asks to call, send sms, open an app, set alarm, or toggle torch.\n")
-        if (memoryHint.isNotBlank()) sb.append("Vault: ").append(memoryHint.take(200)).append("\n")
+        sb.append("{\"action\":\"CHAT|CALL|SMS|OPEN_APP|ALARM|TORCH|VIRTUAL_APP\",\"target\":\"\",\"message\":\"\",\"reply\":\"concise Hinglish reply\"}. ")
+        sb.append("Use CHAT unless user explicitly asks to call, send sms, open an app, run app in background (VIRTUAL_APP), set alarm, or toggle torch.\n")
+        if (memoryHint.isNotBlank()) sb.append("Vault: ").append(memoryHint.take(260)).append("\n")
         if (screenSummary.isNotBlank()) sb.append("Screen: ").append(compressScreenTree(screenSummary, 160)).append("\n")
         if (workingContext.isNotBlank()) sb.append("Context: ").append(workingContext.take(200)).append("\n")
         sb.append("User: ").append(userPrompt.take(300)).append("\nAssistant JSON:")
@@ -416,7 +432,7 @@ class OfflineModelDownloadManager(private val context: Context) {
 
                 val requestBuilder = Request.Builder()
                     .url(lastUrl)
-                    .header("User-Agent", "Goku-V10-Android")
+                    .header("User-Agent", "Goku-10.1-godmode-Android")
                 if (existingBytes > 0L) {
                     requestBuilder.header("Range", "bytes=$existingBytes-")
                 }
@@ -634,10 +650,99 @@ class OfflineModelDownloadManager(private val context: Context) {
 data class OnDeviceLlmResult(
     val reply: String,
     val badge: String,
-    val action: String = "CHAT", // CHAT, CALL, SMS, OPEN_APP, ALARM, TORCH
+    val action: String = "CHAT", // CHAT, CALL, SMS, OPEN_APP, ALARM, TORCH, VIRTUAL_APP
     val target: String = "",
-    val extra: String = ""
+    val extra: String = "" // Holds SMS message body or action extra metadata
 )
+
+/**
+ * Shared structured JSON action parser for both Online Multi-Model Router (Gemini/Groq/DeepSeek/OpenRouter)
+ * and Offline MediaPipe GenAI LLM outputs. Safely strips markdown code fences and extracts balanced JSON.
+ */
+object StructuredActionParser {
+    private val SUPPORTED_ACTIONS = setOf(
+        "CHAT", "CALL", "SMS", "OPEN_APP", "ALARM", "TORCH", "VIRTUAL_APP"
+    )
+
+    fun parse(raw: String, badge: String): OnDeviceLlmResult {
+        val cleaned = stripMarkdownCodeFences(raw).trim()
+        val jsonCandidate = extractBalancedJsonObject(cleaned)
+        if (jsonCandidate != null) {
+            val parsed = runCatching { JSONObject(jsonCandidate) }.getOrNull()
+            if (parsed != null) {
+                val rawAction = parsed.optString("action", "CHAT").uppercase(Locale.ROOT).trim()
+                val action = if (rawAction in SUPPORTED_ACTIONS) rawAction else "CHAT"
+                val target = parsed.optString("target", "").trim()
+                val messageOrExtra = parsed.optString("message", "").trim()
+                    .ifBlank { parsed.optString("extra", "").trim() }
+                val reply = parsed.optString("reply", "").trim()
+                    .ifBlank {
+                        if (action == "CHAT") cleaned.take(520)
+                        else "Action '$action' process kar raha hoon boss."
+                    }
+                return OnDeviceLlmResult(
+                    reply = reply,
+                    badge = badge,
+                    action = action,
+                    target = target,
+                    extra = messageOrExtra
+                )
+            }
+        }
+        return OnDeviceLlmResult(
+            reply = cleaned.ifBlank { raw.trim() }.take(600),
+            badge = badge,
+            action = "CHAT"
+        )
+    }
+
+    private fun stripMarkdownCodeFences(text: String): String {
+        val trimmed = text.trim()
+        val fenceRegex = Regex("^```(?:json|JSON)?\\s*\\n?([\\s\\S]*?)\\n?```$")
+        val match = fenceRegex.find(trimmed)
+        if (match != null) {
+            return match.groupValues[1].trim()
+        }
+        return trimmed
+            .replace(Regex("```(?:json|JSON)?", RegexOption.IGNORE_CASE), "")
+            .replace("```", "")
+            .trim()
+    }
+
+    private fun extractBalancedJsonObject(text: String): String? {
+        val start = text.indexOf('{')
+        if (start < 0) return null
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (i in start until text.length) {
+            val ch = text[i]
+            if (escaped) {
+                escaped = false
+                continue
+            }
+            if (ch == '\\' && inString) {
+                escaped = true
+                continue
+            }
+            if (ch == '"') {
+                inString = !inString
+                continue
+            }
+            if (!inString) {
+                if (ch == '{') depth++
+                else if (ch == '}') {
+                    depth--
+                    if (depth == 0) {
+                        return text.substring(start, i + 1)
+                    }
+                }
+            }
+        }
+        val fallbackEnd = text.lastIndexOf('}')
+        return if (fallbackEnd > start) text.substring(start, fallbackEnd + 1) else null
+    }
+}
 
 class OnDeviceLlmEngine(
     private val context: Context,
@@ -769,39 +874,7 @@ class OnDeviceLlmEngine(
     }
 
     private fun parseStructuredLlmOutput(raw: String): OnDeviceLlmResult {
-        val jsonCandidate = extractJsonObject(raw)
-        if (jsonCandidate != null) {
-            val parsed = runCatching { JSONObject(jsonCandidate) }.getOrNull()
-            if (parsed != null) {
-                val action = parsed.optString("action", "CHAT").uppercase(Locale.ROOT).trim()
-                val target = parsed.optString("target", "").trim()
-                val extra = parsed.optString("extra", "").trim()
-                val reply = parsed.optString("reply", "").trim().ifBlank { raw.take(360) }
-                if (action in setOf("CHAT", "CALL", "SMS", "OPEN_APP", "ALARM", "TORCH")) {
-                    return OnDeviceLlmResult(
-                        reply = reply,
-                        badge = "MEDIAPIPE-LOCAL",
-                        action = action,
-                        target = target,
-                        extra = extra
-                    )
-                }
-            }
-        }
-        return OnDeviceLlmResult(
-            reply = raw.take(480),
-            badge = "MEDIAPIPE-LOCAL",
-            action = "CHAT"
-        )
-    }
-
-    private fun extractJsonObject(text: String): String? {
-        val start = text.indexOf('{')
-        val end = text.lastIndexOf('}')
-        if (start >= 0 && end > start) {
-            return text.substring(start, end + 1)
-        }
-        return null
+        return StructuredActionParser.parse(raw, "MEDIAPIPE-LOCAL")
     }
 
     private fun generateBuiltInOfflineFallback(
@@ -827,7 +900,7 @@ class OnDeviceLlmEngine(
         // 3. Natural Hindi/Hinglish Conversational & Command Parity
         val reply = when {
             lower.contains("hello") || lower.contains("hi") || lower.contains("namaste") || lower.contains("kaise ho") ->
-                "Namaste boss! Main Goku V10 hoon — 100% ready offline aur online dono mode mein. Bolo kya kaam karna hai?"
+                "Namaste boss! Main Goku V10.1 (10.1-godmode) hoon — 100% ready offline aur online dono mode mein. Bolo kya kaam karna hai?"
 
             lower.contains("time") || lower.contains("samay") || lower.contains("baje") -> {
                 val now = SimpleDateFormat("hh:mm a, EEEE dd MMM", Locale.getDefault()).format(Date())
@@ -843,13 +916,13 @@ class OnDeviceLlmEngine(
             }
 
             lower.contains("kaun ho") || lower.contains("who are you") || lower.contains("capabilities") ->
-                "Main Goku V10 hoon — aapka personal Jarvis agent. Main torch, apps, calls, SMS, alarm, Local ADB, Accessibility taps, OTP auto-fill, expense tracking, aur Emergency SOS bina internet ke bhi chala sakta hoon."
+                "Main Goku V10.1 (10.1-godmode) hoon — aapka personal Jarvis agent. Main Qwen2.5/SmolLM2 offline AI, Camera Live-Eye Vision, torch, apps, calls, SMS, alarm, Local ADB Virtual Display, Accessibility taps, Headless WebView, OTP auto-fill, expense tracking, Anti-Theft Intruder Guard, aur Emergency SOS bina internet ke bhi chala sakta hoon."
 
             lower.contains("thank") || lower.contains("shukriya") || lower.contains("dhanyawad") ->
                 "Hamesha haazir hoon boss! Jab bhi zaroorat ho bas 'Hey Goku' bol dena."
 
             else ->
-                "Maine offline samjha: \"$userPrompt\". Full local AI chat ke liye Vault tab mein 'Latest Offline AI Brain (1-Tap Download)' se Qwen2.5 download karein, ya directly phone commands bolein jaise 'Torch on', 'Open WhatsApp', 'Call Mom', 'SMS Mom hello', 'Expense summary', ya 'Phone Doctor'."
+                "Maine offline samjha: \"$userPrompt\". Full local AI chat ke liye Vault tab mein 'Latest Offline AI Brain (1-Tap Download)' se Qwen2.5 ya SmolLM2 download karein, ya directly phone commands bolein jaise 'Torch on', 'Open WhatsApp', 'Call Mom', 'SMS Mom hello', 'Expense summary', ya 'Phone Doctor'."
         }
         return OnDeviceLlmResult(reply = reply, badge = "OFFLINE-NLU-FALLBACK")
     }
@@ -875,7 +948,7 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
     suspend fun queryWithFailover(
         userPrompt: String,
         systemPrompt: String
-    ): Pair<String, String>? = withContext(Dispatchers.IO) {
+    ): OnDeviceLlmResult? = withContext(Dispatchers.IO) {
         val geminiKey = vault.settings.geminiApiKey
         val groqKey = vault.settings.groqApiKey
         val deepSeekKey = vault.settings.deepSeekApiKey
@@ -885,7 +958,7 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
         if (geminiKey.isNotBlank()) {
             callGeminiRest(geminiKey, userPrompt, systemPrompt)?.let {
                 _activeProvider.value = "GEMINI-CLOUD"
-                return@withContext it to "GEMINI-CLOUD"
+                return@withContext StructuredActionParser.parse(it, "GEMINI-CLOUD")
             }
         }
 
@@ -899,7 +972,7 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
                 systemPrompt = systemPrompt
             )?.let {
                 _activeProvider.value = "GROQ-FAILOVER"
-                return@withContext it to "GROQ-FAILOVER"
+                return@withContext StructuredActionParser.parse(it, "GROQ-FAILOVER")
             }
         }
 
@@ -913,7 +986,7 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
                 systemPrompt = systemPrompt
             )?.let {
                 _activeProvider.value = "DEEPSEEK-FAILOVER"
-                return@withContext it to "DEEPSEEK-FAILOVER"
+                return@withContext StructuredActionParser.parse(it, "DEEPSEEK-FAILOVER")
             }
         }
 
@@ -927,7 +1000,7 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
                 systemPrompt = systemPrompt
             )?.let {
                 _activeProvider.value = "OPENROUTER-FREE"
-                return@withContext it to "OPENROUTER-FREE"
+                return@withContext StructuredActionParser.parse(it, "OPENROUTER-FREE")
             }
         }
 
@@ -1022,8 +1095,8 @@ class HybridBrainAndSwarm(
         listOf(
             ChatMessage(
                 isUser = false,
-                text = "Goku V10 online & MediaPipe offline hybrid core ready hai boss! 'Hey Goku' bolo ya neeche command likho. Vault tab se 1-tap Offline AI model bhi download kar sakte ho.",
-                engineBadge = "V10-CORE",
+                text = "Goku V10.1 (10.1-godmode) online & MediaPipe offline hybrid core ready hai boss! 'Hey Goku' bolo ya neeche command likho. Vault tab se 1-tap Qwen2.5 / SmolLM2 Offline AI download kar sakte ho.",
+                engineBadge = "V10.1-CORE",
                 confidence = 100
             )
         )
@@ -1090,6 +1163,18 @@ class HybridBrainAndSwarm(
             return stopReply
         }
 
+        // 0B. Direct Multimodal Gemini Vision Live-Eye Result passthrough
+        if (trimmed.startsWith("[VISION-READY]")) {
+            val visionText = trimmed.removePrefix("[VISION-READY]").trim()
+            appendUserMessage("Camera Live-Eye Vision Scan")
+            vault.workingMemory.addTurn("GOKU", visionText)
+            vault.logAction("EXECUTOR", "Camera Live-Eye Vision", visionText, 97, "OK", System.currentTimeMillis() - startMs)
+            appendGokuMessage(visionText, "GEMINI-VISION", 97)
+            if (speakReply) voiceEngine.speak(visionText)
+            _brainState.value = BrainVisualState.IDLE
+            return visionText
+        }
+
         GokuKillSwitch.reset()
         appendUserMessage(trimmed)
 
@@ -1152,36 +1237,36 @@ class HybridBrainAndSwarm(
         // --------------------------------------------------------------------
         val screenSummary = pilot.captureCurrentScreenSummary()
         val memories = vault.searchMemories(resolvedInput)
-        val ragHits = vault.ragBrain.query(resolvedInput)
-        val memoryHint = memories.take(3).joinToString("; ") { "${it.key}=${it.value}" }
+        val ragHits = vault.ragBrain.queryPersistentFts(resolvedInput, topK = 5)
+        val memoryHint = memories.take(4).joinToString("; ") { "${it.key}=${it.value}" }
+        val ragHint = ragHits.take(3).joinToString("; ") { "${it.docName}: ${it.text.take(140)}" }
+        val combinedVaultHint = listOf(memoryHint, ragHint).filter { it.isNotBlank() }.joinToString(" | ")
         val systemPrompt = DynamicContextCompressor.buildMicroSystemPrompt(
             screenSummary = screenSummary,
             workingContext = vault.workingMemory.buildCompressedContext(),
-            memoryHint = memoryHint
+            memoryHint = combinedVaultHint
         )
 
         vault.logAction(
             stage = "PLANNER",
             command = resolvedInput,
-            detail = "Online=${isNetworkAvailable()}, LocalModel=${offlineLlm.isModelAvailable()}, Memories=${memories.size}, RAG=${ragHits.size}",
+            detail = "v10.1-godmode | Online=${isNetworkAvailable()}, LocalModel=${offlineLlm.isModelAvailable()}, VirtualDisplay=${adbEngine.virtualDisplayRunner.isActive.value}(#${adbEngine.virtualDisplayRunner.virtualDisplayId.value ?: -1}), Memories=${memories.size}, PersistentRAG=${ragHits.size}",
             confidence = 92,
             status = "OK"
         )
 
-        val onlineResponse = if (isNetworkAvailable()) {
+        val structuredResult: OnDeviceLlmResult = if (isNetworkAvailable()) {
             onlineRouter.queryWithFailover(resolvedInput, systemPrompt)
-        } else null
-
-        val (aiReply, providerBadge) = if (onlineResponse != null) {
-            onlineResponse
+                ?: offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary)
         } else {
-            val localRes = offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary)
-            executeStructuredLocalAction(localRes, dryRun)
+            offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary)
         }
+
+        val (aiReply, providerBadge) = executeStructuredAction(structuredResult, resolvedInput, dryRun)
 
         // Critic verification pass
         val elapsed = System.currentTimeMillis() - startMs
-        vault.logAction("CRITIC", resolvedInput, "Verified reply via $providerBadge", 94, "OK", elapsed)
+        vault.logAction("CRITIC", resolvedInput, "Action=${structuredResult.action} verified via $providerBadge", 94, "OK", elapsed)
         vault.workingMemory.addTurn("GOKU", aiReply)
         appendGokuMessage(aiReply, providerBadge, 94)
         if (speakReply) voiceEngine.speak(aiReply)
@@ -1190,32 +1275,106 @@ class HybridBrainAndSwarm(
     }
 
     /**
-     * Executes structured JSON actions emitted by the on-device MediaPipe LLM
-     * (CALL, SMS, OPEN_APP, ALARM, TORCH, CHAT) with full Hindi Haan/Nahi safety gating.
+     * Bug #1 Helper: Generates a concise Hinglish negotiation reply + hang-up decision
+     * for SmartCallScreenerService's Half-Duplex 2-Way Caller Negotiation Loop.
      */
-    private suspend fun executeStructuredLocalAction(
+    suspend fun generateCallNegotiationReply(
+        callerNumber: String,
+        policy: String,
+        conversationHistory: String,
+        callerSaid: String
+    ): Pair<String, Boolean> {
+        val lower = callerSaid.lowercase(Locale.ROOT)
+        val systemPrompt = buildString {
+            append("You are Goku, an AI assistant answering a phone call on behalf of the phone owner in polite, natural Hinglish (1-2 short sentences max). ")
+            append("Owner policy: ").append(policy.take(220)).append(". ")
+            append("Respond ONLY with compact JSON: {\"action\":\"CHAT\",\"target\":\"CONTINUE|END_CALL\",\"message\":\"\",\"reply\":\"short Hinglish spoken response\"}. ")
+            append("Use target=END_CALL if caller is spam/loan/telemarketer, said goodbye/okay/thanks, or the delivery/message instruction is complete.")
+        }
+        val userTurn = "Caller ($callerNumber) history: ${conversationHistory.take(360)}\nCaller just said: ${callerSaid.take(220)}"
+
+        if (isNetworkAvailable()) {
+            val cloud = onlineRouter.queryWithFailover(userTurn, systemPrompt)
+            if (cloud != null && cloud.reply.isNotBlank()) {
+                val endNow = cloud.target.equals("END_CALL", ignoreCase = true) ||
+                    lower.contains("bye") || lower.contains("thank") || lower.contains("theek hai")
+                return cloud.reply to endNow
+            }
+        }
+
+        // Offline policy-aware Hinglish fallback negotiator
+        return when {
+            lower.contains("delivery") || lower.contains("order") || lower.contains("parcel") ||
+                lower.contains("amazon") || lower.contains("flipkart") || lower.contains("swiggy") || lower.contains("zomato") ->
+                "Ji shukriya, owner abhi busy hain. Kripya parcel gate ya security par rakh dijiye, main unhe inform kar deta hoon. Dhanyawad!" to true
+
+            lower.contains("loan") || lower.contains("credit card") || lower.contains("insurance") ||
+                lower.contains("bank") || lower.contains("offer") || lower.contains("emi") ->
+                "Maaf kijiye, humein abhi kisi loan, card ya offer ki zaroorat nahi hai. Kripya dobara call na karein. Namaste." to true
+
+            lower.contains("bye") || lower.contains("theek hai") || lower.contains("okay") || lower.contains("shukriya") || lower.contains("thanks") ->
+                "Theek hai ji, maine aapka message note kar liya hai aur owner ko bata doonga. Namaste!" to true
+
+            else ->
+                "Maine aapki baat note kar li hai: '${callerSaid.take(80)}'. Kya koi aur urgent message dena hai owner ke liye?" to false
+        }
+    }
+
+    /**
+     * Unified structured JSON action executor for BOTH Online LLMs (Gemini/Groq/DeepSeek/OpenRouter)
+     * and Offline MediaPipe LLM (CALL, SMS, OPEN_APP, VIRTUAL_APP, ALARM, TORCH, CHAT),
+     * preserving the Hindi "Haan" / "Nahi" Safety Confirmation Gate for CALL & SMS.
+     */
+    private suspend fun executeStructuredAction(
         result: OnDeviceLlmResult,
+        originalCommand: String,
         dryRun: Boolean
     ): Pair<String, String> {
         return when (result.action) {
             "TORCH" -> {
-                val turnOn = !result.target.equals("off", ignoreCase = true)
+                _brainState.value = BrainVisualState.ACTING
+                val turnOn = !(result.target.equals("off", ignoreCase = true) || result.target.equals("band", ignoreCase = true))
                 val msg = if (dryRun) "[DRY-RUN] Torch -> ${if (turnOn) "ON" else "OFF"}" else toggleTorch(turnOn)
                 msg to "${result.badge}+TORCH"
             }
+            "VIRTUAL_APP" -> {
+                if (result.target.isNotBlank()) {
+                    _brainState.value = BrainVisualState.ACTING
+                    val launched = launchAppInVirtualDisplay(result.target, dryRun)
+                        ?: launchAppByName(result.target, dryRun)
+                    if (launched != null) {
+                        vault.workingMemory.addTurn("SYSTEM", "Background app ${result.target}", "app:${result.target}")
+                        val suffix = maybeCompileAppShortcut(originalCommand, result.target, dryRun)
+                        return (launched + suffix) to "${result.badge}+VAPP"
+                    }
+                }
+                result.reply to result.badge
+            }
             "OPEN_APP" -> {
                 if (result.target.isNotBlank()) {
-                    val launched = launchAppByName(result.target, dryRun)
-                    if (launched != null) return launched to "${result.badge}+APP"
+                    _brainState.value = BrainVisualState.ACTING
+                    val launched = if (adbEngine.virtualDisplayRunner.isActive.value && !adbEngine.useAccessibilityFallback.value) {
+                        launchAppInVirtualDisplay(result.target, dryRun) ?: launchAppByName(result.target, dryRun)
+                    } else {
+                        launchAppByName(result.target, dryRun)
+                    }
+                    if (launched != null) {
+                        vault.workingMemory.addTurn("SYSTEM", "Opened ${result.target}", "app:${result.target}")
+                        val suffix = maybeCompileAppShortcut(originalCommand, result.target, dryRun)
+                        return (launched + suffix) to "${result.badge}+APP"
+                    }
                 }
                 result.reply to result.badge
             }
             "ALARM" -> {
+                _brainState.value = BrainVisualState.ACTING
                 val timeMatch = Regex("(\\d{1,2})(?::(\\d{2}))?").find(result.target)
                 val hour = timeMatch?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 23) ?: 7
                 val minute = timeMatch?.groupValues?.get(2)?.toIntOrNull()?.coerceIn(0, 59) ?: 0
                 if (!dryRun) setAlarmIntent(hour, minute)
-                "Alarm $hour:${"%02d".format(minute)} ke liye set kar diya boss." to "${result.badge}+ALARM"
+                val replyMsg = if (dryRun) "[DRY-RUN] Would set alarm for $hour:${"%02d".format(minute)}"
+                else "Alarm $hour:${"%02d".format(minute)} ke liye set kar diya boss."
+                replyMsg to "${result.badge}+ALARM"
             }
             "CALL" -> {
                 if (result.target.isNotBlank()) {
@@ -1245,6 +1404,72 @@ class HybridBrainAndSwarm(
             val res = if (dryRun) "[DRY-RUN] Would send offline GPS + battery SOS SMS to saved family contacts."
             else sosManager.triggerSosBeacon()
             return Triple(res, "REFLEX-SOS", 100)
+        }
+
+        // 1B. VirtualDisplay Invisible Background Screen Control (V10.1)
+        if (lower.contains("virtual screen band") ||
+            lower.contains("virtual display band") ||
+            lower.contains("virtual display off") ||
+            lower.contains("virtual screen off") ||
+            lower.contains("invisible mode off") ||
+            lower.contains("background mode off")
+        ) {
+            if (!dryRun) adbEngine.virtualDisplayRunner.releaseVirtualDisplay()
+            return Triple(
+                "GokuVirtualScreen band kar diya boss. Ab sab actions normal foreground screen par chalenge.",
+                "VIRTUAL-DISPLAY",
+                99
+            )
+        }
+
+        if (lower.contains("virtual display on") ||
+            lower.contains("virtual screen on") ||
+            lower == "invisible mode" ||
+            lower.contains("invisible mode on") ||
+            lower.contains("background mode on")
+        ) {
+            if (dryRun) {
+                return Triple("[DRY-RUN] Would allocate GokuVirtualScreen (1080x2400 @ 320dpi).", "VIRTUAL-DISPLAY", 98)
+            }
+            val displayId = adbEngine.virtualDisplayRunner.ensureVirtualDisplay()
+            val msg = if (displayId != null) {
+                val adbHint = if (adbEngine.useAccessibilityFallback.value) {
+                    " (Local ADB pair kar lo for invisible --display input; tab tak Accessibility fallback ready hai.)"
+                } else {
+                    " Local ADB --display $displayId routing active!"
+                }
+                "VirtualDisplay ON ho gaya boss (GokuVirtualScreen Display #$displayId).$adbHint"
+            } else {
+                "VirtualDisplay allocate nahi ho paya; standard ADB/Accessibility mode active rahega."
+            }
+            return Triple(msg, "VIRTUAL-DISPLAY", if (displayId != null) 98 else 72)
+        }
+
+        if (lower.contains("background mein chalao") ||
+            lower.contains("background me chalao") ||
+            lower.contains("background mein kholo") ||
+            lower.contains("in background")
+        ) {
+            val appQuery = input
+                .replace(Regex("(background\\s+mein?\\s*(chalao|kholo)?|in\\s+background|run|open)", RegexOption.IGNORE_CASE), "")
+                .trim()
+            if (appQuery.isNotEmpty()) {
+                _brainState.value = BrainVisualState.ACTING
+                val bgResult = launchAppInVirtualDisplay(appQuery, dryRun)
+                    ?: launchAppByName(appQuery, dryRun)
+                if (bgResult != null) {
+                    vault.workingMemory.addTurn("SYSTEM", "Background app $appQuery", "app:$appQuery")
+                    return Triple(bgResult, "VIRTUAL-DISPLAY", 95)
+                }
+            } else {
+                val id = if (dryRun) 99 else adbEngine.virtualDisplayRunner.ensureVirtualDisplay()
+                return Triple(
+                    if (id != null) "Invisible Background Mode ON (Display #$id). Bolo kaunsa app background mein chalaoon?"
+                    else "Background display ready nahi ho paya; normal screen mode active hai.",
+                    "VIRTUAL-DISPLAY",
+                    92
+                )
+            }
         }
 
         // 2. Torch / Flashlight toggle
@@ -1330,7 +1555,34 @@ class HybridBrainAndSwarm(
             }
         }
 
-        // 11. Open App Fast-Lane (Fuzzy PackageManager Match)
+        // 10B. Headless Background WebView Read & Auto-Fill Commands
+        if (lower.startsWith("read webpage ") || lower.startsWith("web read ") || lower.startsWith("read url ")) {
+            val url = input.substringAfter(" ").substringAfter(" ").trim()
+                .ifBlank { input.substringAfterLast(" ").trim() }
+            if (url.isNotBlank()) {
+                _brainState.value = BrainVisualState.ACTING
+                val (ok, text) = if (dryRun) true to "[DRY-RUN] Would read webpage $url in headless WebView."
+                else pilot.runHeadlessWebRead(url)
+                return Triple(text.take(480), "HEADLESS-WEB", if (ok) 95 else 55)
+            }
+        }
+        if (lower.startsWith("autofill ") || lower.startsWith("fill form ")) {
+            val url = input.replace(Regex("^(autofill|fill\\s+form)\\s+", RegexOption.IGNORE_CASE), "").trim()
+            if (url.isNotBlank()) {
+                _brainState.value = BrainVisualState.ACTING
+                val (ok, msg) = if (dryRun) true to "[DRY-RUN] Would auto-fill $url using Vault profile."
+                else pilot.runHeadlessWebAutoFill(url, vault)
+                return Triple(msg, "HEADLESS-WEB", if (ok) 95 else 60)
+            }
+        }
+
+        // 10C. Multi-Step Chained Command Executor + Auto 3x Shortcut Compiler
+        if (lower.contains(" and ") || lower.contains(" aur ") || lower.contains(" then ")) {
+            val chainResult = tryExecuteMultiStepChain(input, dryRun)
+            if (chainResult != null) return chainResult
+        }
+
+        // 11. Open App Fast-Lane (Fuzzy PackageManager Match + Auto 3x Shortcut Compiler)
         if (lower.startsWith("open ") || lower.endsWith(" kholo") || lower.endsWith(" chala do")) {
             val appQuery = input
                 .replace(Regex("^open\\s+", RegexOption.IGNORE_CASE), "")
@@ -1340,7 +1592,8 @@ class HybridBrainAndSwarm(
                 val launched = launchAppByName(appQuery, dryRun)
                 if (launched != null) {
                     vault.workingMemory.addTurn("SYSTEM", "Opened $appQuery", "app:$appQuery")
-                    return Triple(launched, "INTENT-0.05S", 96)
+                    val suffix = maybeCompileAppShortcut(input, appQuery, dryRun)
+                    return Triple(launched + suffix, "INTENT-0.05S", 96)
                 }
             }
         }
@@ -1350,7 +1603,12 @@ class HybridBrainAndSwarm(
             val target = input.substringAfter(" ").trim()
             _brainState.value = BrainVisualState.ACTING
             val (ok, msg) = if (dryRun) true to "[DRY-RUN] Would tap '$target'" else pilot.tapTarget(target)
-            return Triple(msg, "BODY-PILOT", if (ok) 92 else 60)
+            val suffix = if (ok && !dryRun) {
+                val steps = JSONArray().put(JSONObject().put("action", "tap").put("target", target)).toString()
+                val compiled = vault.recordCommandPatternAndAutoCompile(input, steps, "Tap $target")
+                if (compiled != null) " ⚡ Auto-Shortcut Compiled! ('${compiled.name}')" else ""
+            } else ""
+            return Triple(msg + suffix, "BODY-PILOT", if (ok) 92 else 60)
         }
         if (lower == "scroll down" || lower == "neeche scroll karo") {
             if (!dryRun) pilot.scrollDown()
@@ -1379,6 +1637,84 @@ class HybridBrainAndSwarm(
         }
 
         return null
+    }
+
+    /**
+     * Parses chained multi-step commands (e.g. "open YouTube and tap search and scroll down"),
+     * executes them sequentially via UniversalAppPilot, and automatically compiles a zero-latency
+     * LearnedSkillEntity macro when repeated 3 times.
+     */
+    private suspend fun tryExecuteMultiStepChain(
+        rawCommand: String,
+        dryRun: Boolean
+    ): Triple<String, String, Int>? {
+        val segments = rawCommand
+            .split(Regex("\\s+(?:and|aur|then)\\s+", RegexOption.IGNORE_CASE))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        if (segments.size < 2) return null
+
+        val stepsArr = JSONArray()
+        for (seg in segments) {
+            val low = seg.lowercase(Locale.ROOT)
+            when {
+                low.startsWith("open ") || low.endsWith(" kholo") -> {
+                    val appName = seg.replace(Regex("^open\\s+", RegexOption.IGNORE_CASE), "")
+                        .replace(Regex("\\s*kholo$", RegexOption.IGNORE_CASE), "").trim()
+                    val pkg = resolveInstalledPackage(appName) ?: return null
+                    stepsArr.put(JSONObject().put("action", "open_app").put("target", pkg))
+                    stepsArr.put(JSONObject().put("action", "wait").put("target", "850"))
+                }
+                low.startsWith("tap ") || low.startsWith("click ") -> {
+                    val target = seg.substringAfter(" ").trim()
+                    if (target.isEmpty()) return null
+                    stepsArr.put(JSONObject().put("action", "tap").put("target", target))
+                }
+                low.startsWith("type ") -> {
+                    val text = seg.substringAfter(" ").trim()
+                    if (text.isEmpty()) return null
+                    stepsArr.put(JSONObject().put("action", "type").put("target", text))
+                }
+                low.contains("scroll") -> stepsArr.put(JSONObject().put("action", "scroll").put("target", ""))
+                low == "go home" || low == "home" -> stepsArr.put(JSONObject().put("action", "home").put("target", ""))
+                low == "go back" || low == "back" -> stepsArr.put(JSONObject().put("action", "back").put("target", ""))
+                else -> return null
+            }
+        }
+        if (stepsArr.length() < 2) return null
+
+        _brainState.value = BrainVisualState.ACTING
+        val stepsJson = stepsArr.toString()
+        val (ok, detail) = pilot.executeStepsJson(stepsJson, dryRun = dryRun)
+        val compiledSuffix = if (ok && !dryRun) {
+            val compiled = vault.recordCommandPatternAndAutoCompile(
+                rawCommand = rawCommand,
+                stepsJson = stepsJson,
+                skillDisplayName = rawCommand.take(40)
+            )
+            if (compiled != null) " ⚡ Auto-Shortcut Compiled! ('${compiled.name}')" else ""
+        } else ""
+        return Triple(detail + compiledSuffix, "CHAIN-MACRO", if (ok) 96 else 65)
+    }
+
+    private suspend fun maybeCompileAppShortcut(
+        rawCommand: String,
+        appQuery: String,
+        dryRun: Boolean
+    ): String {
+        if (dryRun) return ""
+        val pkg = resolveInstalledPackage(appQuery) ?: return ""
+        val stepsJson = JSONArray().put(JSONObject().put("action", "open_app").put("target", pkg)).toString()
+        val compiled = vault.recordCommandPatternAndAutoCompile(rawCommand, stepsJson, "Open $appQuery")
+        return if (compiled != null) " ⚡ Auto-Shortcut Compiled! ('${compiled.name}')" else ""
+    }
+
+    private suspend fun resolveInstalledPackage(query: String): String? {
+        val apps = adbEngine.discoverInstalledApps()
+        val low = query.lowercase(Locale.ROOT).trim()
+        val match = apps.firstOrNull { it.first.lowercase(Locale.ROOT) == low }
+            ?: apps.firstOrNull { it.first.lowercase(Locale.ROOT).contains(low) || it.second.lowercase(Locale.ROOT).contains(low) }
+        return match?.second
     }
 
     private suspend fun prepareCallWithSafetyGate(targetRaw: String, dryRun: Boolean): Triple<String, String, Int> {
@@ -1492,6 +1828,29 @@ class HybridBrainAndSwarm(
             smsManager.sendMultipartTextMessage(number, null, parts, null, null)
             "SMS $number par bhej diya boss."
         }.getOrElse { "SMS send failed: ${it.message}" }
+    }
+
+    private suspend fun launchAppInVirtualDisplay(query: String, dryRun: Boolean): String? {
+        val apps = adbEngine.discoverInstalledApps()
+        val low = query.lowercase(Locale.ROOT)
+        val match = apps.firstOrNull { it.first.lowercase(Locale.ROOT) == low }
+            ?: apps.firstOrNull { it.first.lowercase(Locale.ROOT).contains(low) || it.second.lowercase(Locale.ROOT).contains(low) }
+            ?: return null
+
+        if (dryRun) {
+            return "[DRY-RUN] Would launch ${match.first} (${match.second}) on GokuVirtualScreen (--display)."
+        }
+        val displayId = adbEngine.virtualDisplayRunner.ensureVirtualDisplay()
+        if (displayId != null) {
+            val res = adbEngine.virtualDisplayRunner.launchAppInBackground(match.second)
+            if (res.success && res.viaAdb) {
+                return "${match.first} ko invisibly VirtualDisplay #$displayId par chala diya boss — aapki current screen disturb nahi hogi!"
+            }
+        }
+        // Clean fallback to standard foreground launch when Local ADB is not paired
+        return launchAppByName(query, dryRun = false)?.let {
+            "$it (Local ADB pair karne par yeh VirtualDisplay #$displayId par invisibly chalega.)"
+        }
     }
 
     private suspend fun launchAppByName(query: String, dryRun: Boolean): String? {

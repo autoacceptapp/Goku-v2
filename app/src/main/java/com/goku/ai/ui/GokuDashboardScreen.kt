@@ -263,7 +263,8 @@ data class PermissionWizardStatus(
     val notificationListenerEnabled: Boolean = false,
     val batteryOptimizationIgnored: Boolean = false,
     val keepAliveRunning: Boolean = false,
-    val floatingOrbRunning: Boolean = false
+    val floatingOrbRunning: Boolean = false,
+    val deviceAdminEnabled: Boolean = false
 )
 
 data class GokuSettingsSnapshot(
@@ -309,7 +310,9 @@ data class GokuDashboardUiState(
     val skills: List<LearnedSkillEntity> = emptyList(),
     val expenses: List<ExpenseRecordEntity> = emptyList(),
     val exportedSkillsJson: String? = null,
-    val pluginOutput: String = ""
+    val pluginOutput: String = "",
+    val isVirtualDisplayActive: Boolean = false,
+    val activeVirtualDisplayId: Int? = null
 )
 
 data class GokuDashboardCallbacks(
@@ -331,6 +334,8 @@ data class GokuDashboardCallbacks(
     val onOpenOverlaySettings: () -> Unit,
     val onOpenNotificationListenerSettings: () -> Unit,
     val onRequestBatteryExemption: () -> Unit,
+    val onRequestDeviceAdmin: () -> Unit,
+    val onToggleVirtualDisplay: (Boolean) -> Unit,
     val onToggleFloatingOrb: (Boolean) -> Unit,
     val onUpdateSettings: (GokuSettingsSnapshot) -> Unit,
     val onRunLivePlugin: (String, Boolean) -> Unit,
@@ -502,7 +507,7 @@ private fun CoreCommandTab(
         ) {
             Column {
                 Text(
-                    text = "GOKU V10",
+                    text = "GOKU V10.1",
                     style = MaterialTheme.typography.headlineSmall,
                     color = GokuCyan
                 )
@@ -677,7 +682,108 @@ private fun CoreCommandTab(
             }
         }
 
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(6.dp))
+
+        // Compact 24x7 Ear Wake-Word Engine Status Chip
+        val isSherpaNative = uiState.voiceState.kwsEngineBackend.contains("Sherpa-ONNX Native", ignoreCase = true)
+        Surface(
+            color = GokuSurfaceDark,
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(
+                1.dp,
+                if (isSherpaNative) GokuEmerald.copy(alpha = 0.65f) else GokuCyan.copy(alpha = 0.35f)
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("ear_kws_status_chip")
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Mic,
+                    contentDescription = "24x7 Wake Word Ear Status",
+                    tint = if (isSherpaNative) GokuEmerald else GokuCyan,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = if (isSherpaNative) {
+                        "24x7 Ear: Sherpa-ONNX Native KWS Active"
+                    } else {
+                        "24x7 Ear: Acoustic VAD Ready (Drop .onnx in models/kws for Sherpa)"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = GokuTextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        // VirtualDisplay Invisible Background Screen 1-Tap Toggle Card
+        Surface(
+            color = GokuSurfaceDark,
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(
+                1.dp,
+                if (uiState.isVirtualDisplayActive) GokuEmerald else GokuOutline
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("virtual_display_toggle_card")
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            text = "VirtualDisplay Background Screen",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = GokuTextPrimary
+                        )
+                        TelemetryPill(
+                            text = if (uiState.isVirtualDisplayActive) {
+                                "ON (Display #${uiState.activeVirtualDisplayId ?: 0})"
+                            } else {
+                                "OFF"
+                            },
+                            color = if (uiState.isVirtualDisplayActive) GokuEmerald else GokuTextMuted
+                        )
+                    }
+                    Text(
+                        text = if (uiState.isVirtualDisplayActive) {
+                            "Invisible 1080×2400 offscreen ADB task runner active"
+                        } else {
+                            "Run multi-step app tasks invisibly without disturbing your screen"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = GokuTextMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Switch(
+                    checked = uiState.isVirtualDisplayActive,
+                    onCheckedChange = callbacks.onToggleVirtualDisplay,
+                    modifier = Modifier.testTag("switch_virtual_display"),
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = GokuObsidianBg,
+                        checkedTrackColor = GokuEmerald
+                    )
+                )
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
 
         // Quick Action Chips Row
         Row(
@@ -1043,6 +1149,20 @@ private fun SetupWizardTab(
                 onClick = callbacks.onRequestBatteryExemption
             )
         }
+        item {
+            SetupRowCard(
+                title = "Anti-Theft Intruder Guard (Device Admin)",
+                subtitle = if (perm.deviceAdminEnabled) {
+                    "ACTIVE (3-Wrong-PIN Camera + GPS Trap)"
+                } else {
+                    "Silently snaps front camera + sends GPS SOS SMS on 3 failed PINs"
+                },
+                isGranted = perm.deviceAdminEnabled,
+                actionLabel = if (perm.deviceAdminEnabled) "ACTIVE" else "TAP TO ENABLE",
+                testTag = "wizard_device_admin",
+                onClick = callbacks.onRequestDeviceAdmin
+            )
+        }
 
         // Floating Overlay Service Toggle Card
         item {
@@ -1145,7 +1265,7 @@ private fun GokuStudioDebuggerTab(
 ) {
     var pluginJson by rememberSaveable {
         mutableStateOf(
-            """{"steps":[{"action":"speak","target":"Goku live plugin 0.1 second mein chal gaya!"},{"action":"save_memory","key":"plugin_check","target":"Verified V10"}]}"""
+            """{"steps":[{"action":"speak","target":"Goku V10.1 live plugin 0.1 second mein chal gaya!"},{"action":"save_memory","key":"plugin_check","target":"Verified V10.1"}]}"""
         )
     }
     var teachSkillName by rememberSaveable { mutableStateOf("Morning Routine") }
