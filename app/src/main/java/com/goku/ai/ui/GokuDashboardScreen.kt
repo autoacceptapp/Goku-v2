@@ -4,6 +4,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -55,17 +57,21 @@ import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.HealthAndSafety
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.NightsStay
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RadioButtonChecked
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.StopCircle
@@ -83,6 +89,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -128,6 +135,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.goku.ai.adb.AdbStatus
 import com.goku.ai.automation.CameraLiveEyeOcr
@@ -135,6 +143,9 @@ import com.goku.ai.automation.SensorReflexState
 import com.goku.ai.body.RecordedStep
 import com.goku.ai.brain.BrainVisualState
 import com.goku.ai.brain.ChatMessage
+import com.goku.ai.brain.ModelDownloadState
+import com.goku.ai.brain.OFFLINE_MODEL_PRESETS
+import com.goku.ai.brain.OfflineModelDownloadManager
 import com.goku.ai.brain.PendingConfirmation
 import com.goku.ai.data.ActionLogEntity
 import com.goku.ai.data.ExpenseRecordEntity
@@ -502,6 +513,10 @@ private fun CoreCommandTab(
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                TelemetryPill(
+                    text = if (uiState.isLocalModelLoaded) "LLM RAM" else "0MB IDLE",
+                    color = if (uiState.isLocalModelLoaded) GokuViolet else GokuTextMuted
+                )
                 TelemetryPill(
                     text = if (uiState.isOnline) "ONLINE" else "OFFLINE",
                     color = if (uiState.isOnline) GokuEmerald else GokuAmber
@@ -1369,6 +1384,11 @@ private fun VaultAndSettingsTab(
             Text("Memory Vault & V10 Settings", style = MaterialTheme.typography.headlineSmall, color = GokuCyan)
         }
 
+        // Latest Offline AI Brain (1-Tap Download + HTTP Range Resume + 15s RAM Auto-Unload)
+        item {
+            LatestOfflineAiBrainCard(isLoadedInRam = uiState.isLocalModelLoaded)
+        }
+
         // Personal Knowledge Graph Quick Add
         item {
             Card(
@@ -1647,7 +1667,387 @@ private fun VaultAndSettingsTab(
 }
 
 // ============================================================================
-// 8. DIALOGS & SHARED MICRO-COMPONENTS
+// 8. LATEST OFFLINE AI BRAIN (1-TAP DOWNLOAD + RANGE RESUME + RAM MONITOR)
+// ============================================================================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
+    val ctx = LocalContext.current
+    val downloadManager = remember(ctx) { OfflineModelDownloadManager.getInstance(ctx) }
+    val downloadState by downloadManager.state.collectAsStateWithLifecycle()
+
+    var selectedPresetIndex by rememberSaveable { mutableIntStateOf(0) }
+    var useCustomUrl by rememberSaveable { mutableStateOf(false) }
+    var customUrl by rememberSaveable { mutableStateOf("") }
+
+    val localModelPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            downloadManager.importLocalModel(uri)
+        }
+    }
+
+    val selectedPreset = OFFLINE_MODEL_PRESETS.getOrElse(selectedPresetIndex) { OFFLINE_MODEL_PRESETS.first() }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = GokuSurfaceDark),
+        border = BorderStroke(
+            width = 1.2.dp,
+            color = when (downloadState) {
+                is ModelDownloadState.Ready -> GokuEmerald.copy(alpha = 0.75f)
+                is ModelDownloadState.Downloading -> GokuCyan
+                is ModelDownloadState.Error -> GokuCrimson.copy(alpha = 0.75f)
+                else -> GokuViolet.copy(alpha = 0.6f)
+            }
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("offline_ai_brain_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // Header Row + Live RAM Status Pill
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.CloudDownload,
+                        contentDescription = "Offline AI Brain",
+                        tint = GokuCyan
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "Latest Offline AI Brain (1-Tap Download)",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = GokuCyan
+                    )
+                }
+                Spacer(Modifier.width(6.dp))
+                TelemetryPill(
+                    text = if (isLoadedInRam) "Loaded" else "Sleeping - 0MB RAM",
+                    color = if (isLoadedInRam) GokuEmerald else GokuAmber
+                )
+            }
+
+            Text(
+                text = "MediaPipe / LiteRT GenAI on-device LLM with HTTP Range resume & strict 15s idle auto-unload. Open-access models — no login or token needed.",
+                style = MaterialTheme.typography.bodySmall,
+                color = GokuTextMuted
+            )
+
+            // Open-Access Model Preset Chips (hidden while actively downloading)
+            if (downloadState !is ModelDownloadState.Downloading) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OFFLINE_MODEL_PRESETS.forEachIndexed { idx, preset ->
+                        val active = !useCustomUrl && selectedPresetIndex == idx
+                        FilterChip(
+                            selected = active,
+                            onClick = {
+                                useCustomUrl = false
+                                selectedPresetIndex = idx
+                            },
+                            modifier = Modifier.testTag("preset_${preset.id}"),
+                            label = {
+                                Text(
+                                    "${preset.name} (~${preset.approxSizeMb}MB)",
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = GokuCyan.copy(alpha = 0.16f),
+                                selectedLabelColor = GokuCyan
+                            )
+                        )
+                    }
+                    FilterChip(
+                        selected = useCustomUrl,
+                        onClick = { useCustomUrl = !useCustomUrl },
+                        modifier = Modifier.testTag("preset_custom_url"),
+                        label = { Text("Custom URL", style = MaterialTheme.typography.labelMedium) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = GokuViolet.copy(alpha = 0.2f),
+                            selectedLabelColor = GokuViolet
+                        )
+                    )
+                }
+
+                if (!useCustomUrl) {
+                    Text(
+                        text = "${selectedPreset.name}: ${selectedPreset.subtitle}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = GokuTextPrimary
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = customUrl,
+                        onValueChange = { customUrl = it },
+                        label = { Text("Direct HTTPS .task / .bin URL") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("custom_model_url_input")
+                    )
+                }
+            }
+
+            // Dynamic Download / Ready / Error Body
+            when (val st = downloadState) {
+                is ModelDownloadState.Idle -> {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                if (useCustomUrl) {
+                                    downloadManager.startDownload(customUrl, "Custom Offline LLM")
+                                } else {
+                                    downloadManager.startDownload(selectedPreset.directUrl, selectedPreset.name)
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = GokuCyan),
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp)
+                                .testTag("offline_model_download_btn")
+                        ) {
+                            Icon(Icons.Filled.Download, contentDescription = null, tint = GokuObsidianBg)
+                            Spacer(Modifier.width(6.dp))
+                            Text("1-Tap Download", color = GokuObsidianBg, fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick = { localModelPicker.launch(arrayOf("*/*")) },
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .testTag("offline_model_import_btn")
+                        ) {
+                            Icon(Icons.Filled.FolderOpen, contentDescription = "Import Local .task")
+                            Spacer(Modifier.width(4.dp))
+                            Text("Import")
+                        }
+                    }
+                }
+
+                is ModelDownloadState.Downloading -> {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "Downloading ${st.modelName}...",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = GokuCyan,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = "${st.progressPercent}%",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = GokuCyan
+                            )
+                        }
+                        LinearProgressIndicator(
+                            progress = { (st.progressPercent / 100f).coerceIn(0f, 1f) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .testTag("offline_model_progress_bar"),
+                            color = GokuCyan,
+                            trackColor = GokuSurfaceElevated
+                        )
+                        val totalText = if (st.totalMb > 0f) "${"%.1f".format(st.totalMb)} MB" else "..."
+                        val speedText = if (st.speedMbps > 0.01f) " • ${"%.2f".format(st.speedMbps)} MB/s" else ""
+                        Text(
+                            text = "${"%.1f".format(st.downloadedMb)} MB / $totalText$speedText",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = GokuTextMuted
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { downloadManager.pauseDownload() },
+                                colors = ButtonDefaults.buttonColors(containerColor = GokuAmber),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .testTag("offline_model_pause_btn")
+                            ) {
+                                Icon(Icons.Filled.Pause, contentDescription = null, tint = GokuObsidianBg)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Pause", color = GokuObsidianBg, fontWeight = FontWeight.Bold)
+                            }
+                            OutlinedButton(
+                                onClick = { downloadManager.deleteModel() },
+                                modifier = Modifier.heightIn(min = 48.dp)
+                            ) {
+                                Icon(Icons.Filled.Delete, contentDescription = "Cancel", tint = GokuCrimson)
+                            }
+                        }
+                    }
+                }
+
+                is ModelDownloadState.Paused -> {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            text = "Paused: ${st.modelName} (${st.progressPercent}% • ${"%.1f".format(st.downloadedMb)} / ${"%.1f".format(st.totalMb)} MB)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = GokuAmber
+                        )
+                        LinearProgressIndicator(
+                            progress = { (st.progressPercent / 100f).coerceIn(0f, 1f) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(RoundedCornerShape(6.dp)),
+                            color = GokuAmber,
+                            trackColor = GokuSurfaceElevated
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { downloadManager.resumeDownload() },
+                                colors = ButtonDefaults.buttonColors(containerColor = GokuCyan),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .testTag("offline_model_resume_btn")
+                            ) {
+                                Icon(Icons.Filled.PlayArrow, contentDescription = null, tint = GokuObsidianBg)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Resume (HTTP Range)", color = GokuObsidianBg, fontWeight = FontWeight.Bold)
+                            }
+                            OutlinedButton(
+                                onClick = { downloadManager.deleteModel() },
+                                modifier = Modifier
+                                    .heightIn(min = 48.dp)
+                                    .testTag("offline_model_delete_btn")
+                            ) {
+                                Icon(Icons.Filled.Delete, contentDescription = "Delete Partial", tint = GokuCrimson)
+                            }
+                        }
+                    }
+                }
+
+                is ModelDownloadState.Ready -> {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Surface(
+                            color = GokuEmerald.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, GokuEmerald.copy(alpha = 0.55f))
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = GokuEmerald)
+                                Spacer(Modifier.width(8.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "${st.modelName} Ready",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = GokuTextPrimary
+                                    )
+                                    Text(
+                                        text = "${"%.1f".format(st.sizeMb)} MB on disk • Auto-unloads from RAM after 15s idle",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = GokuEmerald
+                                    )
+                                }
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = { localModelPicker.launch(arrayOf("*/*")) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                            ) {
+                                Icon(Icons.Filled.FolderOpen, contentDescription = null)
+                                Spacer(Modifier.width(4.dp))
+                                Text("Replace File")
+                            }
+                            Button(
+                                onClick = {
+                                    downloadManager.deleteModel()
+                                    Toast.makeText(ctx, "Offline AI model deleted & RAM freed", Toast.LENGTH_SHORT).show()
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = GokuCrimson),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .testTag("offline_model_delete_btn")
+                            ) {
+                                Icon(Icons.Filled.Delete, contentDescription = null, tint = Color.White)
+                                Spacer(Modifier.width(4.dp))
+                                Text("Delete Model", color = Color.White, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+
+                is ModelDownloadState.Error -> {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            text = st.message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = GokuCrimson
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = {
+                                    if (st.canResume) {
+                                        downloadManager.resumeDownload()
+                                    } else if (useCustomUrl) {
+                                        downloadManager.startDownload(customUrl, "Custom Offline LLM")
+                                    } else {
+                                        downloadManager.startDownload(selectedPreset.directUrl, selectedPreset.name)
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = GokuCyan),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .testTag("offline_model_retry_btn")
+                            ) {
+                                Icon(Icons.Filled.Refresh, contentDescription = null, tint = GokuObsidianBg)
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    if (st.canResume) "Resume Download" else "Retry Download",
+                                    color = GokuObsidianBg,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = { downloadManager.deleteModel() },
+                                modifier = Modifier.heightIn(min = 48.dp)
+                            ) {
+                                Text("Reset")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 9. DIALOGS & SHARED MICRO-COMPONENTS
 // ============================================================================
 
 @Composable

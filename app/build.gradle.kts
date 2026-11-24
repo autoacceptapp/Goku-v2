@@ -68,6 +68,15 @@ android {
     includeInApk = false
     includeInBundle = true
   }
+  packaging {
+    resources {
+      excludes += setOf(
+        "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+        "META-INF/LICENSE.md",
+        "META-INF/NOTICE.md"
+      )
+    }
+  }
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
@@ -124,6 +133,10 @@ dependencies {
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   implementation(libs.logging.interceptor)
+  implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar", "*.aar"))))
+  implementation("com.google.mediapipe:tasks-genai:0.10.22")
+  implementation("org.bouncycastle:bcprov-jdk18on:1.79")
+  implementation("org.bouncycastle:bcpkix-jdk18on:1.79")
   implementation(libs.mlkit.text.recognition)
   // implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)

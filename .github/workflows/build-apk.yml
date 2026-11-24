@@ -1,4 +1,4 @@
-name: Build Goku V10 Debug APK
+name: Build & Release Goku V10 APK
 
 on:
   push:
@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-apk:
@@ -51,9 +54,23 @@ jobs:
         run: |
           ${GRADLE_CMD} assembleDebug --no-daemon --stacktrace
 
+      - name: Prepare Release APK Filename
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk Goku-V10-GodMode.apk
+
       - name: Upload Goku-V10-Debug-APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Goku-V10-Debug-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: Goku-V10-GodMode.apk
           retention-days: 30
+
+      - name: Publish Goku V10 APK to GitHub Releases
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v10.${{ github.run_number }}
+          name: Goku V10 God-Mode (Build #${{ github.run_number }})
+          generate_release_notes: true
+          files: |
+            Goku-V10-GodMode.apk
