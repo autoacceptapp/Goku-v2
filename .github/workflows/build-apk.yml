@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '21'
@@ -85,13 +85,15 @@ jobs:
             echo "GRADLE_CMD=gradle" >> "$GITHUB_ENV"
           fi
 
-      - name: Run Unit & Robolectric Tests
+      - name: Assemble Goku V10.1 Debug APK & Run Unit Tests
+        env:
+          JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
         run: |
-          ${GRADLE_CMD} testDebugUnitTest --no-daemon --stacktrace
-
-      - name: Assemble Goku V10 Debug APK
-        run: |
-          ${GRADLE_CMD} assembleDebug --no-daemon --stacktrace
+          ${GRADLE_CMD} assembleDebug testDebugUnitTest \
+            --no-daemon \
+            --console=plain \
+            -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g -Djava.awt.headless=true -Dfile.encoding=UTF-8" \
+            -Dorg.gradle.workers.max=2
 
       - name: Prepare Release APK Filename
         run: |

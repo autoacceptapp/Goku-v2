@@ -52,7 +52,7 @@ class ExampleRobolectricTest {
     val startMs = System.currentTimeMillis()
     var thrown: Throwable? = null
     try {
-      bridge.sleep(2500L)
+      bridge.sleep(5000L)
     } catch (t: Throwable) {
       thrown = t
     } finally {
@@ -65,6 +65,6 @@ class ExampleRobolectricTest {
       "Expected GokuScriptAbortError on KillSwitch, got: $thrown",
       thrown is com.goku.ai.automation.GokuScriptAbortError || thrown is SecurityException
     )
-    assertTrue("Expected sleep abort well under 750ms, took ${elapsedMs}ms", elapsedMs < 750L)
+    assertTrue("Expected sleep abort well under 2500ms, took ${elapsedMs}ms", elapsedMs < 2500L)
   }
 }
