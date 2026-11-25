@@ -439,6 +439,9 @@ interface ExpenseRecordDao {
     @Query("SELECT * FROM expense_records WHERE timestamp >= :sinceMillis ORDER BY timestamp DESC")
     suspend fun getSince(sinceMillis: Long): List<ExpenseRecordEntity>
 
+    @Query("SELECT * FROM expense_records WHERE isRecurring = 1 ORDER BY timestamp DESC LIMIT 50")
+    suspend fun getRecurring(): List<ExpenseRecordEntity>
+
     @Query("SELECT SUM(amountInr) FROM expense_records WHERE timestamp >= :sinceMillis")
     suspend fun getTotalSince(sinceMillis: Long): Double?
 
@@ -450,6 +453,9 @@ interface ExpenseRecordDao {
 interface ActionLogDao {
     @Query("SELECT * FROM action_logs ORDER BY timestamp DESC LIMIT 150")
     fun observeRecent(): Flow<List<ActionLogEntity>>
+
+    @Query("SELECT * FROM action_logs WHERE status = 'OK' ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun getRecentSuccessfulCommands(limit: Int = 200): List<ActionLogEntity>
 
     @Query("SELECT * FROM action_logs WHERE status = 'ERROR' OR status = 'WARN' ORDER BY timestamp DESC LIMIT 50")
     suspend fun getRecentFailures(): List<ActionLogEntity>
@@ -1179,6 +1185,10 @@ class GokuEncryptedSettings(context: Context) {
         get() = getSecret("openrouter_api_key")
         set(value) = setSecret("openrouter_api_key", value)
 
+    var nvidiaNimApiKey: String
+        get() = getSecret("nvidia_nim_api_key")
+        set(value) = setSecret("nvidia_nim_api_key", value)
+
     var sosContactsCsv: String
         get() = getOperationalString("sos_contacts", "")
         set(value) = setOperationalString("sos_contacts", value)
@@ -1257,6 +1267,7 @@ class GokuEncryptedSettings(context: Context) {
         groqKey: String = this.groqApiKey,
         deepSeekKey: String = this.deepSeekApiKey,
         openRouterKey: String = this.openRouterApiKey,
+        nvidiaNimKey: String = this.nvidiaNimApiKey,
         sosContacts: String = this.sosContactsCsv,
         githubRepo: String = this.githubRepo,
         githubToken: String = this.githubToken,
@@ -1284,6 +1295,7 @@ class GokuEncryptedSettings(context: Context) {
                     putString("groq_api_key", groqKey.trim())
                     putString("deepseek_api_key", deepSeekKey.trim())
                     putString("openrouter_api_key", openRouterKey.trim())
+                    putString("nvidia_nim_api_key", nvidiaNimKey.trim())
                     putString("github_token", githubToken.trim())
                     putString("telegram_bot_token", telegramBot.trim())
                     inMemorySecretFallback.clear()
@@ -1292,6 +1304,7 @@ class GokuEncryptedSettings(context: Context) {
                     inMemorySecretFallback["groq_api_key"] = groqKey.trim()
                     inMemorySecretFallback["deepseek_api_key"] = deepSeekKey.trim()
                     inMemorySecretFallback["openrouter_api_key"] = openRouterKey.trim()
+                    inMemorySecretFallback["nvidia_nim_api_key"] = nvidiaNimKey.trim()
                     inMemorySecretFallback["github_token"] = githubToken.trim()
                     inMemorySecretFallback["telegram_bot_token"] = telegramBot.trim()
                 }
@@ -1702,6 +1715,74 @@ class GokuVaultRepository(context: Context) {
             )
         )
     }
+
+    suspend fun buildRecurringBillsReminderHinglish(nowMillis: Long = System.currentTimeMillis()): String =
+        withContext(Dispatchers.IO) {
+            val recurring = db.expenseRecordDao().getRecurring()
+            if (recurring.isEmpty()) {
+                return@withContext "Abhi koi recurring bill, EMI, ya OTT auto-debit track nahi hua hai. Jaise hi bank/OTT alert aayega, main 24h pehle remind kar doonga."
+            }
+            val latestByMerchant = LinkedHashMap<String, ExpenseRecordEntity>()
+            for (item in recurring) {
+                val key = "${item.merchant.lowercase(Locale.ROOT)}|${item.category}"
+                latestByMerchant.putIfAbsent(key, item)
+            }
+            val dueSoon = ArrayList<String>()
+            val allTracked = ArrayList<String>()
+            val dayMs = 24L * 60L * 60L * 1000L
+            for (item in latestByMerchant.values.take(8)) {
+                val daysSince = ((nowMillis - item.timestamp) / dayMs).coerceAtLeast(0L)
+                val label = "${item.merchant} (${item.category}) ₹${"%.0f".format(Locale.US, item.amountInr)}"
+                allTracked.add(label)
+                if (daysSince in 28L..31L) {
+                    val daysLeft = (30L - daysSince).coerceAtLeast(0L)
+                    dueSoon.add("$label (~${if (daysLeft == 0L) "aaj/24h" else "${daysLeft}d"} mein expected)")
+                }
+            }
+            if (dueSoon.isNotEmpty()) {
+                "Auto-Debit Alert (24h Window): ${dueSoon.joinToString("; ")}. Kul ${allTracked.size} recurring bills tracked hain."
+            } else {
+                "Tracked Recurring Bills (${allTracked.size}): ${allTracked.take(4).joinToString(", ")}. Abhi koi auto-debit next 24h window mein due nahi dikh raha."
+            }
+        }
+
+    /**
+     * Blueprint Phase 6 — Habit Predictor:
+     * Analyzes real successful commands from Room `action_logs` executed within ±1 hour of the
+     * current hour-of-day and returns recurring user habits (count >= 2) sorted by frequency.
+     */
+    suspend fun predictHabitsForCurrentHour(nowMillis: Long = System.currentTimeMillis()): List<Pair<String, Int>> =
+        withContext(Dispatchers.IO) {
+            val calNow = java.util.Calendar.getInstance().apply { timeInMillis = nowMillis }
+            val currentHour = calNow.get(java.util.Calendar.HOUR_OF_DAY)
+            val logs = db.actionLogDao().getRecentSuccessfulCommands(limit = 200)
+            val ignoredPrefixes = listOf(
+                "auto-shortcut", "nightly dream", "adaptive power", "import .goku",
+                "live plugin", "headlesscommand", "anti-theft", "emergency sos"
+            )
+            val counts = LinkedHashMap<String, Int>()
+            val canonicalDisplay = HashMap<String, String>()
+            val calItem = java.util.Calendar.getInstance()
+            for (log in logs) {
+                if (log.agentStage == "SYSTEM" || log.agentStage == "CRITIC") continue
+                val cmd = log.command.trim()
+                val lower = cmd.lowercase(Locale.ROOT)
+                if (cmd.length < 3 || ignoredPrefixes.any { lower.startsWith(it) }) continue
+                calItem.timeInMillis = log.timestamp
+                val h = calItem.get(java.util.Calendar.HOUR_OF_DAY)
+                val diff = kotlin.math.abs(h - currentHour)
+                val circularDiff = minOf(diff, 24 - diff)
+                if (circularDiff <= 1) {
+                    counts[lower] = (counts[lower] ?: 0) + 1
+                    canonicalDisplay.putIfAbsent(lower, cmd)
+                }
+            }
+            counts.entries
+                .filter { it.value >= 2 }
+                .sortedByDescending { it.value }
+                .take(3)
+                .map { (canonicalDisplay[it.key] ?: it.key) to it.value }
+        }
 
     suspend fun getRecentFailures(): List<ActionLogEntity> = withContext(Dispatchers.IO) {
         db.actionLogDao().getRecentFailures()

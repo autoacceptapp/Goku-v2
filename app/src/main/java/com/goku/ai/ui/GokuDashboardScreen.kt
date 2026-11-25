@@ -286,6 +286,7 @@ data class GokuSettingsSnapshot(
     val groqKey: String = "",
     val deepSeekKey: String = "",
     val openRouterKey: String = "",
+    val nvidiaNimKey: String = "",
     val sosContacts: String = "",
     val githubRepo: String = "",
     val githubToken: String = "",
@@ -327,7 +328,8 @@ data class GokuDashboardUiState(
     val exportedSkillsJson: String? = null,
     val pluginOutput: String = "",
     val isVirtualDisplayActive: Boolean = false,
-    val activeVirtualDisplayId: Int? = null
+    val activeVirtualDisplayId: Int? = null,
+    val suggestedHabit: String? = null
 )
 
 data class GokuDashboardCallbacks(
@@ -643,6 +645,75 @@ private fun CoreCommandTab(
                     )
                     IconButton(onClick = callbacks.onDismissMistakeWarning) {
                         Icon(Icons.Filled.Close, contentDescription = "Dismiss", tint = Color.White)
+                    }
+                }
+            }
+        }
+
+        // Late-Night Screen-Time & Eye-Care Guardian Banner (23:00-05:00 after >=45m screen-on)
+        val eyeCareReminder = uiState.sensorState.lateNightEyeCareReminder
+        AnimatedVisibility(visible = !eyeCareReminder.isNullOrBlank()) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1530)),
+                border = BorderStroke(1.dp, GokuViolet),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp)
+                    .testTag("late_night_eyecare_banner")
+            ) {
+                Row(
+                    modifier = Modifier.padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Filled.NightsStay, contentDescription = "Eye Care", tint = GokuViolet)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = eyeCareReminder.orEmpty(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = GokuTextPrimary,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
+        // 1-Tap Habit Predictor Banner (Time-of-day routine suggestion from Room action logs)
+        val suggestedHabit = uiState.suggestedHabit
+        AnimatedVisibility(visible = !suggestedHabit.isNullOrBlank()) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = GokuSurfaceDark),
+                border = BorderStroke(1.dp, GokuEmerald.copy(alpha = 0.6f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp)
+                    .testTag("habit_predictor_banner")
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Filled.AutoAwesome, contentDescription = "Habit Suggestion", tint = GokuEmerald)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "Routine: ${suggestedHabit.orEmpty()}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = GokuTextPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    TextButton(
+                        onClick = { suggestedHabit?.let { callbacks.onSendCommand(it) } },
+                        modifier = Modifier.testTag("habit_predictor_run_btn")
+                    ) {
+                        Text("Run", color = GokuEmerald)
                     }
                 }
             }
@@ -1602,6 +1673,7 @@ private fun VaultAndSettingsTab(
     var groqKey by rememberSaveable(uiState.settings.groqKey) { mutableStateOf(uiState.settings.groqKey) }
     var deepSeekKey by rememberSaveable(uiState.settings.deepSeekKey) { mutableStateOf(uiState.settings.deepSeekKey) }
     var openRouterKey by rememberSaveable(uiState.settings.openRouterKey) { mutableStateOf(uiState.settings.openRouterKey) }
+    var nvidiaNimKey by rememberSaveable(uiState.settings.nvidiaNimKey) { mutableStateOf(uiState.settings.nvidiaNimKey) }
     var sosContacts by rememberSaveable(uiState.settings.sosContacts) { mutableStateOf(uiState.settings.sosContacts) }
     var smartCallPolicy by rememberSaveable(uiState.settings.smartCallPolicy) { mutableStateOf(uiState.settings.smartCallPolicy) }
     var githubRepo by rememberSaveable(uiState.settings.githubRepo) { mutableStateOf(uiState.settings.githubRepo) }
@@ -1836,6 +1908,16 @@ private fun VaultAndSettingsTab(
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
+                        value = nvidiaNimKey,
+                        onValueChange = { nvidiaNimKey = it },
+                        label = { Text("NVIDIA NIM Free API Key (Failover #4)") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("nvidia_nim_key_input")
+                    )
+                    OutlinedTextField(
                         value = localModelPath,
                         onValueChange = { localModelPath = it },
                         label = { Text("Offline MediaPipe LiteRT (.task) Model Path") },
@@ -1884,6 +1966,7 @@ private fun VaultAndSettingsTab(
                                     groqKey = groqKey,
                                     deepSeekKey = deepSeekKey,
                                     openRouterKey = openRouterKey,
+                                    nvidiaNimKey = nvidiaNimKey,
                                     sosContacts = sosContacts,
                                     smartCallPolicy = smartCallPolicy,
                                     githubRepo = githubRepo,

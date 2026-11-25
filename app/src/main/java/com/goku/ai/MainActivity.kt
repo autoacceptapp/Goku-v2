@@ -317,6 +317,9 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
             val notifConnected = GokuNotificationListenerService.isConnected.value ||
                 enabledListeners.contains(ctx.packageName)
             val deviceAdminOk = isDeviceAdminActive(ctx)
+            val topHabit = runCatching {
+                vault.predictHabitsForCurrentHour().firstOrNull()?.first
+            }.getOrNull()
 
             _uiState.update {
                 it.copy(
@@ -331,7 +334,8 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
                         deviceAdminEnabled = deviceAdminOk
                     ),
                     isVirtualDisplayActive = adbEngine.virtualDisplayRunner.isActive.value,
-                    activeVirtualDisplayId = adbEngine.virtualDisplayRunner.virtualDisplayId.value
+                    activeVirtualDisplayId = adbEngine.virtualDisplayRunner.virtualDisplayId.value,
+                    suggestedHabit = topHabit
                 )
             }
         }
@@ -556,6 +560,7 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
                 groqKey = updated.groqKey,
                 deepSeekKey = updated.deepSeekKey,
                 openRouterKey = updated.openRouterKey,
+                nvidiaNimKey = updated.nvidiaNimKey,
                 sosContacts = updated.sosContacts,
                 githubRepo = updated.githubRepo,
                 githubToken = updated.githubToken,
@@ -580,6 +585,7 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
             groqKey = s.groqApiKey,
             deepSeekKey = s.deepSeekApiKey,
             openRouterKey = s.openRouterApiKey,
+            nvidiaNimKey = s.nvidiaNimApiKey,
             sosContacts = s.sosContactsCsv,
             githubRepo = s.githubRepo,
             githubToken = s.githubToken,

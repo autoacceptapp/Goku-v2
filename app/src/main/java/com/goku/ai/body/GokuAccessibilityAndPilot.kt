@@ -1138,6 +1138,19 @@ class GokuAccessibilityService : AccessibilityService() {
         return list
     }
 
+    fun captureLiveScreenText(): String {
+        val root = rootInActiveWindow ?: return _lastScreenText.value
+        return try {
+            val extracted = extractTreeText(root, maxNodes = 90)
+            if (extracted.isNotBlank()) {
+                _lastScreenText.value = extracted
+            }
+            extracted.ifBlank { _lastScreenText.value }
+        } finally {
+            root.recycleCompat()
+        }
+    }
+
     private fun extractTreeText(root: AccessibilityNodeInfo, maxNodes: Int): String {
         val sb = StringBuilder()
         val nodes = collectNodes(root, maxNodes)

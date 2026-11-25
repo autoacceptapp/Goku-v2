@@ -880,6 +880,8 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                         isKeyguardLocked = isLocked
                     )
                 }
+                // Blueprint Phase 3 — Speculative Pre-Warming: warm UI tree & context before sentence finishes
+                runCatching { onWakePreWarm?.invoke() }
                 // Check isSpeechRecognizerActive (NOT isAcousticEarArmed/isListening) so lock-screen
                 // VAD immediately launches SpeechRecognizer when Sherpa-ONNX AAR is absent.
                 if (!_state.value.isSpeechRecognizerActive) {
@@ -956,8 +958,15 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         }
     }
 
+    @Volatile
+    private var onWakePreWarm: (() -> Unit)? = null
+
     fun setCommandCallback(callback: (String) -> Unit) {
         onCommandRecognized = callback
+    }
+
+    fun setPreWarmCallback(callback: () -> Unit) {
+        onWakePreWarm = callback
     }
 
     private fun initTts() {

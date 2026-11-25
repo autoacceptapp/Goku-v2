@@ -143,6 +143,9 @@ object GokuHeadlessCommandBus {
     fun ensureVoiceCallbackWired(context: Context): GokuRuntimeComponents {
         val appCtx = context.applicationContext
         val runtime = ensureInitialized(appCtx)
+        runtime.voiceEngine.setPreWarmCallback {
+            runtime.brain.preWarmForWakeWord()
+        }
         runtime.voiceEngine.setCommandCallback { spokenText ->
             dispatchVoiceCommand(appCtx, spokenText, speakReply = true)
         }
@@ -1219,16 +1222,21 @@ class GokuNotificationListenerService : NotificationListenerService() {
             }
         }
 
-        // 2. Autonomous Financial & Bill Guardian (Local Expense Parser)
+        // 2. Autonomous Financial & Bill Guardian (Local Expense Parser + 24h Auto-Debit Alert)
+        val isUpcomingDebit = lower.contains("bill due") || lower.contains("auto-debit") ||
+            lower.contains("autopay") || lower.contains("e-mandate") || lower.contains("mandate") ||
+            lower.contains("due tomorrow") || lower.contains("due in 24") || lower.contains("will be debited")
         val isDebit = lower.contains("debited") || lower.contains("spent") ||
-            lower.contains("paid") || lower.contains("bill due") || lower.contains("auto-debit")
+            lower.contains("paid") || isUpcomingDebit
         if (isDebit) {
             val amtStr = expenseAmountRegex.find(combined)?.groupValues?.get(1)?.replace(",", "")
             val amount = amtStr?.toDoubleOrNull()
             if (amount != null && amount > 0.0) {
                 val category = classifyExpenseCategory(lower)
                 val merchant = title.ifBlank { pkg.substringAfterLast('.') }
-                val recurring = lower.contains("auto-debit") || lower.contains("emi") || lower.contains("subscription")
+                val recurring = isUpcomingDebit || lower.contains("emi") ||
+                    lower.contains("subscription") || lower.contains("sip") ||
+                    category == "OTT" || category == "EMI"
                 scope.launch {
                     vault.recordExpense(
                         merchant = merchant,
@@ -1236,6 +1244,14 @@ class GokuNotificationListenerService : NotificationListenerService() {
                         category = category,
                         rawSource = combined.take(220),
                         isRecurring = recurring
+                    )
+                }
+                if (isUpcomingDebit) {
+                    GokuKeepAliveService.postFgsRestrictedNotification(
+                        context = applicationContext,
+                        title = "Goku Bill Guardian: Upcoming Auto-Debit",
+                        detail = "$merchant ($category) ₹${"%.0f".format(Locale.US, amount)} — ${text.take(120)}",
+                        notifId = 1094
                     )
                 }
             }

@@ -271,6 +271,7 @@ class GokuCoreUnitTest {
             groqKey = "groq-key-456",
             deepSeekKey = "ds-key-789",
             openRouterKey = "or-key-012",
+            nvidiaNimKey = "nvapi-free-345",
             sosContacts = "+919876543210, 9123456789; 123",
             githubRepo = "user/goku-backup",
             githubToken = "ghp_secretToken999",
@@ -290,6 +291,7 @@ class GokuCoreUnitTest {
         assertEquals("groq-key-456", settings.groqApiKey)
         assertEquals("ds-key-789", settings.deepSeekApiKey)
         assertEquals("or-key-012", settings.openRouterApiKey)
+        assertEquals("nvapi-free-345", settings.nvidiaNimApiKey)
         assertEquals("user/goku-backup", settings.githubRepo)
         assertEquals("ghp_secretToken999", settings.githubToken)
         assertEquals("123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11", settings.telegramBotToken)
@@ -417,5 +419,44 @@ class GokuCoreUnitTest {
         assertTrue(msg404.contains("404"))
         assertTrue(msg404.contains(defaultPreset.name))
         assertTrue(msg404.contains(".task/.bin"))
+    }
+
+    @Test
+    fun testHabitPredictorAndRecurringBillsReminder() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vault = GokuVaultRepository(context)
+        val now = System.currentTimeMillis()
+
+        // Seed 2 recurring commands around current hour so Habit Predictor detects the routine
+        vault.logAction("EXECUTOR", "Torch on", "Flashlight enabled", 100, "OK", 5L)
+        vault.logAction("EXECUTOR", "Torch on", "Flashlight enabled", 100, "OK", 5L)
+        val habits = vault.predictHabitsForCurrentHour(now)
+        assertTrue(
+            "Expected 'Torch on' habit prediction, got: $habits",
+            habits.any { it.first.equals("Torch on", ignoreCase = true) && it.second >= 2 }
+        )
+
+        // Seed a recurring OTT bill and verify 24h monthly auto-debit window reminder
+        vault.recordExpense(
+            merchant = "Netflix India",
+            amountInr = 499.0,
+            category = "OTT",
+            rawSource = "AutoPay mandate Netflix Rs.499",
+            isRecurring = true
+        )
+        val dayMs = 24L * 60L * 60L * 1000L
+        val billSummary = vault.buildRecurringBillsReminderHinglish(now + 29L * dayMs)
+        assertTrue(
+            "Expected Auto-Debit Alert (24h Window) in recurring bills summary, got: $billSummary",
+            billSummary.contains("Auto-Debit Alert", ignoreCase = true)
+        )
+        assertTrue(
+            "Expected Netflix India in recurring bills summary, got: $billSummary",
+            billSummary.contains("Netflix India", ignoreCase = true)
+        )
+        assertTrue(
+            "Expected amount 499 in recurring bills summary, got: $billSummary",
+            billSummary.contains("499")
+        )
     }
 }

@@ -1,5 +1,5 @@
 ====================================================================
-GOKU - FINAL SMART MASTER ROADMAP (7 PHASES - ZERO-LIMIT V10 GOD-MODE)
+GOKU - FINAL SMART MASTER ROADMAP (7 PHASES - ZERO-LIMIT V10.1)
 ====================================================================
 
 CORE PHILOSOPHY (UNRESTRICTED HUMAN BRAIN + FULL PHONE BODY)
@@ -9,8 +9,9 @@ CORE PHILOSOPHY (UNRESTRICTED HUMAN BRAIN + FULL PHONE BODY)
   dimaag aur haath-aankh use karta hai, waise hi Goku phone ke har
   corner ko bina kisi limit ke control karega.
 - OFFLINE = ONLINE (IDENTICAL POWER): Bina internet ke bhi Goku
-  bilkul online jaisi natural baat-cheet aur poora kaam karega—full
-  on-device LLM, offline Hindi/Hinglish voice, offline screen vision,
+  bilkul online jaisi natural baat-cheet aur poora kaam karega—latest
+  2026 on-device LiteRT-LM / MediaPipe GenAI LLM, 1-Tap In-App Model
+  Downloader, offline Hindi/Hinglish voice, offline screen vision,
   aur 100% phone body control ke saath. Internet sirf live web search
   ke liye hoga, aur online seekha har kaam turant offline brain mein
   save ho jaayega.
@@ -105,9 +106,9 @@ PHASE 3: 3-TIER LOW-POWER EAR, AMBIENT AWARENESS & PROACTIVE SHIELD
     action shuru ho.
   * Tier 2 (0.1s Reflex): Simple commands bina heavy LLM jagaye
     turant execute honge.
-  * Tier 3 (On-Demand LLM Auto-Unload): Complex baat-cheet par local
-    AI load hoga aur baat khatam hone ke 15 second baad RAM se unload
-    hokar battery bachayega.
+  * Tier 3 (On-Demand Latest LiteRT/MediaPipe LLM Auto-Unload): Complex
+    baat-cheet par local AI load hoga aur baat khatam hone ke 15
+    second baad RAM se auto-unload hokar 0 MB idle RAM rakhega.
 - Natural Hinglish Prosody, Neural Noise Cancellation & Barge-In:
   * Traffic, hawa, ya pankhe ke shor mein bhi neural noise suppression
     se aapki aawaz saaf sunna aur human-like Hinglish rhythm mein
@@ -129,19 +130,25 @@ PHASE 3: 3-TIER LOW-POWER EAR, AMBIENT AWARENESS & PROACTIVE SHIELD
   * "Goku, kaam mode ON" bolte hi distraction apps aur alerts block.
 
 --------------------------------------------------------------------
-PHASE 4: MULTI-AGENT SWARM BRAIN, LIVE-EYE & EXPENSE GUARDIAN
+PHASE 4: LATEST OFFLINE AI (1-TAP DOWNLOAD), SWARM BRAIN & LIVE-EYE
 --------------------------------------------------------------------
+- Latest 2026 On-Device Offline AI Engine (1-Tap In-App Setup):
+  * 1-Tap In-App Model Downloader (Zero Manual Setup): APK install
+    hone ke baad app ke andar se hi ek tap mein open-access latest
+    models (Gemma-3-1B Ultra-Lite ~650 MB / Qwen2.5-1.5B Pro ~1.15 GB)
+    HTTP Range Resume support ke saath download hokar auto-activate
+    honge (net katne par wahin se resume + 1-tap delete option).
+  * Google LiteRT-LM / MediaPipe GenAI Runtime (`tasks-genai` NPU/GPU
+    accelerated): Ek hi compact 4-bit quantized `.task`/`.bin` model
+    offline Hinglish conversation, JSON action planning, reasoning,
+    aur coding sab sambhalega + 15-second idle RAM auto-unload.
+  * Online Multi-Model Router + Auto-Quota Failover: Internet hone par
+    Gemini, DeepSeek, Qwen, Groq, ya NVIDIA NIM mein auto-switch karna.
 - Self-Correcting Multi-Agent Swarm (Planner + Executor + Critic):
   * Planner: Sabse chhota aur fast action path banata hai.
   * Executor: Intent / ADB / Accessibility se step-by-step chalata hai.
   * Critic (Watchdog): Har step ke baad screen verify karta hai ki
     wahi result aaya ya nahi; 1% gadbad par turant undo/fix karta hai.
-- Unified Multi-Model Brain Engine (Offline = Online, Single Model):
-  * Single Shared 4-Bit Quantized GGUF Model (~1.2–1.5 GB): Alag-alag
-    models ki jagah ek hi compact local model chat, reasoning, aur
-    coding sab sambhalega (storage aur RAM dono ki bachat).
-  * Online Multi-Model Router + Auto-Quota Failover: Internet hone par
-    Gemini, DeepSeek, Qwen, Groq, ya NVIDIA NIM mein auto-switch karna.
 - Adaptive Micro-Prompts & Token Compression (3x Fast Brain):
   * Screen ke sirf kaam ke buttons aur baaton ke core facts extract
     karke AI ko bhejna taaki offline LLM 3x fast chale, battery half
@@ -221,8 +228,8 @@ PHASE 7: AUTONOMOUS SELF-CODING, R&D DISCOVERY & SYNC
 - Nightly Autonomous App-Intent Discovery & Self-Critique (Dream Mode):
   * Raat ko charging + Wi-Fi par installed apps ke hidden ADB intents
     aur shortcuts khud scan/discover karke skill library mein add
-    karna + din bhar ki galtiyon ka self-audit karke rules upgrade
-    karna + storage cache clean karna.
+    karna + din bhar ki galtiyon aur slow tasks ka self-audit karke
+    rules upgrade karna + storage cache clean karna.
 - Autonomous Multi-Tool & Multi-Model Self-Coding Builder:
   * Instant In-App Live Plugin Engine (0.1s): Bina APK rebuild kiye
     JSON/QuickJS scripts live load karna.

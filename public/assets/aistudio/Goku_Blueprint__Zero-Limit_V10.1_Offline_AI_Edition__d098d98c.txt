@@ -1,5 +1,5 @@
 ====================================================================
-GOKU - COMPLETE ARCHITECTURE & FEATURE BLUEPRINT (ZERO-LIMIT V10)
+GOKU - COMPLETE ARCHITECTURE & FEATURE BLUEPRINT (ZERO-LIMIT V10.1)
 ====================================================================
 
 1. CORE VISION (UNRESTRICTED HUMAN BRAIN + FULL PHONE BODY)
@@ -8,13 +8,14 @@ Goku ek personal Jarvis-style autonomous assistant hai jisme koi
 artificial limit, command cap, ya restriction nahi hai. Jaise ek
 insaan ka dimaag sochta hai aur uska shareer har kaam karta hai,
 waise hi Goku ka dimaag aur poori phone body milkar kaam karte hain.
-Offline aur Online mein Goku bilkul ek jaisa baat aur kaam karega,
-Planner-Executor-Critic swarm, Predictive Pre-Fetching, aur
-Dual-Verification se bina galti kiye 0.1s mein kaam karega, aur smart
-compression/sleep se phone ki battery aur storage dono bachayega:
+Latest 2026 on-device LiteRT-LM / MediaPipe GenAI engine aur 1-Tap
+In-App Model Downloader ke saath Offline aur Online mein Goku bilkul
+ek jaisa baat aur kaam karega, Planner-Executor-Critic swarm se bina
+galti kiye 0.1s mein kaam karega, aur smart sleep/compression se phone
+ki battery aur storage dono bachayega:
 
   SENSE (3-Tier Pre-Warming Ear + Ambient/Camera Live-Eye + Sensors)
-    -> THINK (Pre-Fetch + Swarm [Planner/Executor/Critic] + World Model)
+    -> THINK (1-Tap Offline LLM + Pre-Fetch + Swarm [Planner/Executor/Critic])
       -> ACT (Intent + Local ADB + Ad/OTP Autopilot + VirtualDisplay)
         -> EVOLVE (Shortcut Compiler + R&D Discovery + Self-Coding)
 
@@ -30,9 +31,9 @@ compression/sleep se phone ki battery aur storage dono bachayega:
     hote hi 0.2 second mein action shuru ho sake.
   * Tier 2 (0.1s Reflex): Simple commands bina heavy LLM jagaye
     turant chalenge.
-  * Tier 3 (On-Demand LLM Auto-Unload): Complex baat-cheet ke waqt
-    local AI RAM mein load hoga aur baat khatam hone ke 15 second baad
-    auto-unload hokar CPU/battery bachayega.
+  * Tier 3 (On-Demand Latest LiteRT/MediaPipe LLM Auto-Unload): Complex
+    baat-cheet ke waqt local AI RAM mein load hoga aur baat khatam
+    hone ke 15 second baad auto-unload hokar 0 MB idle RAM rakhega.
 - Natural Hinglish Prosody, Neural Noise Cancellation & Barge-In:
   * Traffic, hawa, ya pankhe ke shor mein bhi on-device neural noise
     suppression se aawaz saaf sunna, natural Hinglish breathing pauses
@@ -47,17 +48,26 @@ compression/sleep se phone ki battery aur storage dono bachayega:
   Fingerprint bypass nahi hota; app kholne ke liye unlock zaroori hai).
 
 --------------------------------------------------------------------
-3. MULTI-AGENT SWARM BRAIN (OFFLINE = ONLINE + LIVE-EYE + RAG)
+3. MULTI-AGENT SWARM BRAIN (LATEST OFFLINE AI = ONLINE + LIVE-EYE)
 --------------------------------------------------------------------
+- Latest 2026 On-Device Offline AI Engine + 1-Tap In-App Downloader:
+  * 1-Tap In-App Model Downloader: APK install karne ke baad app ke
+    andar se hi 1 tap mein open-access latest quantized models
+    (Gemma-3-1B Ultra-Lite ~650 MB / Qwen2.5-1.5B Smart Pro ~1.15 GB)
+    HTTP Range Resume support ke saath download hokar auto-activate
+    honge (no login token or manual file-picker needed; pause/resume
+    aur 1-tap delete storage cleanup support ke saath).
+  * Google LiteRT-LM / MediaPipe GenAI Runtime (`tasks-genai` NPU/GPU
+    accelerated): Ek hi compact 4-bit quantized `.task`/`.bin` model
+    offline Hinglish conversation, structured JSON action planning,
+    reasoning, aur coding sab sambhalega (GBs storage bachat + 15s
+    idle RAM auto-unload).
 - Self-Correcting Multi-Agent Swarm (Planner + Executor + Critic):
   * Planner: Sabse chhota aur fast action path banata hai.
   * Executor: Intent / ADB / Accessibility se step-by-step chalata hai.
   * Critic (Watchdog): Har step ke baad screen verify karta hai ki
     sach mein wahi result aaya ya nahi; 1% gadbad par turant undo/fix
     karta hai.
-- Single Shared 4-Bit Quantized GGUF Model (~1.2–1.5 GB):
-  * Alag-alag models download karne ki jagah ek hi compact local LLM
-    chat, reasoning, aur coding sab sambhalega (GBs storage bachat).
 - Adaptive Micro-Prompts & Token Compression (3x Fast Brain):
   * Dynamic Context Compressor: Screen ke sirf kaam ke buttons aur
     baaton ke core facts extract karke AI ko bhejna—jisse offline LLM

@@ -2,11 +2,13 @@ package com.goku.ai.brain
 
 import android.Manifest
 import android.app.KeyguardManager
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -18,6 +20,7 @@ import androidx.core.content.ContextCompat
 import com.goku.ai.adb.LocalAdbEngine
 import com.goku.ai.automation.EmergencySosManager
 import com.goku.ai.automation.SelfCodingPluginEngine
+import com.goku.ai.body.GokuAccessibilityService
 import com.goku.ai.body.UniversalAppPilot
 import com.goku.ai.data.GokuVaultRepository
 import com.goku.ai.data.MemoryNodeEntity
@@ -1142,6 +1145,7 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
         val groqKey = vault.settings.groqApiKey
         val deepSeekKey = vault.settings.deepSeekApiKey
         val openRouterKey = vault.settings.openRouterApiKey
+        val nvidiaNimKey = vault.settings.nvidiaNimApiKey
 
         // Provider 1: Google Gemini Free Tier REST API
         if (geminiKey.isNotBlank() && isActive && !GokuKillSwitch.isStopped.value) {
@@ -1190,6 +1194,20 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
             )?.let {
                 _activeProvider.value = "OPENROUTER-FREE"
                 return@withContext StructuredActionParser.parse(it, "OPENROUTER-FREE")
+            }
+        }
+
+        // Provider 5: NVIDIA NIM Free Tier Failover (Blueprint V10.1)
+        if (nvidiaNimKey.isNotBlank() && isActive && !GokuKillSwitch.isStopped.value) {
+            callOpenAiCompatible(
+                endpoint = "https://integrate.api.nvidia.com/v1/chat/completions",
+                apiKey = nvidiaNimKey,
+                model = "meta/llama-3.3-70b-instruct",
+                userPrompt = userPrompt,
+                systemPrompt = systemPrompt
+            )?.let {
+                _activeProvider.value = "NVIDIA-NIM"
+                return@withContext StructuredActionParser.parse(it, "NVIDIA-NIM")
             }
         }
 
@@ -1307,7 +1325,7 @@ class HybridBrainAndSwarm(
         listOf(
             ChatMessage(
                 isUser = false,
-                text = "Goku V10.1 (10.1-godmode) online & MediaPipe offline hybrid core ready hai boss! 'Hey Goku' bolo ya neeche command likho. Vault tab se 1-tap Qwen2.5 / SmolLM2 Offline AI download kar sakte ho.",
+                text = "Goku V10.1 (10.1-godmode) online & MediaPipe offline hybrid core ready hai boss! 'Hey Goku' bolo ya neeche command likho. Vault tab se 1-tap Qwen2.5 1.5B / 0.5B Offline AI download kar sakte ho.",
                 engineBadge = "V10.1-CORE",
                 confidence = 100
             )
@@ -1340,8 +1358,35 @@ class HybridBrainAndSwarm(
         GokuKillSwitch.registerStopHook(stopHook)
     }
 
+    private val preWarmScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    @Volatile
+    private var lastPreWarmAtMs: Long = 0L
+
+    /**
+     * V10.1 Speculative Pre-Warming:
+     * Invoked the millisecond "Hey Goku" wake-word triggers, pre-reading the active Accessibility
+     * screen tree and refreshing network state in the background before the user finishes speaking.
+     */
+    fun preWarmForWakeWord() {
+        val now = System.currentTimeMillis()
+        if (now - lastPreWarmAtMs < 1_500L) return
+        lastPreWarmAtMs = now
+        preWarmScope.launch {
+            runCatching { isNetworkAvailable() }
+            val liveScreen = runCatching {
+                GokuAccessibilityService.instance?.captureLiveScreenText()
+            }.getOrNull()
+            if (!liveScreen.isNullOrBlank()) {
+                vault.workingMemory.lastScreenSummary =
+                    DynamicContextCompressor.compressScreenTree(liveScreen, maxChars = 360)
+            }
+        }
+    }
+
     fun close() {
         GokuKillSwitch.unregisterStopHook(stopHook)
+        preWarmScope.cancel()
         offlineLlm.close()
     }
 
@@ -1769,6 +1814,60 @@ class HybridBrainAndSwarm(
             return Triple(res, "REFLEX-0S", 99)
         }
 
+        // 2B. 0-Sec Offline Volume Control (Blueprint Phase 4)
+        if (lower.contains("volume") || lower.contains("aawaz") || lower == "mute" || lower.contains("mute karo")) {
+            val res = if (dryRun) "[DRY-RUN] Would adjust device volume ($input)"
+            else adjustDeviceVolume(lower)
+            return Triple(res, "REFLEX-0S", 98)
+        }
+
+        // 2C. Deep Focus Shield ("Goku, kaam mode ON/OFF") (Blueprint Phase 3)
+        if (lower.contains("kaam mode") || lower.contains("work mode") || lower.contains("focus mode") || lower.contains("focus shield")) {
+            val enable = !(lower.contains("off") || lower.contains("band") || lower.contains("disable"))
+            val res = if (dryRun) {
+                "[DRY-RUN] Work Focus Shield -> ${if (enable) "ON" else "OFF"}"
+            } else {
+                applyWorkFocusShield(enable)
+            }
+            return Triple(res, "FOCUS-SHIELD", 99)
+        }
+
+        // 2D. Smart App Freezer via Direct Local ADB (Blueprint Phase 2 & 4)
+        if (lower.startsWith("freeze ") || lower.startsWith("unfreeze ") ||
+            lower.endsWith(" freeze karo") || lower.endsWith(" unfreeze karo")
+        ) {
+            val isUnfreeze = lower.contains("unfreeze")
+            val appQuery = input
+                .replace(Regex("^(?:un)?freeze\\s+", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("\\s*(?:un)?freeze\\s+karo$", RegexOption.IGNORE_CASE), "")
+                .trim()
+            if (appQuery.isNotEmpty()) {
+                if (isDeviceLocked()) {
+                    return Triple(
+                        "Security Lock: Phone locked hai boss. App freeze/unfreeze ke liye pehle device unlock karein.",
+                        "LOCK-SCREEN-GUARD",
+                        100
+                    )
+                }
+                val pkg = resolveInstalledPackage(appQuery)
+                if (pkg == null) {
+                    return Triple("'$appQuery' naam ka koi installed app nahi mila.", "APP-FREEZER", 70)
+                }
+                _brainState.value = BrainVisualState.ACTING
+                val resMsg = if (dryRun) {
+                    "[DRY-RUN] Would ${if (isUnfreeze) "unfreeze" else "freeze"} $appQuery ($pkg) via Local ADB."
+                } else {
+                    val adbRes = if (isUnfreeze) adbEngine.unfreezeApp(pkg) else adbEngine.freezeApp(pkg)
+                    if (adbRes.success) {
+                        "$appQuery ($pkg) ${if (isUnfreeze) "unfreeze" else "freeze"} kar diya boss!"
+                    } else {
+                        "$appQuery ${if (isUnfreeze) "unfreeze" else "freeze"} ke liye Local ADB connected hona zaroori hai (${adbRes.output.take(100)})."
+                    }
+                }
+                return Triple(resMsg, "APP-FREEZER", 95)
+            }
+        }
+
         // 3. Remember / Save to Personal Memory Vault
         if (lower.startsWith("yaad rakh") || lower.startsWith("remember ")) {
             val body = input
@@ -1790,7 +1889,17 @@ class HybridBrainAndSwarm(
             }
         }
 
-        // 4. Expense Guardian Summary
+        // 4. Expense Guardian & 24h Recurring Bills Summary
+        if (lower.contains("recurring bill") || lower.contains("auto debit") || lower.contains("auto-debit") || lower.contains("subscription")) {
+            if (isDeviceLocked()) {
+                return Triple(
+                    "Security Lock: Phone locked hai boss. Bill alerts dekhne ke liye pehle device unlock karein.",
+                    "LOCK-SCREEN-GUARD",
+                    100
+                )
+            }
+            return Triple(vault.buildRecurringBillsReminderHinglish(), "BILL-GUARDIAN", 98)
+        }
         if (lower.contains("expense") || lower.contains("kharch") || lower.contains("bill summary")) {
             if (isDeviceLocked()) {
                 return Triple(
@@ -1801,6 +1910,58 @@ class HybridBrainAndSwarm(
             }
             val summary = vault.buildMonthlyExpenseSummaryHinglish()
             return Triple(summary, "EXPENSE-GUARDIAN", 98)
+        }
+
+        // 4B. Habit Predictor (Blueprint Phase 6)
+        if (lower.contains("habit") || lower.contains("mera routine") || lower.contains("aaj kya karoon") || lower.contains("kya suggest")) {
+            val habits = vault.predictHabitsForCurrentHour()
+            val msg = if (habits.isEmpty()) {
+                "Abhi is samay ke liye koi repeated habit pattern nahi mila. Jaise-jaise aap roz commands use karenge, main is time ke tasks khud suggest karoonga."
+            } else {
+                val formatted = habits.joinToString(", ") { "'${it.first}' (${it.second}x)" }
+                "Habit Predictor: Is samay aap aksar yeh karte hain — $formatted. Bolo shuru kar doon?"
+            }
+            return Triple(msg, "HABIT-PREDICTOR", 94)
+        }
+
+        // 4C. Live Screen Co-Pilot (Blueprint Phase 5)
+        if (lower.contains("read screen") || lower.contains("screen padho") ||
+            lower.contains("screen samjhao") || lower.contains("explain screen")
+        ) {
+            if (isDeviceLocked()) {
+                return Triple(
+                    "Security Lock: Phone locked hai boss. Screen read karne ke liye pehle device unlock karein.",
+                    "LOCK-SCREEN-GUARD",
+                    100
+                )
+            }
+            val liveScreen = GokuAccessibilityService.instance?.captureLiveScreenText().orEmpty()
+                .ifBlank { vault.workingMemory.lastScreenSummary }
+            if (liveScreen.isBlank()) {
+                return Triple(
+                    "Live Screen Co-Pilot: Screen text nahi mila. Setup tab se Goku Accessibility Phone Body enable karein.",
+                    "SCREEN-COPILOT",
+                    65
+                )
+            }
+            val compact = DynamicContextCompressor.compressScreenTree(liveScreen, 360)
+            return Triple("Live Screen Co-Pilot: Screen par yeh dikh raha hai — $compact", "SCREEN-COPILOT", 95)
+        }
+
+        // 4D. Zero-Space Encrypted Cloud Archive On-Demand (Blueprint Phase 7)
+        if (lower.contains("cloud archive") || lower.contains("backup now") || lower.contains("skills backup")) {
+            _brainState.value = BrainVisualState.ACTING
+            if (dryRun) {
+                return Triple("[DRY-RUN] Would export .goku skills & push encrypted archive to GitHub/Telegram.", "CLOUD-ARCHIVE", 96)
+            }
+            val skillsJson = vault.exportAllSkillsToGokuJson()
+            val ghRes = if (vault.settings.githubToken.isNotBlank()) {
+                pluginEngine.pushToGithubArchive("backups/goku-skills-v10.1.goku.json", skillsJson, "On-demand Goku V10.1 encrypted skill backup")
+            } else "GitHub not configured"
+            val tgRes = if (vault.settings.telegramBotToken.isNotBlank()) {
+                pluginEngine.sendTelegramArchiveSummary("Goku V10.1 On-Demand Encrypted Backup\nSkills exported (${skillsJson.length} chars)")
+            } else "Telegram not configured"
+            return Triple("Cloud Archive Complete: $ghRes | $tgRes", "CLOUD-ARCHIVE", 96)
         }
 
         // 5. Phone Doctor & Cache Cleaner
@@ -2137,19 +2298,28 @@ class HybridBrainAndSwarm(
                 100
             )
         }
-        val finalNumber = resolvePhoneNumber(targetRaw)
+        val candidates = resolvePhoneCandidates(targetRaw)
         vault.workingMemory.addTurn("SYSTEM", "Target contact $targetRaw", "contact:$targetRaw")
-        if (finalNumber.isBlank()) {
+        if (candidates.isEmpty()) {
             return Triple(
                 "Ambiguity Resolver: '$targetRaw' ka number Vault mein nahi mila. Kripya number bolein ya 'Yaad rakhna $targetRaw = 98XXXXXXXX' bolkar save karein.",
                 "AMBIGUITY-RESOLVER",
                 72
             )
         }
-        val prompt = "Safety Confirm: Kya main $targetRaw ($finalNumber) ko call lagaoon? 'Haan' ya 'Nahi' bolein."
+        if (candidates.size > 1) {
+            val options = candidates.take(3).joinToString(" ya ") { "${it.first} (${it.second})" }
+            return Triple(
+                "Ambiguity Resolver: '$targetRaw' naam ke ${candidates.size} contacts mile hain — $options. Kise call lagaoon?",
+                "AMBIGUITY-RESOLVER",
+                80
+            )
+        }
+        val (resolvedLabel, finalNumber) = candidates.first()
+        val prompt = "Safety Confirm: Kya main $resolvedLabel ($finalNumber) ko call lagaoon? 'Haan' ya 'Nahi' bolein."
         _pendingConfirmation.value = PendingConfirmation(
             promptHinglish = prompt,
-            actionSummary = "Call $targetRaw ($finalNumber)",
+            actionSummary = "Call $resolvedLabel ($finalNumber)",
             confidence = 95,
             onConfirm = {
                 if (dryRun) "[DRY-RUN] Would dial $finalNumber"
@@ -2167,19 +2337,28 @@ class HybridBrainAndSwarm(
                 100
             )
         }
-        val finalNumber = resolvePhoneNumber(targetRaw)
+        val candidates = resolvePhoneCandidates(targetRaw)
         vault.workingMemory.addTurn("SYSTEM", "Target SMS $targetRaw", "contact:$targetRaw")
-        if (finalNumber.isBlank()) {
+        if (candidates.isEmpty()) {
             return Triple(
                 "Ambiguity Resolver: '$targetRaw' ka number Vault mein nahi mila. Pehle 'Yaad rakhna $targetRaw = 98XXXXXXXX' save karein.",
                 "AMBIGUITY-RESOLVER",
                 72
             )
         }
-        val prompt = "Safety Confirm: Kya main $targetRaw ($finalNumber) ko SMS bhejoon: \"$body\"? 'Haan' ya 'Nahi' bolein."
+        if (candidates.size > 1) {
+            val options = candidates.take(3).joinToString(" ya ") { "${it.first} (${it.second})" }
+            return Triple(
+                "Ambiguity Resolver: '$targetRaw' naam ke ${candidates.size} contacts mile hain — $options. Kise SMS bhejoon?",
+                "AMBIGUITY-RESOLVER",
+                80
+            )
+        }
+        val (resolvedLabel, finalNumber) = candidates.first()
+        val prompt = "Safety Confirm: Kya main $resolvedLabel ($finalNumber) ko SMS bhejoon: \"$body\"? 'Haan' ya 'Nahi' bolein."
         _pendingConfirmation.value = PendingConfirmation(
             promptHinglish = prompt,
-            actionSummary = "SMS $targetRaw ($finalNumber)",
+            actionSummary = "SMS $resolvedLabel ($finalNumber)",
             confidence = 95,
             onConfirm = {
                 if (dryRun) "[DRY-RUN] Would send SMS to $finalNumber: $body"
@@ -2189,10 +2368,65 @@ class HybridBrainAndSwarm(
         return Triple(prompt, "SAFETY-GATE", 95)
     }
 
-    private suspend fun resolvePhoneNumber(targetRaw: String): String {
-        extractFirstPhoneNumber(targetRaw)?.let { return it }
-        val vaultMatch = vault.searchMemories(targetRaw).firstOrNull { extractFirstPhoneNumber(it.value) != null }
-        return vaultMatch?.let { extractFirstPhoneNumber(it.value) }.orEmpty()
+    private suspend fun resolvePhoneCandidates(targetRaw: String): List<Pair<String, String>> {
+        extractFirstPhoneNumber(targetRaw)?.let { return listOf(targetRaw to it) }
+        val matches = vault.searchMemories(targetRaw)
+            .mapNotNull { node ->
+                val num = extractFirstPhoneNumber(node.value) ?: return@mapNotNull null
+                node.key to num
+            }
+            .distinctBy { it.second }
+        if (matches.size <= 1) return matches
+        val exact = matches.firstOrNull { it.first.equals(targetRaw.trim(), ignoreCase = true) }
+        return if (exact != null) listOf(exact) else matches
+    }
+
+    private fun adjustDeviceVolume(lower: String): String {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            ?: return "AudioManager unavailable hai."
+        return runCatching {
+            val stream = AudioManager.STREAM_MUSIC
+            val maxVol = am.getStreamMaxVolume(stream).coerceAtLeast(1)
+            when {
+                lower.contains("mute") || lower.contains("silent") || lower.contains("band") -> {
+                    am.setStreamVolume(stream, 0, AudioManager.FLAG_SHOW_UI)
+                    "Media volume mute kar diya boss."
+                }
+                lower.contains("full") || lower.contains("max") || lower.contains("100") -> {
+                    am.setStreamVolume(stream, maxVol, AudioManager.FLAG_SHOW_UI)
+                    "Volume full ($maxVol/$maxVol) kar diya boss."
+                }
+                lower.contains("down") || lower.contains("kam") || lower.contains("low") || lower.contains("ghata") -> {
+                    am.adjustStreamVolume(stream, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+                    "Volume kam kar diya boss."
+                }
+                else -> {
+                    am.adjustStreamVolume(stream, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+                    "Volume badha diya boss."
+                }
+            }
+        }.getOrElse { "Volume adjust nahi ho paya: ${it.message}" }
+    }
+
+    private fun applyWorkFocusShield(enable: Boolean): String {
+        vault.settings.workFocusMode = enable
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        val dndNote = if (nm != null && nm.isNotificationPolicyAccessGranted) {
+            runCatching {
+                nm.setInterruptionFilter(
+                    if (enable) NotificationManager.INTERRUPTION_FILTER_PRIORITY
+                    else NotificationManager.INTERRUPTION_FILTER_ALL
+                )
+                if (enable) " + DND Priority ON" else " + DND OFF"
+            }.getOrDefault("")
+        } else {
+            ""
+        }
+        return if (enable) {
+            "Work Focus Shield ON kar diya boss$dndNote — distraction alerts aur whisper readouts paused hain."
+        } else {
+            "Work Focus Shield OFF kar diya boss$dndNote — normal notifications active hain."
+        }
     }
 
     private fun extractFirstPhoneNumber(raw: String): String? {

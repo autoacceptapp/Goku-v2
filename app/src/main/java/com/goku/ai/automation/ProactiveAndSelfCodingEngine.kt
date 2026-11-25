@@ -114,7 +114,8 @@ data class SensorReflexState(
     val isInPocket: Boolean = false,
     val batteryPercent: Int = 100,
     val isCharging: Boolean = false,
-    val adaptivePowerMode: String = "NORMAL" // NORMAL, ECO_20, SURVIVAL_10, DREAM_CHARGING
+    val adaptivePowerMode: String = "NORMAL", // NORMAL, ECO_20, SURVIVAL_10, DREAM_CHARGING
+    val lateNightEyeCareReminder: String? = null
 )
 
 class SensorReflexManager(private val context: Context) : SensorEventListener {
@@ -123,6 +124,7 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     private val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
     private val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+    private val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
     private val reflexScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _state = MutableStateFlow(SensorReflexState())
@@ -132,16 +134,38 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
     private var accelRegistered = false
     private var batteryReceiverRegistered = false
     private var screenReceiverRegistered = false
+    private var airplaneReceiverRegistered = false
     private var previousRingerMode: Int? = null
     private var previousInterruptionFilter: Int? = null
     private var lastAppliedPowerMode: String = "NORMAL"
     private var lastDreamTriggerMs: Long = 0L
+    @Volatile
+    private var screenOnSessionStartMs: Long = System.currentTimeMillis()
+    @Volatile
+    private var lastEyeCareReminderDay: Int = -1
+
+    private val airplaneReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            if (intent?.action != Intent.ACTION_AIRPLANE_MODE_CHANGED) return
+            val enabled = intent.getBooleanExtra("state", false)
+            val locked = runCatching {
+                keyguardManager?.isKeyguardLocked == true || keyguardManager?.isDeviceLocked == true
+            }.getOrDefault(false)
+            if (enabled && locked) {
+                AntiTheftIntruderGuard.getInstance(context).onLockScreenAirplaneAttempt()
+            }
+        }
+    }
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
             when (intent?.action) {
-                Intent.ACTION_SCREEN_OFF -> unregisterAccelerometer()
+                Intent.ACTION_SCREEN_OFF -> {
+                    unregisterAccelerometer()
+                    screenOnSessionStartMs = 0L
+                }
                 Intent.ACTION_SCREEN_ON -> {
+                    screenOnSessionStartMs = System.currentTimeMillis()
                     if (registered && _state.value.adaptivePowerMode != "SURVIVAL_10") {
                         registerAccelerometer()
                     }
@@ -160,7 +184,8 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
             val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
                 status == BatteryManager.BATTERY_STATUS_FULL
 
-            val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+            val cal = Calendar.getInstance()
+            val hour = cal.get(Calendar.HOUR_OF_DAY)
             val mode = when {
                 pct <= 10 && !charging -> "SURVIVAL_10"
                 pct <= 20 && !charging -> "ECO_20"
@@ -168,10 +193,38 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
                 else -> "NORMAL"
             }
 
+            // Blueprint Phase 3 — Late-Night Screen-Time & Eye-Care Guardian (23:00–05:00, >=45 min continuous use)
+            var eyeCareNote = _state.value.lateNightEyeCareReminder
+            val isLateNight = hour >= 23 || hour < 5
+            val sessionStart = screenOnSessionStartMs
+            val dayOfYear = cal.get(Calendar.DAY_OF_YEAR)
+            if (isLateNight &&
+                powerManager?.isInteractive == true &&
+                sessionStart > 0L &&
+                (System.currentTimeMillis() - sessionStart) >= 45L * 60_000L &&
+                lastEyeCareReminderDay != dayOfYear
+            ) {
+                lastEyeCareReminderDay = dayOfYear
+                eyeCareNote = "Raat kaafi ho gayi hai boss — 45+ min se screen on hai. Aankhon ko thoda rest de dijiye!"
+                reflexScope.launch {
+                    runCatching {
+                        GokuVaultRepository.getInstance(context).logAction(
+                            stage = "SYSTEM",
+                            command = "Eye-Care Guardian",
+                            detail = eyeCareNote,
+                            confidence = 100
+                        )
+                    }
+                }
+            } else if (!isLateNight && eyeCareNote != null) {
+                eyeCareNote = null
+            }
+
             _state.value = _state.value.copy(
                 batteryPercent = pct,
                 isCharging = charging,
-                adaptivePowerMode = mode
+                adaptivePowerMode = mode,
+                lateNightEyeCareReminder = eyeCareNote
             )
             applyAdaptivePowerActions(mode)
         }
@@ -281,6 +334,17 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
                 batteryReceiverRegistered = true
             }
         }
+        if (!airplaneReceiverRegistered) {
+            runCatching {
+                ContextCompat.registerReceiver(
+                    context,
+                    airplaneReceiver,
+                    IntentFilter(Intent.ACTION_AIRPLANE_MODE_CHANGED),
+                    ContextCompat.RECEIVER_EXPORTED
+                )
+                airplaneReceiverRegistered = true
+            }
+        }
     }
 
     fun stop() {
@@ -296,6 +360,10 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
         if (batteryReceiverRegistered) {
             runCatching { context.unregisterReceiver(batteryReceiver) }
             batteryReceiverRegistered = false
+        }
+        if (airplaneReceiverRegistered) {
+            runCatching { context.unregisterReceiver(airplaneReceiver) }
+            airplaneReceiverRegistered = false
         }
     }
 
@@ -818,6 +886,42 @@ class AntiTheftIntruderGuard(private val context: Context) {
             }
         } else {
             onComplete?.invoke()
+        }
+    }
+
+    /**
+     * Blueprint Phase 2 / Section 5 — Lock-Screen Airplane Mode Tamper Guard:
+     * Fires when someone enables Airplane Mode while the phone is locked.
+     */
+    fun onLockScreenAirplaneAttempt() {
+        val now = System.currentTimeMillis()
+        if ((now - lastAlertTimeMs) < ALERT_COOLDOWN_MS) return
+        lastAlertTimeMs = now
+        prefs.edit().putLong(KEY_LAST_ALERT_MS, now).apply()
+        scope.launch {
+            withTimeoutOrNull(8_500L) {
+                val vault = GokuVaultRepository.getInstance(context)
+                val sos = EmergencySosManager(context, vault)
+                val (photoFile, diagnosticReason) = captureSilentFrontCameraPhotoWithDiagnostic()
+                val photoPath = photoFile?.absolutePath
+                val gpsSummary = sos.getBestLastKnownLocationSummary()
+                if (photoPath != null) {
+                    prefs.edit().putString(KEY_LAST_PHOTO, photoPath).apply()
+                }
+                val photoStatus = photoPath ?: (diagnosticReason ?: "unavailable")
+                val logDetail = "Lock-screen Airplane Mode attempt | GPS=$gpsSummary | Photo=$photoStatus"
+                vault.logAction("SYSTEM", "Anti-Theft Airplane Guard", logDetail, 100, "WARN")
+                vault.saveMemory("last_intruder_event", logDetail, category = "SECURITY")
+                val smsReport = sos.triggerSosBeacon(
+                    customPrefix = "ANTI-THEFT ALERT (Goku V10.1): Airplane Mode toggled on lock screen! Photo=${photoFile?.name ?: "skipped"}."
+                )
+                _state.value = _state.value.copy(
+                    lastIntruderPhotoPath = photoPath ?: _state.value.lastIntruderPhotoPath,
+                    lastAlertTimestamp = System.currentTimeMillis(),
+                    lastAlertSummary = "$logDetail | $smsReport",
+                    isDeviceAdminActive = isDeviceAdminActive()
+                )
+            }
         }
     }
 
@@ -1690,6 +1794,24 @@ class SelfCodingPluginEngine(
         val doctorMsg = adbEngine.runPhoneDoctor()
         val failures = vault.getRecentFailures()
         val apps = adbEngine.discoverInstalledApps()
+        if (apps.isNotEmpty()) {
+            val appDirectoryDoc = apps.take(120).joinToString("; ") { "${it.first} (${it.second})" }
+            runCatching { vault.ragBrain.indexDocumentPersistent("installed_apps_index", appDirectoryDoc) }
+        }
+
+        // Prune old intruder snapshots (>14 days when >20 exist) to keep storage zero-bloat
+        val intruderDir = File(context.filesDir, "intruder")
+        val prunedPhotos = if (intruderDir.isDirectory) {
+            val cutoff = System.currentTimeMillis() - 14L * 24L * 60L * 60L * 1000L
+            val allPhotos = intruderDir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() }.orEmpty()
+            var removed = 0
+            allPhotos.drop(20).forEach { f ->
+                if (f.lastModified() < cutoff && f.delete()) removed++
+            }
+            removed
+        } else 0
+
+        val recurringBillsSummary = vault.buildRecurringBillsReminderHinglish()
         val skillJson = vault.exportAllSkillsToGokuJson()
 
         val ghStatus = if (vault.settings.githubToken.trim().isNotBlank()) {
@@ -1701,12 +1823,15 @@ class SelfCodingPluginEngine(
         } else "GitHub backup not configured"
 
         val tgStatus = if (vault.settings.telegramBotToken.trim().isNotBlank()) {
-            sendTelegramArchiveSummary("Goku V10.1 Dream Mode Backup\nApps indexed: ${apps.size}\nCompacted screens: $compacted\nRecent issues audited: ${failures.size}")
+            sendTelegramArchiveSummary(
+                "Goku V10.1 Dream Mode Backup\nApps indexed: ${apps.size}\nCompacted screens: $compacted\nRecent issues audited: ${failures.size}\nBills: ${recurringBillsSummary.take(180)}"
+            )
         } else "Telegram backup not configured"
 
         val summary = "Dream Mode Complete (${System.currentTimeMillis() - start}ms): " +
-            "$compacted screens compacted, ${apps.size} apps indexed, ${failures.size} past failures audited. " +
-            "$doctorMsg | $ghStatus | $tgStatus"
+            "$compacted screens compacted, ${apps.size} apps indexed to RAG, ${failures.size} past failures audited" +
+            (if (prunedPhotos > 0) ", $prunedPhotos old snapshots purged" else "") +
+            ". $doctorMsg | $recurringBillsSummary | $ghStatus | $tgStatus"
         vault.logAction("CRITIC", "Nightly Dream Mode", summary, 98, "OK", System.currentTimeMillis() - start)
         summary
     }
