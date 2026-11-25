@@ -1,8 +1,10 @@
 package com.goku.ai.automation
 
 import android.Manifest
+import android.app.Activity
 import android.app.KeyguardManager
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.admin.DeviceAdminReceiver
 import android.app.admin.DevicePolicyManager
 import android.content.BroadcastReceiver
@@ -85,11 +87,22 @@ import org.mozilla.javascript.ContextFactory
 import org.mozilla.javascript.ScriptableObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.net.InetAddress
+import java.net.URI
+import java.net.URLEncoder
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.Calendar
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import kotlin.coroutines.resume
 
 // ============================================================================
@@ -109,14 +122,33 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     private val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+    private val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+    private val reflexScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _state = MutableStateFlow(SensorReflexState())
     val state: StateFlow<SensorReflexState> = _state.asStateFlow()
 
     private var registered = false
+    private var accelRegistered = false
     private var batteryReceiverRegistered = false
+    private var screenReceiverRegistered = false
     private var previousRingerMode: Int? = null
     private var previousInterruptionFilter: Int? = null
+    private var lastAppliedPowerMode: String = "NORMAL"
+    private var lastDreamTriggerMs: Long = 0L
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> unregisterAccelerometer()
+                Intent.ACTION_SCREEN_ON -> {
+                    if (registered && _state.value.adaptivePowerMode != "SURVIVAL_10") {
+                        registerAccelerometer()
+                    }
+                }
+            }
+        }
+    }
 
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
@@ -141,20 +173,102 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
                 isCharging = charging,
                 adaptivePowerMode = mode
             )
+            applyAdaptivePowerActions(mode)
+        }
+    }
+
+    private fun registerAccelerometer() {
+        if (accelRegistered) return
+        val accel = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) ?: return
+        runCatching {
+            sensorManager?.registerListener(this, accel, SensorManager.SENSOR_DELAY_NORMAL)
+            accelRegistered = true
+        }
+    }
+
+    private fun unregisterAccelerometer() {
+        if (!accelRegistered) return
+        val accel = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        runCatching {
+            if (accel != null) {
+                sensorManager?.unregisterListener(this, accel)
+            }
+        }
+        accelRegistered = false
+    }
+
+    private fun applyAdaptivePowerActions(mode: String) {
+        if (mode == lastAppliedPowerMode) return
+        lastAppliedPowerMode = mode
+        when (mode) {
+            "SURVIVAL_10" -> {
+                // Pause high-frequency accelerometer and release any offscreen VirtualDisplay to conserve battery
+                unregisterAccelerometer()
+                reflexScope.launch {
+                    runCatching { LocalAdbEngine.getInstance(context).virtualDisplayRunner.releaseVirtualDisplay() }
+                    runCatching {
+                        GokuVaultRepository.getInstance(context).logAction(
+                            stage = "SYSTEM",
+                            command = "Adaptive Power: SURVIVAL_10",
+                            detail = "Battery <=10%: Paused accelerometer & released VirtualDisplay to save power",
+                            confidence = 100
+                        )
+                    }
+                }
+            }
+            "ECO_20" -> {
+                reflexScope.launch {
+                    runCatching { LocalAdbEngine.getInstance(context).virtualDisplayRunner.releaseVirtualDisplay() }
+                }
+            }
+            "DREAM_CHARGING" -> {
+                val now = System.currentTimeMillis()
+                if (now - lastDreamTriggerMs > 6 * 3600_000L) {
+                    lastDreamTriggerMs = now
+                    reflexScope.launch {
+                        runCatching {
+                            val vault = GokuVaultRepository.getInstance(context)
+                            val adb = LocalAdbEngine.getInstance(context)
+                            val pilot = UniversalAppPilot(context, adb)
+                            val voice = GokuEarAndVoiceEngine.getInstance(context)
+                            SelfCodingPluginEngine(context, vault, adb, pilot, voice).scheduleNightlyDreamMode()
+                        }
+                    }
+                }
+            }
+            "NORMAL" -> {
+                if (registered && (powerManager?.isInteractive != false)) {
+                    registerAccelerometer()
+                }
+            }
         }
     }
 
     fun start() {
         if (!registered) {
-            val accel = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
             val prox = sensorManager?.getDefaultSensor(Sensor.TYPE_PROXIMITY)
-            accel?.let {
-                sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
-            }
             prox?.let {
                 sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
             }
+            if (powerManager?.isInteractive != false) {
+                registerAccelerometer()
+            }
             registered = true
+        }
+        if (!screenReceiverRegistered) {
+            runCatching {
+                val filter = IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                    addAction(Intent.ACTION_SCREEN_ON)
+                }
+                ContextCompat.registerReceiver(
+                    context,
+                    screenReceiver,
+                    filter,
+                    ContextCompat.RECEIVER_NOT_EXPORTED
+                )
+                screenReceiverRegistered = true
+            }
         }
         if (!batteryReceiverRegistered) {
             runCatching {
@@ -173,6 +287,11 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
         if (registered) {
             runCatching { sensorManager?.unregisterListener(this) }
             registered = false
+            accelRegistered = false
+        }
+        if (screenReceiverRegistered) {
+            runCatching { context.unregisterReceiver(screenReceiver) }
+            screenReceiverRegistered = false
         }
         if (batteryReceiverRegistered) {
             runCatching { context.unregisterReceiver(batteryReceiver) }
@@ -211,8 +330,15 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
             previousRingerMode = null
             runCatching {
                 if (enableQuiet) {
+                    val currentFilter = nm.currentInterruptionFilter
+                    // Do not weaken a stricter DND mode already set by the user (NONE or ALARMS)
+                    if (currentFilter == NotificationManager.INTERRUPTION_FILTER_NONE ||
+                        currentFilter == NotificationManager.INTERRUPTION_FILTER_ALARMS
+                    ) {
+                        return@runCatching
+                    }
                     if (previousInterruptionFilter == null) {
-                        previousInterruptionFilter = nm.currentInterruptionFilter
+                        previousInterruptionFilter = currentFilter
                     }
                     nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_PRIORITY)
                 } else {
@@ -224,8 +350,13 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
         } else if (enableQuiet) {
             runCatching {
                 val am = audioManager ?: return@runCatching
+                val currentMode = am.ringerMode
+                // Do not overwrite user's explicit total SILENT mode with VIBRATE
+                if (currentMode == AudioManager.RINGER_MODE_SILENT) {
+                    return@runCatching
+                }
                 if (previousRingerMode == null) {
-                    previousRingerMode = am.ringerMode
+                    previousRingerMode = currentMode
                 }
                 am.ringerMode = AudioManager.RINGER_MODE_VIBRATE
             }
@@ -261,7 +392,7 @@ class EmergencySosManager(
     suspend fun triggerSosBeacon(customPrefix: String? = null): String = withContext(Dispatchers.IO) {
         val contacts = vault.settings.getSosContactsList()
         val battery = readBatteryPercentage()
-        val location = getBestLastKnownLocation()
+        val location = getBestOrFreshLocation()
         val locPart = if (location != null) {
             "https://maps.google.com/?q=${location.latitude},${location.longitude} (acc ${location.accuracy.toInt()}m)"
         } else {
@@ -293,18 +424,132 @@ class EmergencySosManager(
             return@withContext "SmsManager unavailable on this device; SOS SMS could not be sent."
         }
 
-        var sentCount = 0
-        contacts.forEach { number ->
-            runCatching {
-                val parts = smsManager.divideMessage(smsBody)
-                smsManager.sendMultipartTextMessage(number, null, parts, null, null)
-                sentCount++
+        val preparedContacts = contacts.mapIndexedNotNull { idx, number ->
+            val parts = runCatching { smsManager.divideMessage(smsBody) }.getOrNull()
+            if (parts.isNullOrEmpty()) null else Triple(idx, number, parts)
+        }
+        if (preparedContacts.isEmpty()) {
+            val emptyMsg = "Emergency SOS SMS could not be prepared for configured contacts."
+            vault.logAction("SYSTEM", "Emergency SOS", emptyMsg, 100, "WARN")
+            return@withContext emptyMsg
+        }
+
+        val totalParts = preparedContacts.sumOf { it.third.size }
+        val remainingParts = AtomicInteger(totalParts)
+        val contactRemainingParts = ConcurrentHashMap<Int, AtomicInteger>()
+        val contactAllPartsOk = ConcurrentHashMap<Int, AtomicBoolean>()
+        val confirmedContacts = ConcurrentHashMap.newKeySet<Int>()
+        preparedContacts.forEach { (idx, _, parts) ->
+            contactRemainingParts[idx] = AtomicInteger(parts.size)
+            contactAllPartsOk[idx] = AtomicBoolean(true)
+        }
+
+        var dispatchedCount = 0
+        val sentAction = "com.goku.ai.action.SOS_SMS_SENT_${System.currentTimeMillis()}"
+        val receiverUnregistered = AtomicBoolean(false)
+        var activeReceiver: BroadcastReceiver? = null
+
+        fun unregisterSafely() {
+            val r = activeReceiver ?: return
+            if (receiverUnregistered.compareAndSet(false, true)) {
+                runCatching { context.unregisterReceiver(r) }
             }
         }
 
-        val msg = "Emergency SOS beacon $sentCount/${contacts.size} family contacts ko offline SMS se bhej diya gaya. Battery: $battery%, Location: $locPart"
-        vault.logAction("SYSTEM", "Emergency SOS", msg, 100, "OK")
+        // Single overall 4.5s timeout keeps total SOS latency well within onPasswordFailed's 8.5s cap
+        try {
+            withTimeoutOrNull(4_500L) {
+                suspendCancellableCoroutine<Unit> { cont ->
+                    val receiver = object : BroadcastReceiver() {
+                        override fun onReceive(ctx: Context?, intent: Intent?) {
+                            val cIdx = intent?.getIntExtra(EXTRA_SOS_CONTACT_IDX, -1) ?: -1
+                            if (cIdx >= 0) {
+                                if (resultCode != Activity.RESULT_OK) {
+                                    contactAllPartsOk[cIdx]?.set(false)
+                                }
+                                val leftForContact = contactRemainingParts[cIdx]?.decrementAndGet() ?: 0
+                                if (leftForContact <= 0 && contactAllPartsOk[cIdx]?.get() == true) {
+                                    confirmedContacts.add(cIdx)
+                                }
+                            }
+                            if (remainingParts.decrementAndGet() <= 0) {
+                                unregisterSafely()
+                                if (cont.isActive) cont.resume(Unit)
+                            }
+                        }
+                    }
+                    activeReceiver = receiver
+
+                    val registered = runCatching {
+                        ContextCompat.registerReceiver(
+                            context,
+                            receiver,
+                            IntentFilter(sentAction),
+                            ContextCompat.RECEIVER_NOT_EXPORTED
+                        )
+                        true
+                    }.getOrDefault(false)
+                    if (!registered) {
+                        receiverUnregistered.set(true)
+                    }
+
+                    cont.invokeOnCancellation {
+                        unregisterSafely()
+                    }
+
+                    for ((idx, number, parts) in preparedContacts) {
+                        val sentIntents = ArrayList<PendingIntent>(parts.size)
+                        for (pIdx in parts.indices) {
+                            val intent = Intent(sentAction)
+                                .setPackage(context.packageName)
+                                .putExtra(EXTRA_SOS_CONTACT_IDX, idx)
+                                .putExtra(EXTRA_SOS_PART_IDX, pIdx)
+                            val pi = PendingIntent.getBroadcast(
+                                context,
+                                idx * 100 + pIdx,
+                                intent,
+                                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+                            )
+                            sentIntents.add(pi)
+                        }
+
+                        val queued = runCatching {
+                            smsManager.sendMultipartTextMessage(number, null, parts, sentIntents, null)
+                            true
+                        }.getOrDefault(false)
+
+                        if (queued) {
+                            dispatchedCount++
+                        } else {
+                            contactAllPartsOk[idx]?.set(false)
+                            if (remainingParts.addAndGet(-parts.size) <= 0) {
+                                unregisterSafely()
+                                if (cont.isActive) cont.resume(Unit)
+                            }
+                        }
+                    }
+
+                    if (dispatchedCount == 0 || !registered || remainingParts.get() <= 0) {
+                        unregisterSafely()
+                        if (cont.isActive) cont.resume(Unit)
+                    }
+                }
+            }
+        } finally {
+            unregisterSafely()
+        }
+
+        val confirmedCount = confirmedContacts.size
+        val effectiveSent = if (confirmedCount > 0) confirmedCount else dispatchedCount
+        val statusTag = if (effectiveSent > 0) "OK" else "WARN"
+        val msg = "Emergency SOS beacon $effectiveSent/${contacts.size} family contacts ko offline SMS se bhej diya gaya (confirmed=$confirmedCount). Battery: $battery%, Location: $locPart"
+        vault.logAction("SYSTEM", "Emergency SOS", msg, 100, statusTag)
         msg
+    }
+
+    companion object {
+        private const val EXTRA_SOS_CONTACT_IDX = "goku_sos_contact_idx"
+        private const val EXTRA_SOS_PART_IDX = "goku_sos_part_idx"
     }
 
     suspend fun triggerIntruderAlert(
@@ -330,6 +575,76 @@ class EmergencySosManager(
     private fun readBatteryPercentage(): Int {
         val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
         return bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)?.takeIf { it in 0..100 } ?: 100
+    }
+
+    @Suppress("MissingPermission")
+    private suspend fun getBestOrFreshLocation(): Location? {
+        val cached = getBestLastKnownLocation()
+        val now = System.currentTimeMillis()
+        if (cached != null && (now - cached.time) <= 5 * 60_000L) {
+            return cached
+        }
+        val fresh = requestSingleFreshLocationFix(timeoutMs = 2_500L)
+        return fresh ?: cached
+    }
+
+    @Suppress("MissingPermission")
+    private suspend fun requestSingleFreshLocationFix(timeoutMs: Long): Location? {
+        val fine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        if (!fine && !coarse) return null
+
+        val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
+        val provider = when {
+            fine && runCatching { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrDefault(false) ->
+                LocationManager.GPS_PROVIDER
+            runCatching { lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) }.getOrDefault(false) ->
+                LocationManager.NETWORK_PROVIDER
+            else -> return null
+        }
+
+        return withTimeoutOrNull(timeoutMs) {
+            suspendCancellableCoroutine<Location?> { cont ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    val cancelSignal = android.os.CancellationSignal()
+                    cont.invokeOnCancellation { runCatching { cancelSignal.cancel() } }
+                    runCatching {
+                        lm.getCurrentLocation(
+                            provider,
+                            cancelSignal,
+                            ContextCompat.getMainExecutor(context)
+                        ) { loc ->
+                            if (cont.isActive) cont.resume(loc)
+                        }
+                    }.onFailure {
+                        if (cont.isActive) cont.resume(null)
+                    }
+                } else {
+                    val listener = object : android.location.LocationListener {
+                        override fun onLocationChanged(location: Location) {
+                            runCatching { lm.removeUpdates(this) }
+                            if (cont.isActive) cont.resume(location)
+                        }
+                        @Deprecated("Deprecated in Java")
+                        override fun onStatusChanged(p: String?, status: Int, extras: android.os.Bundle?) {}
+                        override fun onProviderEnabled(p: String) {}
+                        override fun onProviderDisabled(p: String) {}
+                    }
+                    cont.invokeOnCancellation {
+                        runCatching { lm.removeUpdates(listener) }
+                    }
+                    runCatching {
+                        @Suppress("DEPRECATION")
+                        lm.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+                    }.onFailure {
+                        runCatching { lm.removeUpdates(listener) }
+                        if (cont.isActive) cont.resume(null)
+                    }
+                }
+            }
+        }
     }
 
     @Suppress("MissingPermission")
@@ -377,16 +692,34 @@ private class HeadlessCameraLifecycleOwner : LifecycleOwner {
     override val lifecycle: Lifecycle get() = registry
 
     fun moveToResumed() {
-        registry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
-        registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
-        registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        runCatching {
+            if (registry.currentState == Lifecycle.State.INITIALIZED) {
+                registry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+            }
+            if (registry.currentState == Lifecycle.State.CREATED) {
+                registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            }
+            if (registry.currentState == Lifecycle.State.STARTED) {
+                registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            }
+        }
     }
 
     fun moveToDestroyed() {
         runCatching {
-            registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-            registry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
-            registry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+            val state = registry.currentState
+            if (state == Lifecycle.State.DESTROYED || state == Lifecycle.State.INITIALIZED) {
+                return@runCatching
+            }
+            if (state == Lifecycle.State.RESUMED) {
+                registry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            }
+            if (registry.currentState == Lifecycle.State.STARTED) {
+                registry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+            }
+            if (registry.currentState == Lifecycle.State.CREATED) {
+                registry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+            }
         }
     }
 }
@@ -719,6 +1052,15 @@ class GokuDeviceAdminReceiver : DeviceAdminReceiver() {
 // ============================================================================
 
 /**
+ * Non-catchable JavaScript sandbox abort error (`java.lang.Error` subclass).
+ * Unlike `RuntimeException` / `SecurityException` (which Mozilla Rhino wraps into a
+ * JS-catchable exception inside `try { while(true){} } catch(e) {}`), throwing a
+ * `java.lang.Error` subclass unwinds Rhino's interpreter immediately without allowing
+ * untrusted JS `try/catch` blocks to swallow instruction, timeout, or KillSwitch aborts.
+ */
+class GokuScriptAbortError(message: String) : Error(message)
+
+/**
  * Safe JavaScript bridge exposed inside sandboxed `.goku` JS plugins as global `goku`.
  * All methods respect `dryRun` and `GokuKillSwitch`.
  */
@@ -731,67 +1073,80 @@ class GokuJsBridge(
     private val outputLog: StringBuilder,
     private val deadlineMs: Long = System.currentTimeMillis() + MAX_JS_WALL_MS
 ) {
+    private fun appendBoundedLog(entry: String) {
+        val clipped = entry.take(MAX_SINGLE_STRING_CHARS)
+        val remaining = (MAX_OUTPUT_LOG_CHARS - outputLog.length).coerceAtLeast(0)
+        if (remaining > 0) {
+            outputLog.append(clipped.take(remaining))
+        }
+    }
+
     fun tap(target: String?): Boolean {
         checkNotStopped()
-        val safeTarget = target?.trim().orEmpty()
+        val safeTarget = target?.trim()?.take(MAX_SINGLE_STRING_CHARS).orEmpty()
         if (safeTarget.isEmpty()) return false
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.tap($safeTarget)\n")
+            appendBoundedLog("[DRY-JS] goku.tap($safeTarget)\n")
             return true
         }
         val result = runBoundedBridgeCall("tap($safeTarget)") { pilot.tapTarget(safeTarget) }
             ?: return false
         val (ok, msg) = result
-        outputLog.append("JS tap($safeTarget): $msg\n")
+        appendBoundedLog("JS tap($safeTarget): $msg\n")
         return ok
     }
 
     fun tapXY(x: Int, y: Int): Boolean {
         checkNotStopped()
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.tapXY($x, $y)\n")
+            appendBoundedLog("[DRY-JS] goku.tapXY($x, $y)\n")
             return true
         }
         val res = runBoundedBridgeCall("tapXY($x,$y)") { adbEngine.dispatchAdbTap(x, y) }
             ?: return false
-        outputLog.append("JS tapXY($x,$y): ${res.output}\n")
+        appendBoundedLog("JS tapXY($x,$y): ${res.output}\n")
         return res.success
     }
 
     fun adb(command: String?): String {
         checkNotStopped()
-        val safeCmd = command?.trim().orEmpty()
+        val safeCmd = command?.trim()?.take(MAX_SINGLE_STRING_CHARS).orEmpty()
         if (safeCmd.isEmpty()) return "Empty command"
+        if (!isAllowedJsAdbCommand(safeCmd)) {
+            val blockedMsg = "Blocked by Goku JS ADB allowlist: '$safeCmd'"
+            appendBoundedLog("JS adb blocked: $blockedMsg\n")
+            return blockedMsg
+        }
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.adb($safeCmd)\n")
+            appendBoundedLog("[DRY-JS] goku.adb($safeCmd)\n")
             return "[DRY] $safeCmd"
         }
         val res = runBoundedBridgeCall("adb($safeCmd)") { adbEngine.execShellCommand(safeCmd) }
             ?: return "Timeout (${BRIDGE_CALL_TIMEOUT_MS}ms)"
-        outputLog.append("JS adb($safeCmd): ${res.output.take(120)}\n")
-        return res.output
+        appendBoundedLog("JS adb($safeCmd): ${res.output.take(120)}\n")
+        return res.output.take(MAX_SINGLE_STRING_CHARS)
     }
 
     fun speak(text: String?) {
         checkNotStopped()
-        val safeText = text?.trim().orEmpty()
+        val safeText = text?.trim()?.take(MAX_SINGLE_STRING_CHARS).orEmpty()
         if (safeText.isEmpty()) return
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.speak($safeText)\n")
+            appendBoundedLog("[DRY-JS] goku.speak($safeText)\n")
             return
         }
         voiceEngine.speak(safeText)
-        outputLog.append("JS spoke: $safeText\n")
+        appendBoundedLog("JS spoke: $safeText\n")
         checkNotStopped()
     }
 
     fun saveMemory(key: String?, value: String?) {
         checkNotStopped()
-        val safeKey = key?.trim().orEmpty()
-        val safeVal = value?.trim().orEmpty()
+        val safeKey = key?.trim()?.take(120).orEmpty()
+        val safeVal = value?.trim()?.take(MAX_SINGLE_STRING_CHARS).orEmpty()
         if (safeKey.isEmpty() || safeVal.isEmpty()) return
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.saveMemory($safeKey, $safeVal)\n")
+            appendBoundedLog("[DRY-JS] goku.saveMemory($safeKey, $safeVal)\n")
             return
         }
         val saved = runBoundedBridgeCall("saveMemory($safeKey)") {
@@ -799,16 +1154,16 @@ class GokuJsBridge(
             true
         }
         if (saved == true) {
-            outputLog.append("JS saved memory [$safeKey]\n")
+            appendBoundedLog("JS saved memory [$safeKey]\n")
         }
     }
 
     fun openApp(appName: String?): Boolean {
         checkNotStopped()
-        val safeApp = appName?.trim().orEmpty()
+        val safeApp = appName?.trim()?.take(160).orEmpty()
         if (safeApp.isEmpty()) return false
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.openApp($safeApp)\n")
+            appendBoundedLog("[DRY-JS] goku.openApp($safeApp)\n")
             return true
         }
         val stepArr = JSONArray().put(JSONObject().put("action", "open_app").put("target", safeApp)).toString()
@@ -816,7 +1171,7 @@ class GokuJsBridge(
             pilot.executeStepsJson(stepArr, dryRun = false)
         } ?: return false
         val (ok, msg) = result
-        outputLog.append("JS openApp($safeApp): $msg\n")
+        appendBoundedLog("JS openApp($safeApp): $msg\n")
         return ok
     }
 
@@ -826,7 +1181,7 @@ class GokuJsBridge(
 
     fun log(message: String?) {
         val safeMsg = message?.take(240).orEmpty()
-        outputLog.append("JS log: ").append(safeMsg).append("\n")
+        appendBoundedLog("JS log: $safeMsg\n")
     }
 
     private fun <T> runBoundedBridgeCall(
@@ -838,7 +1193,7 @@ class GokuJsBridge(
         val result = runBoundedBridgeCallInternal(timeoutMs, deadlineMs, block)
         checkNotStopped()
         if (result == null) {
-            outputLog.append("JS $label timed out after ${timeoutMs}ms\n")
+            appendBoundedLog("JS $label timed out after ${timeoutMs}ms\n")
         }
         return result
     }
@@ -850,13 +1205,49 @@ class GokuJsBridge(
     companion object {
         internal const val BRIDGE_CALL_TIMEOUT_MS = 4_000L
         internal const val MAX_JS_WALL_MS = 6_000L
+        internal const val MAX_SINGLE_STRING_CHARS = 4_096
+        internal const val MAX_OUTPUT_LOG_CHARS = 16_384
+
+        private val DISALLOWED_SHELL_TOKENS = listOf(
+            ";", "&&", "||", "|", "`", "$(", ">", "<", "\n", "\r"
+        )
+
+        private val ALLOWED_JS_ADB_PREFIXES = listOf(
+            "input tap ",
+            "input swipe ",
+            "input text ",
+            "input keyevent ",
+            "input -d ",
+            "cmd statusbar ",
+            "wm size",
+            "wm density",
+            "dumpsys battery",
+            "dumpsys deviceidle",
+            "pm trim-caches",
+            "am start "
+        )
+
+        fun isAllowedJsAdbCommand(rawCommand: String): Boolean {
+            val cmd = rawCommand.trim()
+            if (cmd.isEmpty() || cmd.length > 320) return false
+            if (DISALLOWED_SHELL_TOKENS.any { cmd.contains(it) }) return false
+            val low = cmd.lowercase(Locale.ROOT)
+            if (low.contains("rm ") || low.contains("su ") || low.contains("sh ") ||
+                low.contains("chmod ") || low.contains("chown ") || low.contains("dd ") ||
+                low.contains("pm uninstall") || low.contains("pm clear") || low.contains("pm grant") ||
+                low.contains("settings put") || low.contains("setprop")
+            ) {
+                return false
+            }
+            return ALLOWED_JS_ADB_PREFIXES.any { low.startsWith(it) }
+        }
 
         fun checkNotStopped(deadlineMs: Long = Long.MAX_VALUE) {
             if (GokuKillSwitch.isStopped.value) {
-                throw SecurityException("Stopped by GokuKillSwitch")
+                throw GokuScriptAbortError("Stopped by GokuKillSwitch")
             }
             if (System.currentTimeMillis() > deadlineMs) {
-                throw SecurityException("JS plugin halted: exceeded ${MAX_JS_WALL_MS}ms timeout.")
+                throw GokuScriptAbortError("JS plugin halted: exceeded ${MAX_JS_WALL_MS}ms timeout.")
             }
         }
 
@@ -891,7 +1282,7 @@ class GokuJsBridge(
                 }
             } catch (ce: CancellationException) {
                 if (GokuKillSwitch.isStopped.value) {
-                    throw SecurityException("Stopped by GokuKillSwitch")
+                    throw GokuScriptAbortError("Stopped by GokuKillSwitch")
                 }
                 throw ce
             }
@@ -922,6 +1313,14 @@ class GokuJsBridge(
 private class GuardedRhinoContext(factory: ContextFactory) : RhinoContext(factory) {
     var startTimeMs: Long = System.currentTimeMillis()
     var totalInstructions: Long = 0L
+    var baselineMemoryBytes: Long = usedHeapBytes()
+
+    companion object {
+        fun usedHeapBytes(): Long {
+            val rt = Runtime.getRuntime()
+            return (rt.totalMemory() - rt.freeMemory()).coerceAtLeast(0L)
+        }
+    }
 }
 
 private class GokuSandboxedRhinoContextFactory : ContextFactory() {
@@ -930,7 +1329,8 @@ private class GokuSandboxedRhinoContextFactory : ContextFactory() {
             // Interpreted mode (-1) is mandatory on Android ART/Dalvik (no JVM bytecode emit)
             optimizationLevel = -1
             languageVersion = RhinoContext.VERSION_ES6
-            instructionObserverThreshold = 5_000
+            maximumInterpreterStackDepth = 256
+            instructionObserverThreshold = 2_500
         }
     }
 
@@ -938,18 +1338,23 @@ private class GokuSandboxedRhinoContextFactory : ContextFactory() {
         val guarded = cx as? GuardedRhinoContext ?: return
         guarded.totalInstructions += instructionCount
         if (GokuKillSwitch.isStopped.value) {
-            throw SecurityException("JS plugin aborted by GokuKillSwitch.")
+            throw GokuScriptAbortError("JS plugin aborted by GokuKillSwitch.")
         }
         if (guarded.totalInstructions > MAX_JS_INSTRUCTIONS) {
-            throw SecurityException("JS plugin halted: exceeded instruction limit ($MAX_JS_INSTRUCTIONS).")
+            throw GokuScriptAbortError("JS plugin halted: exceeded instruction limit ($MAX_JS_INSTRUCTIONS).")
         }
         if (System.currentTimeMillis() - guarded.startTimeMs > MAX_JS_WALL_MS) {
-            throw SecurityException("JS plugin halted: exceeded ${MAX_JS_WALL_MS}ms timeout.")
+            throw GokuScriptAbortError("JS plugin halted: exceeded ${MAX_JS_WALL_MS}ms timeout.")
+        }
+        val heapGrowth = GuardedRhinoContext.usedHeapBytes() - guarded.baselineMemoryBytes
+        if (heapGrowth > MAX_JS_HEAP_DELTA_BYTES) {
+            throw GokuScriptAbortError("JS plugin halted: exceeded memory allocation cap (${MAX_JS_HEAP_DELTA_BYTES / (1024 * 1024)}MB).")
         }
     }
 
     companion object {
         private const val MAX_JS_INSTRUCTIONS = 150_000L
+        private const val MAX_JS_HEAP_DELTA_BYTES = 16L * 1024L * 1024L // 16 MB allocation cap
         internal const val MAX_JS_WALL_MS = GokuJsBridge.MAX_JS_WALL_MS
     }
 }
@@ -961,10 +1366,8 @@ class SelfCodingPluginEngine(
     private val pilot: UniversalAppPilot,
     private val voiceEngine: GokuEarAndVoiceEngine
 ) {
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .build()
+    private val http: OkHttpClient
+        get() = sharedHttpClient
 
     private val rhinoFactory = GokuSandboxedRhinoContextFactory()
 
@@ -1025,16 +1428,20 @@ class SelfCodingPluginEngine(
                     report.append("#${i + 1} Saved memory [$key]\n")
                 }
                 "http_get" -> {
-                    if (target.startsWith("https://")) {
+                    if (isPublicHttpsUrl(target)) {
                         val respText = runCatching {
                             val req = Request.Builder().url(target).get().build()
-                            http.newCall(req).execute().use { r ->
+                            val safeClient = http.newBuilder()
+                                .followRedirects(false)
+                                .followSslRedirects(false)
+                                .build()
+                            safeClient.newCall(req).execute().use { r ->
                                 "HTTP ${r.code}: ${(r.body?.string() ?: "").take(160)}"
                             }
                         }.getOrElse { "HTTP error: ${it.message}" }
                         report.append("#${i + 1} $respText\n")
                     } else {
-                        report.append("#${i + 1} Blocked non-HTTPS URL\n")
+                        report.append("#${i + 1} Blocked non-HTTPS or private/local URL\n")
                     }
                 }
                 else -> {
@@ -1050,16 +1457,41 @@ class SelfCodingPluginEngine(
         out
     }
 
+    private fun isPublicHttpsUrl(rawUrl: String): Boolean {
+        val uri = runCatching { URI(rawUrl.trim()) }.getOrNull() ?: return false
+        if (!uri.scheme.equals("https", ignoreCase = true)) return false
+        val host = uri.host?.lowercase(Locale.ROOT)?.trim()?.trimEnd('.') ?: return false
+        if (host.isEmpty() || host == "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) {
+            return false
+        }
+        val addresses = runCatching { InetAddress.getAllByName(host) }.getOrNull() ?: return false
+        if (addresses.isEmpty()) return false
+        return addresses.all { addr ->
+            val raw = addr.address
+            val isUniqueLocalIpv6 = raw.size == 16 && (raw[0].toInt() and 0xFE) == 0xFC
+            !addr.isAnyLocalAddress &&
+                !addr.isLoopbackAddress &&
+                !addr.isLinkLocalAddress &&
+                !addr.isSiteLocalAddress &&
+                !addr.isMulticastAddress &&
+                !isUniqueLocalIpv6
+        }
+    }
+
     /**
      * Executes untrusted `.goku` JavaScript inside a strict Mozilla Rhino sandbox:
      * - `initSafeStandardObjects()` removes Java package/reflection globals
      * - `ClassShutter` permits ONLY `GokuJsBridge` and `java.lang.String`
-     * - `observeInstructionCount` aborts infinite loops (150k instructions / 6s cap / KillSwitch)
+     * - `observeInstructionCount` aborts infinite loops (150k instructions / 6s cap / 16MB heap / KillSwitch)
+     *   by throwing `GokuScriptAbortError` (`java.lang.Error` subclass) so JS `try/catch` cannot intercept it.
      */
     suspend fun runSandboxedJavaScript(jsCode: String, dryRun: Boolean = false): String =
         withContext(Dispatchers.IO) {
             if (GokuKillSwitch.isStopped.value) {
                 return@withContext "JS plugin aborted by GokuKillSwitch."
+            }
+            if (jsCode.length > MAX_JS_SOURCE_CHARS) {
+                return@withContext "JS Sandbox Error: script source exceeds ${MAX_JS_SOURCE_CHARS} chars limit."
             }
             val start = System.currentTimeMillis()
             val deadlineMs = start + GokuJsBridge.MAX_JS_WALL_MS
@@ -1070,6 +1502,8 @@ class SelfCodingPluginEngine(
             val outcome = try {
                 cx.startTimeMs = start
                 cx.totalInstructions = 0L
+                cx.baselineMemoryBytes = GuardedRhinoContext.usedHeapBytes()
+                cx.maximumInterpreterStackDepth = 256
                 cx.setClassShutter(ClassShutter { className ->
                     className == GokuJsBridge::class.java.name ||
                         className == "java.lang.String"
@@ -1081,7 +1515,7 @@ class SelfCodingPluginEngine(
 
                 val evalResult = cx.evaluateString(scope, jsCode, "goku_plugin.js", 1, null)
                 val resultText = if (evalResult != null && evalResult != RhinoContext.getUndefinedValue()) {
-                    RhinoContext.toString(evalResult)
+                    RhinoContext.toString(evalResult).take(GokuJsBridge.MAX_SINGLE_STRING_CHARS)
                 } else ""
 
                 val combined = buildString {
@@ -1110,18 +1544,52 @@ class SelfCodingPluginEngine(
             outcome.second
         }
 
+    private fun encryptArchivePayloadAesGcm(plaintext: String, secretMaterial: String): String {
+        val keyBytes = MessageDigest.getInstance("SHA-256")
+            .digest("goku-v10.1-archive:$secretMaterial".toByteArray(Charsets.UTF_8))
+            .copyOf(32)
+        val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, iv))
+        val ciphertext = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
+        val combined = ByteArray(iv.size + ciphertext.size)
+        System.arraycopy(iv, 0, combined, 0, iv.size)
+        System.arraycopy(ciphertext, 0, combined, iv.size, ciphertext.size)
+        val b64 = Base64.encodeToString(combined, Base64.NO_WRAP)
+        return JSONObject().apply {
+            put("alg", "AES-256-GCM")
+            put("version", "10.1-godmode")
+            put("ciphertext_b64", b64)
+        }.toString()
+    }
+
+    private fun encodeGithubFilePath(filePathInRepo: String): String {
+        return filePathInRepo
+            .trim('/')
+            .split('/')
+            .filter { it.isNotBlank() }
+            .joinToString("/") { segment ->
+                URLEncoder.encode(segment, "UTF-8").replace("+", "%20")
+            }
+    }
+
     /**
-     * Pushes a skill pack / self-coding commit to user's private GitHub repo via GitHub REST API.
+     * Pushes an AES-256-GCM encrypted skill pack / self-coding commit to user's private GitHub repo via GitHub REST API.
      */
     suspend fun pushToGithubArchive(filePathInRepo: String, content: String, commitMsg: String): String =
         withContext(Dispatchers.IO) {
-            val token = vault.settings.githubToken
-            val repo = vault.settings.githubRepo // e.g. "username/goku-archive"
+            val token = vault.settings.githubToken.trim()
+            val repo = vault.settings.githubRepo.trim().trim('/') // e.g. "username/goku-archive"
             if (token.isBlank() || repo.isBlank() || !repo.contains("/")) {
                 return@withContext "GitHub archive skipped: Configure GitHub Repo (user/repo) & PAT in Vault Settings."
             }
-            val url = "https://api.github.com/repos/$repo/contents/$filePathInRepo"
-            val encoded = Base64.encodeToString(content.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            val safePath = encodeGithubFilePath(filePathInRepo)
+            if (safePath.isBlank()) {
+                return@withContext "GitHub archive skipped: Invalid file path."
+            }
+            val url = "https://api.github.com/repos/$repo/contents/$safePath"
+            val encryptedEnvelope = encryptArchivePayloadAesGcm(content, token)
+            val encoded = Base64.encodeToString(encryptedEnvelope.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
 
             val existingSha = runCatching {
                 val getReq = Request.Builder()
@@ -1149,22 +1617,53 @@ class SelfCodingPluginEngine(
                     .put(bodyJson.toString().toRequestBody("application/json".toMediaType()))
                     .build()
                 http.newCall(putReq).execute().use { resp ->
-                    if (resp.isSuccessful) "GitHub sync OK ($repo/$filePathInRepo)"
+                    if (resp.isSuccessful) "GitHub sync OK ($repo/$safePath)"
                     else "GitHub sync HTTP ${resp.code}"
                 }
             }.getOrElse { "GitHub sync error: ${it.message}" }
         }
 
+    private fun trimPlaintextToUtf8ByteBudget(text: String, maxBytes: Int): String {
+        if (text.toByteArray(Charsets.UTF_8).size <= maxBytes) return text
+        val sb = StringBuilder()
+        var usedBytes = 0
+        var i = 0
+        while (i < text.length) {
+            val cp = text.codePointAt(i)
+            val charCount = Character.charCount(cp)
+            val chunk = text.substring(i, i + charCount)
+            val byteLen = chunk.toByteArray(Charsets.UTF_8).size
+            if (usedBytes + byteLen > maxBytes) break
+            sb.append(chunk)
+            usedBytes += byteLen
+            i += charCount
+        }
+        return sb.toString()
+    }
+
     suspend fun sendTelegramArchiveSummary(messageText: String): String = withContext(Dispatchers.IO) {
-        val bot = vault.settings.telegramBotToken
-        val chatId = vault.settings.telegramChatId
+        val bot = vault.settings.telegramBotToken.trim()
+        val chatId = vault.settings.telegramChatId.trim()
         if (bot.isBlank() || chatId.isBlank()) {
             return@withContext "Telegram archive skipped: Configure Bot Token & Chat ID in Vault Settings."
         }
         val url = "https://api.telegram.org/bot$bot/sendMessage"
+        val headerPrefix = "Goku V10.1 Encrypted Archive Envelope:\n"
+        // Compress/trim plaintext BEFORE encryption so AES-GCM JSON/Base64 is NEVER truncated or corrupted
+        var byteBudget = MAX_TELEGRAM_PLAINTEXT_UTF8_BYTES
+        var fullTelegramText: String
+        while (true) {
+            val boundedPlaintext = trimPlaintextToUtf8ByteBudget(messageText, byteBudget)
+            val encryptedPayload = encryptArchivePayloadAesGcm(boundedPlaintext, bot)
+            fullTelegramText = headerPrefix + encryptedPayload
+            if (fullTelegramText.length <= MAX_TELEGRAM_MESSAGE_CHARS || byteBudget <= 128) {
+                break
+            }
+            byteBudget = (byteBudget - 256).coerceAtLeast(128)
+        }
         val json = JSONObject().apply {
             put("chat_id", chatId)
-            put("text", messageText.take(3900))
+            put("text", fullTelegramText)
         }
         runCatching {
             val req = Request.Builder()
@@ -1193,7 +1692,7 @@ class SelfCodingPluginEngine(
         val apps = adbEngine.discoverInstalledApps()
         val skillJson = vault.exportAllSkillsToGokuJson()
 
-        val ghStatus = if (vault.settings.githubToken.isNotBlank()) {
+        val ghStatus = if (vault.settings.githubToken.trim().isNotBlank()) {
             pushToGithubArchive(
                 "backups/goku-skills-v10.1.goku.json",
                 skillJson,
@@ -1201,7 +1700,7 @@ class SelfCodingPluginEngine(
             )
         } else "GitHub backup not configured"
 
-        val tgStatus = if (vault.settings.telegramBotToken.isNotBlank()) {
+        val tgStatus = if (vault.settings.telegramBotToken.trim().isNotBlank()) {
             sendTelegramArchiveSummary("Goku V10.1 Dream Mode Backup\nApps indexed: ${apps.size}\nCompacted screens: $compacted\nRecent issues audited: ${failures.size}")
         } else "Telegram backup not configured"
 
@@ -1226,6 +1725,19 @@ class SelfCodingPluginEngine(
             req
         )
     }
+
+    companion object {
+        private const val MAX_JS_SOURCE_CHARS = 65_536
+        private const val MAX_TELEGRAM_MESSAGE_CHARS = 3_900
+        private const val MAX_TELEGRAM_PLAINTEXT_UTF8_BYTES = 2_600
+
+        private val sharedHttpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(12, TimeUnit.SECONDS)
+                .readTimeout(20, TimeUnit.SECONDS)
+                .build()
+        }
+    }
 }
 
 class DreamModeWorker(
@@ -1239,8 +1751,16 @@ class DreamModeWorker(
         val voice = GokuEarAndVoiceEngine.getInstance(applicationContext)
         val engine = SelfCodingPluginEngine(applicationContext, vault, adb, pilot, voice)
         return runCatching {
-            engine.runDreamModeAudit()
-            Result.success()
+            val report = engine.runDreamModeAudit()
+            val hasTransientSyncFailure = report.contains("GitHub sync error:") ||
+                report.contains("Telegram sync failed:") ||
+                report.contains("HTTP 5") ||
+                report.contains("HTTP 429")
+            if (hasTransientSyncFailure && runAttemptCount < 3) {
+                Result.retry()
+            } else {
+                Result.success()
+            }
         }.getOrElse { Result.retry() }
     }
 }
@@ -1470,9 +1990,10 @@ object CameraLiveEyeManager {
             )
         }
 
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$apiKey"
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         val request = Request.Builder()
             .url(url)
+            .header("x-goog-api-key", apiKey)
             .post(payload.toString().toRequestBody("application/json".toMediaType()))
             .build()
 

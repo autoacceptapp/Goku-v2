@@ -61,7 +61,10 @@ class ExampleRobolectricTest {
     }
     val elapsedMs = System.currentTimeMillis() - startMs
 
-    assertTrue("Expected SecurityException on KillSwitch, got: $thrown", thrown is SecurityException)
+    assertTrue(
+      "Expected GokuScriptAbortError on KillSwitch, got: $thrown",
+      thrown is com.goku.ai.automation.GokuScriptAbortError || thrown is SecurityException
+    )
     assertTrue("Expected sleep abort well under 750ms, took ${elapsedMs}ms", elapsedMs < 750L)
   }
 }

@@ -30,10 +30,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -46,6 +48,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.math.abs
 import kotlin.math.log10
@@ -63,32 +66,55 @@ object GokuKillSwitch {
     private val _lastStopSource = MutableStateFlow("")
     val lastStopSource: StateFlow<String> = _lastStopSource.asStateFlow()
 
-    private val activeJobs = CopyOnWriteArrayList<Job>()
+    private val stateLock = Any()
+    private val activeJobs = ArrayList<Job>()
     private val stopHooks = CopyOnWriteArrayList<() -> Unit>()
 
     fun registerJob(job: Job) {
-        activeJobs.removeAll { !it.isActive }
-        activeJobs.add(job)
+        synchronized(stateLock) {
+            activeJobs.removeAll { !it.isActive }
+            if (job.isActive && !activeJobs.contains(job)) {
+                activeJobs.add(job)
+                job.invokeOnCompletion {
+                    synchronized(stateLock) {
+                        activeJobs.remove(job)
+                    }
+                }
+            }
+        }
     }
 
     fun registerStopHook(hook: () -> Unit) {
-        stopHooks.add(hook)
+        stopHooks.addIfAbsent(hook)
+    }
+
+    fun unregisterStopHook(hook: () -> Unit) {
+        stopHooks.remove(hook)
     }
 
     fun triggerStop(source: String) {
-        _isStopped.value = true
-        _lastStopSource.value = source
-        activeJobs.forEach { runCatching { it.cancel() } }
-        activeJobs.clear()
+        val jobsToCancel: List<Job>
+        synchronized(stateLock) {
+            _isStopped.value = true
+            _lastStopSource.value = source
+            jobsToCancel = activeJobs.toList()
+            activeJobs.clear()
+        }
+        jobsToCancel.forEach { runCatching { it.cancel() } }
         stopHooks.forEach { runCatching { it.invoke() } }
     }
 
     fun reset() {
-        _isStopped.value = false
+        synchronized(stateLock) {
+            _isStopped.value = false
+        }
     }
 
     fun isStopPhrase(text: String): Boolean {
-        val norm = text.lowercase(Locale.ROOT).trim()
+        val norm = text.lowercase(Locale.ROOT)
+            .replace(Regex("[,\\.!?।:;\"'()]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
         return norm.contains("goku stop") ||
             norm.contains("goku ruko") ||
             norm.contains("गोकू स्टॉप") ||
@@ -111,6 +137,8 @@ enum class EarTier {
 data class VoiceEngineState(
     val tier: EarTier = EarTier.IDLE_OFF,
     val isListening: Boolean = false,
+    val isAcousticEarArmed: Boolean = false,
+    val isSpeechRecognizerActive: Boolean = false,
     val isSpeaking: Boolean = false,
     val isWhisperMode: Boolean = false,
     val isNightSoftMode: Boolean = false,
@@ -124,6 +152,8 @@ data class VoiceEngineState(
     val hasKwsOnnxModels: Boolean = false,
     val isPostBootMicSilenced: Boolean = false
 )
+
+typealias GokuVoiceState = VoiceEngineState
 
 /**
  * Reflection-safe bridge to Sherpa-ONNX KeywordSpotter (com.k2fsa.sherpa.onnx.KeywordSpotter).
@@ -424,10 +454,16 @@ class LockScreenWakeWordEngine(
 
     private val running = AtomicBoolean(false)
     private val pausedForExternalRecognizer = AtomicBoolean(false)
+    private val audioRecordReleased = AtomicBoolean(true)
     private val pauseLock = Any()
+    private val audioHardwareLock = Any()
     private var activeAudioRecord = false
+    private var activeAudioRecordRef: AudioRecord? = null
     private var pauseAckDeferred: CompletableDeferred<Unit>? = null
+    @Volatile
     private var monitorJob: Job? = null
+    @Volatile
+    private var lastStoppingJob: Job? = null
 
     fun isRunning(): Boolean = running.get()
 
@@ -441,6 +477,19 @@ class LockScreenWakeWordEngine(
         keyguardManager?.isKeyguardLocked == true
     }.getOrDefault(false)
 
+    private fun interruptActiveAudioRecord() {
+        synchronized(audioHardwareLock) {
+            val rec = activeAudioRecordRef ?: return
+            if (!audioRecordReleased.get()) {
+                runCatching {
+                    if (rec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        rec.stop()
+                    }
+                }
+            }
+        }
+    }
+
     fun start() {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
@@ -451,8 +500,15 @@ class LockScreenWakeWordEngine(
         if (running.getAndSet(true)) return
         pausedForExternalRecognizer.set(false)
 
-        monitorJob?.cancel()
+        val oldJob = monitorJob
+        val stoppingJob = lastStoppingJob
         monitorJob = scope.launch {
+            stoppingJob?.join()
+            oldJob?.cancelAndJoin()
+            if (lastStoppingJob === stoppingJob) {
+                lastStoppingJob = null
+            }
+            if (!running.get()) return@launch
             sherpaBridge.initialize()
             onMonitorStateChanged(true, isDeviceLocked(), sherpaBridge.statusLabel)
             runAudioCaptureLoop()
@@ -462,9 +518,10 @@ class LockScreenWakeWordEngine(
     /**
      * Temporarily yields the microphone when SpeechRecognizer is actively capturing a full
      * command utterance (prevents AudioRecord / SpeechRecognizer contention on single-mic OEMs)
-     * and suspends until AudioRecord stops & releases.
+     * by immediately interrupting AudioRecord.stop() and suspending until AudioRecord releases.
      */
     suspend fun pauseForRecognizer(timeoutMs: Long = 1200L) {
+        val stoppingJob = lastStoppingJob
         val deferred = synchronized(pauseLock) {
             pausedForExternalRecognizer.set(true)
             if (running.get() && activeAudioRecord) {
@@ -472,7 +529,16 @@ class LockScreenWakeWordEngine(
             } else null
         }
         if (deferred != null) {
-            withTimeoutOrNull(timeoutMs) { deferred.await() }
+            // Proactively unblock blocking AudioRecord.read() so the mic lock is released immediately
+            interruptActiveAudioRecord()
+        }
+        if (deferred != null || (stoppingJob != null && stoppingJob.isActive)) {
+            withTimeoutOrNull(timeoutMs) {
+                if (stoppingJob != null && stoppingJob.isActive) {
+                    stoppingJob.join()
+                }
+                deferred?.await()
+            }
         }
     }
 
@@ -483,13 +549,23 @@ class LockScreenWakeWordEngine(
     fun stop() {
         running.set(false)
         pausedForExternalRecognizer.set(false)
+        interruptActiveAudioRecord()
         synchronized(pauseLock) {
             pauseAckDeferred?.complete(Unit)
             pauseAckDeferred = null
         }
-        monitorJob?.cancel()
+        val activeJob = monitorJob
         monitorJob = null
+        if (activeJob != null) {
+            lastStoppingJob = activeJob
+            activeJob.cancel()
+        }
         onMonitorStateChanged(false, isDeviceLocked(), sherpaBridge.statusLabel)
+    }
+
+    suspend fun stopAndJoin() {
+        stop()
+        lastStoppingJob?.join()
     }
 
     fun release() {
@@ -548,12 +624,21 @@ class LockScreenWakeWordEngine(
                     continue
                 }
 
-                synchronized(pauseLock) {
+                val shouldYield = synchronized(pauseLock) {
                     if (pausedForExternalRecognizer.get()) {
-                        runCatching { audioRecord.release() }
-                        return@runAudioCaptureLoop
+                        true
+                    } else {
+                        activeAudioRecord = true
+                        false
                     }
-                    activeAudioRecord = true
+                }
+                if (shouldYield) {
+                    delay(80L)
+                    continue
+                }
+                synchronized(audioHardwareLock) {
+                    activeAudioRecordRef = audioRecord
+                    audioRecordReleased.set(false)
                 }
                 audioRecord.startRecording()
 
@@ -682,12 +767,19 @@ class LockScreenWakeWordEngine(
             } catch (_: Throwable) {
                 delay(400L)
             } finally {
-                runCatching {
-                    if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                        audioRecord.stop()
+                synchronized(audioHardwareLock) {
+                    audioRecordReleased.set(true)
+                    val rec = audioRecord
+                    if (activeAudioRecordRef === rec) {
+                        activeAudioRecordRef = null
                     }
+                    runCatching {
+                        if (rec?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                            rec.stop()
+                        }
+                    }
+                    runCatching { rec?.release() }
                 }
-                runCatching { audioRecord?.release() }
                 val waiter = synchronized(pauseLock) {
                     activeAudioRecord = false
                     pauseAckDeferred.also { pauseAckDeferred = null }
@@ -717,19 +809,27 @@ class GokuEarAndVoiceEngine(private val context: Context) {
     private val _state = MutableStateFlow(VoiceEngineState())
     val state: StateFlow<VoiceEngineState> = _state.asStateFlow()
 
+    private val sessionGeneration = AtomicLong(0L)
     private var speechRecognizer: SpeechRecognizer? = null
     private var currentRecognizerIsOnDevice: Boolean? = null
     @Volatile
     private var onDeviceLanguageUnavailable: Boolean = false
+    @Volatile
     private var strictWakeGateActive: Boolean = false
+    @Volatile
     private var tts: TextToSpeech? = null
     @Volatile
     private var ttsReady = false
+    @Volatile
     private var continuousMode = false
+    @Volatile
     private var continuousWindowUntilMs = 0L
+    @Volatile
     private var onCommandRecognized: ((String) -> Unit)? = null
+    @Volatile
     private var restartRunnable: Runnable? = null
     private val pendingUtterances = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
+    private val activeOneShotRecognizers = CopyOnWriteArrayList<SpeechRecognizer>()
 
     private val lockScreenWakeWordEngine: LockScreenWakeWordEngine = LockScreenWakeWordEngine(
         context = context.applicationContext,
@@ -740,11 +840,13 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                 stopSpeaking()
                 strictWakeGateActive = false
                 continuousWindowUntilMs = System.currentTimeMillis() + 7000L
-                _state.value = _state.value.copy(
-                    tier = EarTier.TIER2_PREWARM_REFLEX,
-                    isKeyguardLocked = isLocked,
-                    partialTranscript = phrase
-                )
+                _state.update {
+                    it.copy(
+                        tier = EarTier.TIER2_PREWARM_REFLEX,
+                        isKeyguardLocked = isLocked,
+                        partialTranscript = phrase
+                    )
+                }
                 startRecognizerCapture(openDirectWindow = true)
             }
         },
@@ -753,66 +855,105 @@ class GokuEarAndVoiceEngine(private val context: Context) {
             stopSpeaking()
             GokuKillSwitch.triggerStop(source)
             mainHandler.post {
-                _state.value = _state.value.copy(
-                    tier = EarTier.STOPPED,
-                    isSpeaking = false,
-                    partialTranscript = source
-                )
+                _state.update {
+                    it.copy(
+                        tier = EarTier.STOPPED,
+                        isSpeaking = false,
+                        isSpeechRecognizerActive = false,
+                        isListening = it.isAcousticEarArmed,
+                        partialTranscript = source
+                    )
+                }
                 speak("Ruk gaya, sab band kar diya.", urgent = true)
             }
         },
         onBargeInSpeechDetected = { isLocked ->
             mainHandler.post {
+                if (GokuKillSwitch.isStopped.value) return@post
                 // Barge-In during TTS: interrupt TTS and open strict wake-word verification window
-                val wasSpeaking = _state.value.isSpeaking
-                if (wasSpeaking) {
+                if (_state.value.isSpeaking) {
                     stopSpeaking()
                 }
-                _state.value = _state.value.copy(
-                    tier = EarTier.TIER2_PREWARM_REFLEX,
-                    isKeyguardLocked = isLocked
-                )
-                if (!_state.value.isListening) {
+                _state.update {
+                    it.copy(
+                        tier = EarTier.TIER2_PREWARM_REFLEX,
+                        isKeyguardLocked = isLocked
+                    )
+                }
+                // Check isSpeechRecognizerActive (NOT isAcousticEarArmed/isListening) so lock-screen
+                // VAD immediately launches SpeechRecognizer when Sherpa-ONNX AAR is absent.
+                if (!_state.value.isSpeechRecognizerActive) {
                     // Enforce strict wake-word gate on ambient VAD onset so TV/chatter cannot wake Goku
                     startRecognizerCapture(openDirectWindow = false)
                 }
             }
         },
         onMonitorStateChanged = { active, locked, backendLabel ->
-            _state.value = _state.value.copy(
-                isLockScreenMonitorActive = active,
-                isKeyguardLocked = locked,
-                kwsEngineBackend = backendLabel,
-                isNativeKwsActive = lockScreenWakeWordEngine.isNativeKwsActive(),
-                isSherpaAarPresent = lockScreenWakeWordEngine.isSherpaAarPresent(),
-                hasKwsOnnxModels = lockScreenWakeWordEngine.hasKwsOnnxModels()
-            )
+            _state.update {
+                it.copy(
+                    isLockScreenMonitorActive = active,
+                    isAcousticEarArmed = active,
+                    isListening = active || it.isSpeechRecognizerActive,
+                    isKeyguardLocked = locked,
+                    kwsEngineBackend = backendLabel,
+                    isNativeKwsActive = lockScreenWakeWordEngine.isNativeKwsActive(),
+                    isSherpaAarPresent = lockScreenWakeWordEngine.isSherpaAarPresent(),
+                    hasKwsOnnxModels = lockScreenWakeWordEngine.hasKwsOnnxModels()
+                )
+            }
         },
         onPostBootMicSilenceChanged = { silenced ->
-            _state.value = _state.value.copy(isPostBootMicSilenced = silenced)
+            _state.update { it.copy(isPostBootMicSilenced = silenced) }
         }
     )
+
+    private val killSwitchStopHook: () -> Unit = {
+        val stopGen = sessionGeneration.incrementAndGet()
+        continuousMode = false
+        strictWakeGateActive = false
+        continuousWindowUntilMs = 0L
+        captureStartJob?.cancel()
+        captureStartJob = null
+        restartRunnable?.let { mainHandler.removeCallbacks(it) }
+        restartRunnable = null
+        stopSpeaking()
+        mainHandler.post {
+            if (sessionGeneration.get() == stopGen) {
+                runCatching { speechRecognizer?.cancel() }
+                activeOneShotRecognizers.forEach { rec ->
+                    runCatching { rec.cancel() }
+                    runCatching { rec.destroy() }
+                }
+                activeOneShotRecognizers.clear()
+                _state.update {
+                    it.copy(
+                        tier = EarTier.STOPPED,
+                        isSpeaking = false,
+                        isSpeechRecognizerActive = false,
+                        isListening = it.isAcousticEarArmed,
+                        partialTranscript = ""
+                    )
+                }
+            }
+        }
+    }
 
     init {
         initTts()
         refreshWakeWordDiagnostics()
-        GokuKillSwitch.registerStopHook {
-            stopSpeaking()
-            _state.value = _state.value.copy(
-                tier = EarTier.STOPPED,
-                isSpeaking = false
-            )
-        }
+        GokuKillSwitch.registerStopHook(killSwitchStopHook)
     }
 
     fun refreshWakeWordDiagnostics() {
         val (hasAar, hasModels, label) = lockScreenWakeWordEngine.refreshKwsDiagnostics()
-        _state.value = _state.value.copy(
-            kwsEngineBackend = label,
-            isNativeKwsActive = lockScreenWakeWordEngine.isNativeKwsActive(),
-            isSherpaAarPresent = hasAar,
-            hasKwsOnnxModels = hasModels
-        )
+        _state.update {
+            it.copy(
+                kwsEngineBackend = label,
+                isNativeKwsActive = lockScreenWakeWordEngine.isNativeKwsActive(),
+                isSherpaAarPresent = hasAar,
+                hasKwsOnnxModels = hasModels
+            )
+        }
     }
 
     fun setCommandCallback(callback: (String) -> Unit) {
@@ -830,10 +971,12 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                     }
                     tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) {
-                            _state.value = _state.value.copy(
-                                isSpeaking = true,
-                                tier = EarTier.SPEAKING
-                            )
+                            _state.update {
+                                it.copy(
+                                    isSpeaking = true,
+                                    tier = EarTier.SPEAKING
+                                )
+                            }
                             // Keep 24x7 AudioRecord barge-in / KWS ear active DURING TTS speech
                             if (continuousMode) {
                                 lockScreenWakeWordEngine.resumeAfterRecognizer()
@@ -843,25 +986,39 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                         override fun onDone(utteranceId: String?) {
                             utteranceId?.let { pendingUtterances.remove(it)?.complete(Unit) }
                             val stopped = GokuKillSwitch.isStopped.value
-                            _state.value = _state.value.copy(
-                                isSpeaking = false,
-                                tier = if (stopped) EarTier.STOPPED else _state.value.tier
-                            )
+                            _state.update {
+                                it.copy(
+                                    isSpeaking = false,
+                                    tier = if (stopped) EarTier.STOPPED else it.tier
+                                )
+                            }
                             if (continuousMode && !stopped) {
                                 // Open 6-second Continuous Talk window right after Goku finishes speaking
                                 continuousWindowUntilMs = System.currentTimeMillis() + 6000L
-                                _state.value = _state.value.copy(tier = EarTier.TIER3_CONTINUOUS_TALK)
+                                _state.update { it.copy(tier = EarTier.TIER3_CONTINUOUS_TALK) }
                                 scheduleRestartListening(200L)
+                            }
+                        }
+
+                        override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                            utteranceId?.let { pendingUtterances.remove(it)?.complete(Unit) }
+                            _state.update {
+                                it.copy(
+                                    isSpeaking = false,
+                                    tier = if (GokuKillSwitch.isStopped.value) EarTier.STOPPED else it.tier
+                                )
                             }
                         }
 
                         @Deprecated("Deprecated in Java")
                         override fun onError(utteranceId: String?) {
                             utteranceId?.let { pendingUtterances.remove(it)?.complete(Unit) }
-                            _state.value = _state.value.copy(
-                                isSpeaking = false,
-                                tier = if (GokuKillSwitch.isStopped.value) EarTier.STOPPED else _state.value.tier
-                            )
+                            _state.update {
+                                it.copy(
+                                    isSpeaking = false,
+                                    tier = if (GokuKillSwitch.isStopped.value) EarTier.STOPPED else it.tier
+                                )
+                            }
                         }
                     })
                     ttsReady = true
@@ -903,12 +1060,15 @@ class GokuEarAndVoiceEngine(private val context: Context) {
 
         val whisper = isEarphoneConnected()
         val nightSoft = isNightOrDnd()
-        _state.value = _state.value.copy(
-            isWhisperMode = whisper,
-            isNightSoftMode = nightSoft
-        )
+        _state.update {
+            it.copy(
+                isWhisperMode = whisper,
+                isNightSoftMode = nightSoft
+            )
+        }
 
-        if (!ttsReady) return
+        val engine = tts
+        if (!ttsReady || engine == null) return
 
         // Natural Hinglish prosody adaptation
         val speechRate = when {
@@ -918,8 +1078,8 @@ class GokuEarAndVoiceEngine(private val context: Context) {
             else -> 1.03f
         }
         val pitch = if (whisper || nightSoft) 0.95f else 1.02f
-        tts?.setSpeechRate(speechRate)
-        tts?.setPitch(pitch)
+        engine.setSpeechRate(speechRate)
+        engine.setPitch(pitch)
 
         val params = Bundle().apply {
             val vol = when {
@@ -934,7 +1094,7 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         val queueMode = if (flushQueue) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
         val utteranceId = "goku_${UUID.randomUUID()}"
         runCatching {
-            tts?.speak(text, queueMode, params, utteranceId)
+            engine.speak(text, queueMode, params, utteranceId)
         }
     }
 
@@ -947,7 +1107,8 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         urgent: Boolean = true,
         timeoutMs: Long = 12_000L
     ) {
-        if (text.isBlank() || !ttsReady) return
+        val engine = tts
+        if (text.isBlank() || !ttsReady || engine == null) return
         val utteranceId = "goku_await_${UUID.randomUUID()}"
         val deferred = CompletableDeferred<Unit>()
         pendingUtterances[utteranceId] = deferred
@@ -955,20 +1116,23 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         val params = Bundle().apply {
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, if (urgent) 1.0f else 0.92f)
         }
-        tts?.setSpeechRate(1.02f)
-        tts?.setPitch(1.0f)
+        engine.setSpeechRate(1.02f)
+        engine.setPitch(1.0f)
         val started = runCatching {
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId) == TextToSpeech.SUCCESS
+            engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId) == TextToSpeech.SUCCESS
         }.getOrDefault(false)
 
         if (!started) {
             pendingUtterances.remove(utteranceId)
             return
         }
-        withTimeoutOrNull(timeoutMs) {
-            deferred.await()
+        try {
+            withTimeoutOrNull(timeoutMs) {
+                deferred.await()
+            }
+        } finally {
+            pendingUtterances.remove(utteranceId)
         }
-        pendingUtterances.remove(utteranceId)
     }
 
     /**
@@ -981,88 +1145,101 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         ) return ""
 
         val resumeContinuous = continuousMode
-        lockScreenWakeWordEngine.pauseForRecognizer()
-        stopSpeaking()
 
-        val result = withTimeoutOrNull(timeoutMs) {
-            suspendCancellableCoroutine<String> { cont ->
-                var oneShotRecognizer: SpeechRecognizer? = null
-                mainHandler.post {
-                    val onDeviceOk = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                        !onDeviceLanguageUnavailable &&
-                        runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(context) }.getOrDefault(false)
-                    val useOnDevice = onDeviceOk && !isNetworkConnected()
-                    oneShotRecognizer = runCatching {
-                        if (useOnDevice && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                            SpeechRecognizer.createOnDeviceSpeechRecognizer(context.applicationContext)
-                        } else {
-                            SpeechRecognizer.createSpeechRecognizer(context.applicationContext)
-                        }
-                    }.getOrNull()
-
-                    val rec = oneShotRecognizer
-                    if (rec == null) {
-                        if (cont.isActive) cont.resume("")
-                        return@post
-                    }
-
-                    var lastPartial = ""
-                    rec.setRecognitionListener(object : RecognitionListener {
-                        override fun onReadyForSpeech(params: Bundle?) {}
-                        override fun onBeginningOfSpeech() {}
-                        override fun onRmsChanged(rmsdB: Float) {}
-                        override fun onBufferReceived(buffer: ByteArray?) {}
-                        override fun onEndOfSpeech() {}
-                        override fun onEvent(eventType: Int, params: Bundle?) {}
-
-                        override fun onPartialResults(partialResults: Bundle?) {
-                            val p = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                                ?.firstOrNull()?.trim().orEmpty()
-                            if (p.isNotBlank()) lastPartial = p
-                        }
-
-                        override fun onResults(results: Bundle?) {
-                            val spoken = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                                ?.firstOrNull()?.trim().orEmpty().ifBlank { lastPartial }
-                            mainHandler.post { runCatching { rec.destroy() } }
-                            if (cont.isActive) cont.resume(spoken)
-                        }
-
-                        override fun onError(error: Int) {
-                            mainHandler.post { runCatching { rec.destroy() } }
-                            if (cont.isActive) cont.resume(lastPartial)
-                        }
-                    })
-
-                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "hi-IN")
-                        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 2)
-                        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1300L)
-                        if (useOnDevice) putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                    }
-
-                    runCatching { rec.startListening(intent) }.onFailure {
-                        mainHandler.post { runCatching { rec.destroy() } }
-                        if (cont.isActive) cont.resume("")
-                    }
-                }
-
-                cont.invokeOnCancellation {
+        return try {
+            lockScreenWakeWordEngine.pauseForRecognizer()
+            stopSpeaking()
+            val result = withTimeoutOrNull(timeoutMs) {
+                suspendCancellableCoroutine<String> { cont ->
+                    var oneShotRecognizer: SpeechRecognizer? = null
                     mainHandler.post {
-                        runCatching { oneShotRecognizer?.cancel() }
-                        runCatching { oneShotRecognizer?.destroy() }
+                        if (!cont.isActive) return@post
+                        val onDeviceOk = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                            !onDeviceLanguageUnavailable &&
+                            runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(context) }.getOrDefault(false)
+                        val useOnDevice = onDeviceOk && !isNetworkConnected()
+                        oneShotRecognizer = runCatching {
+                            if (useOnDevice && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                SpeechRecognizer.createOnDeviceSpeechRecognizer(context.applicationContext)
+                            } else {
+                                SpeechRecognizer.createSpeechRecognizer(context.applicationContext)
+                            }
+                        }.getOrNull()
+
+                        val rec = oneShotRecognizer
+                        if (rec == null) {
+                            if (cont.isActive) cont.resume("")
+                            return@post
+                        }
+                        activeOneShotRecognizers.add(rec)
+
+                        var lastPartial = ""
+                        rec.setRecognitionListener(object : RecognitionListener {
+                            override fun onReadyForSpeech(params: Bundle?) {}
+                            override fun onBeginningOfSpeech() {}
+                            override fun onRmsChanged(rmsdB: Float) {}
+                            override fun onBufferReceived(buffer: ByteArray?) {}
+                            override fun onEndOfSpeech() {}
+                            override fun onEvent(eventType: Int, params: Bundle?) {}
+
+                            override fun onPartialResults(partialResults: Bundle?) {
+                                val p = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                    ?.firstOrNull()?.trim().orEmpty()
+                                if (p.isNotBlank()) lastPartial = p
+                            }
+
+                            override fun onResults(results: Bundle?) {
+                                val spoken = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                    ?.firstOrNull()?.trim().orEmpty().ifBlank { lastPartial }
+                                activeOneShotRecognizers.remove(rec)
+                                runCatching { rec.destroy() }
+                                if (cont.isActive) cont.resume(spoken)
+                            }
+
+                            override fun onError(error: Int) {
+                                if (useOnDevice && (error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ||
+                                        error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED)
+                                ) {
+                                    onDeviceLanguageUnavailable = true
+                                }
+                                activeOneShotRecognizers.remove(rec)
+                                runCatching { rec.destroy() }
+                                if (cont.isActive) cont.resume(lastPartial)
+                            }
+                        })
+
+                        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "hi-IN")
+                            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 2)
+                            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1300L)
+                            if (useOnDevice) putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                        }
+
+                        runCatching { rec.startListening(intent) }.onFailure {
+                            activeOneShotRecognizers.remove(rec)
+                            runCatching { rec.destroy() }
+                            if (cont.isActive) cont.resume("")
+                        }
+                    }
+
+                    cont.invokeOnCancellation {
+                        mainHandler.post {
+                            oneShotRecognizer?.let { activeOneShotRecognizers.remove(it) }
+                            runCatching { oneShotRecognizer?.cancel() }
+                            runCatching { oneShotRecognizer?.destroy() }
+                        }
                     }
                 }
+            }.orEmpty()
+            result.trim()
+        } finally {
+            if (resumeContinuous && continuousMode && !GokuKillSwitch.isStopped.value) {
+                lockScreenWakeWordEngine.resumeAfterRecognizer()
             }
-        }.orEmpty()
-
-        if (resumeContinuous && !GokuKillSwitch.isStopped.value) {
-            lockScreenWakeWordEngine.resumeAfterRecognizer()
         }
-        return result.trim()
     }
 
     /**
@@ -1070,7 +1247,7 @@ class GokuEarAndVoiceEngine(private val context: Context) {
      * background mic silence restrictions, restart AudioRecord cleanly, and open a direct listening window.
      */
     fun unlockPostBootMicAndListen() {
-        _state.value = _state.value.copy(isPostBootMicSilenced = false, lastError = null)
+        _state.update { it.copy(isPostBootMicSilenced = false, lastError = null) }
         lockScreenWakeWordEngine.stop()
         startListening(continuous = true, openDirectWindow = true)
     }
@@ -1079,7 +1256,7 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         runCatching { tts?.stop() }
         pendingUtterances.values.forEach { it.complete(Unit) }
         pendingUtterances.clear()
-        _state.value = _state.value.copy(isSpeaking = false)
+        _state.update { it.copy(isSpeaking = false) }
     }
 
     fun startLockScreenMonitor() {
@@ -1094,12 +1271,13 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            _state.value = _state.value.copy(
-                lastError = "RECORD_AUDIO permission required for Goku Ear"
-            )
+            _state.update {
+                it.copy(lastError = "RECORD_AUDIO permission required for Goku Ear")
+            }
             return
         }
 
+        sessionGeneration.incrementAndGet()
         GokuKillSwitch.reset()
         continuousMode = continuous
         if (openDirectWindow) {
@@ -1113,16 +1291,22 @@ class GokuEarAndVoiceEngine(private val context: Context) {
 
         val locked = keyguardManager?.isKeyguardLocked == true
         if (locked && !openDirectWindow) {
-            // While locked and idle, rely on low-power 24x7 AudioRecord KWS/VAD loop until wake/speech onset
+            // While locked and idle, rely on low-power 24x7 AudioRecord KWS/VAD loop until wake/speech onset.
+            // Keep isAcousticEarArmed=true and isSpeechRecognizerActive=false so acoustic VAD triggers
+            // SpeechRecognizer immediately when Sherpa-ONNX AAR is absent.
             lockScreenWakeWordEngine.resumeAfterRecognizer()
-            _state.value = _state.value.copy(
-                tier = EarTier.TIER1_WAKE_SLEEP,
-                isListening = true,
-                isKeyguardLocked = true,
-                isWhisperMode = isEarphoneConnected(),
-                isNightSoftMode = isNightOrDnd(),
-                lastError = null
-            )
+            _state.update {
+                it.copy(
+                    tier = EarTier.TIER1_WAKE_SLEEP,
+                    isAcousticEarArmed = continuous,
+                    isSpeechRecognizerActive = false,
+                    isListening = continuous,
+                    isKeyguardLocked = true,
+                    isWhisperMode = isEarphoneConnected(),
+                    isNightSoftMode = isNightOrDnd(),
+                    lastError = null
+                )
+            }
             return
         }
 
@@ -1133,12 +1317,15 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
         val net = cm.activeNetwork ?: return false
         val caps = cm.getNetworkCapabilities(net) ?: return false
-        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
     private fun startRecognizerCapture(openDirectWindow: Boolean) {
+        val targetGen = sessionGeneration.get()
         captureStartJob?.cancel()
-        captureStartJob = engineScope.launch {
+        val job = engineScope.launch {
+            if (sessionGeneration.get() != targetGen || GokuKillSwitch.isStopped.value) return@launch
             val onDeviceAvailable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
                 !onDeviceLanguageUnavailable &&
                 runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(context) }.getOrDefault(false)
@@ -1147,9 +1334,13 @@ class GokuEarAndVoiceEngine(private val context: Context) {
             if (!standardAvailable && !onDeviceAvailable) {
                 // Keep 24x7 AudioRecord KWS running even if Google SpeechRecognizer service is absent
                 lockScreenWakeWordEngine.resumeAfterRecognizer()
-                _state.value = _state.value.copy(
-                    lastError = "System SpeechRecognizer unavailable; 24x7 AudioRecord KWS active"
-                )
+                _state.update {
+                    it.copy(
+                        isSpeechRecognizerActive = false,
+                        isListening = it.isAcousticEarArmed,
+                        lastError = "System SpeechRecognizer unavailable; 24x7 AudioRecord KWS active"
+                    )
+                }
                 return@launch
             }
 
@@ -1163,9 +1354,14 @@ class GokuEarAndVoiceEngine(private val context: Context) {
             // Strict wake-word gate applies whenever capture was triggered passively (not direct tap / active window)
             strictWakeGateActive = !openDirectWindow && System.currentTimeMillis() > continuousWindowUntilMs
 
-            // Yield AudioRecord while SpeechRecognizer holds the mic stream (awaits AudioRecord release off-UI)
+            // Yield AudioRecord while SpeechRecognizer holds the mic stream (interrupts & awaits release off-UI)
             lockScreenWakeWordEngine.pauseForRecognizer()
-            if (!isActive) return@launch
+            if (!isActive || sessionGeneration.get() != targetGen || GokuKillSwitch.isStopped.value) {
+                if (continuousMode && !GokuKillSwitch.isStopped.value) {
+                    lockScreenWakeWordEngine.resumeAfterRecognizer()
+                }
+                return@launch
+            }
             ensureRecognizer(preferOnDevice = preferOnDevice)
 
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -1187,39 +1383,54 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                 } else {
                     EarTier.TIER1_WAKE_SLEEP
                 }
-                _state.value = _state.value.copy(
-                    tier = tier,
-                    isListening = true,
-                    isKeyguardLocked = locked,
-                    isWhisperMode = isEarphoneConnected(),
-                    isNightSoftMode = isNightOrDnd(),
-                    lastError = null
-                )
+                _state.update {
+                    it.copy(
+                        tier = tier,
+                        isSpeechRecognizerActive = true,
+                        isListening = true,
+                        isKeyguardLocked = locked,
+                        isWhisperMode = isEarphoneConnected(),
+                        isNightSoftMode = isNightOrDnd(),
+                        lastError = null
+                    )
+                }
             }.onFailure { err ->
                 lockScreenWakeWordEngine.resumeAfterRecognizer()
-                _state.value = _state.value.copy(
-                    isListening = false,
-                    lastError = err.message
-                )
+                _state.update {
+                    it.copy(
+                        isSpeechRecognizerActive = false,
+                        isListening = it.isAcousticEarArmed,
+                        lastError = err.message
+                    )
+                }
             }
         }
+        captureStartJob = job
+        GokuKillSwitch.registerJob(job)
     }
 
     fun stopListening() {
+        val stopGen = sessionGeneration.incrementAndGet()
         continuousMode = false
         strictWakeGateActive = false
         captureStartJob?.cancel()
         captureStartJob = null
         restartRunnable?.let { mainHandler.removeCallbacks(it) }
+        restartRunnable = null
         lockScreenWakeWordEngine.stop()
         mainHandler.post {
+            if (sessionGeneration.get() != stopGen) return@post
             runCatching { speechRecognizer?.stopListening() }
             runCatching { speechRecognizer?.cancel() }
-            _state.value = _state.value.copy(
-                isListening = false,
-                tier = EarTier.IDLE_OFF,
-                partialTranscript = ""
-            )
+            _state.update {
+                it.copy(
+                    isAcousticEarArmed = false,
+                    isSpeechRecognizerActive = false,
+                    isListening = false,
+                    tier = EarTier.IDLE_OFF,
+                    partialTranscript = ""
+                )
+            }
         }
     }
 
@@ -1262,7 +1473,7 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                     if (_state.value.isSpeaking) {
                         stopSpeaking()
                     }
-                    _state.value = _state.value.copy(tier = EarTier.TIER2_PREWARM_REFLEX)
+                    _state.update { it.copy(tier = EarTier.TIER2_PREWARM_REFLEX) }
                 }
 
                 override fun onRmsChanged(rmsdB: Float) {}
@@ -1270,7 +1481,12 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                 override fun onEndOfSpeech() {}
 
                 override fun onError(error: Int) {
-                    _state.value = _state.value.copy(isListening = false)
+                    _state.update {
+                        it.copy(
+                            isSpeechRecognizerActive = false,
+                            isListening = it.isAcousticEarArmed
+                        )
+                    }
                     val isLangUnsupported = error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE ||
                         error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED
                     if (isLangUnsupported && currentRecognizerIsOnDevice == true) {
@@ -1280,11 +1496,10 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                         error == SpeechRecognizer.ERROR_CLIENT ||
                         isLangUnsupported
                     ) {
-                        mainHandler.post {
-                            runCatching { speechRecognizer?.destroy() }
-                            speechRecognizer = null
-                            currentRecognizerIsOnDevice = null
-                        }
+                        val stale = speechRecognizer
+                        speechRecognizer = null
+                        currentRecognizerIsOnDevice = null
+                        runCatching { stale?.destroy() }
                     }
                     // Resume 24x7 AudioRecord lock-screen monitor immediately on recognizer error/timeout
                     if (continuousMode) {
@@ -1296,10 +1511,12 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                             val backoff = if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 900L else 450L
                             scheduleRestartListening(backoff)
                         } else {
-                            _state.value = _state.value.copy(
-                                tier = EarTier.TIER1_WAKE_SLEEP,
-                                isKeyguardLocked = locked
-                            )
+                            _state.update {
+                                it.copy(
+                                    tier = EarTier.TIER1_WAKE_SLEEP,
+                                    isKeyguardLocked = locked
+                                )
+                            }
                         }
                     }
                 }
@@ -1310,7 +1527,7 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                         ?.firstOrNull()
                         .orEmpty()
                     if (partial.isBlank()) return
-                    _state.value = _state.value.copy(partialTranscript = partial)
+                    _state.update { it.copy(partialTranscript = partial) }
 
                     // Instant 0.1s kill-switch interrupt on partial voice recognition
                     if (GokuKillSwitch.isStopPhrase(partial)) {
@@ -1327,11 +1544,14 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                         val words = partial.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
                         if (words.size >= 4 && !containsWakePhrase(partial)) {
                             runCatching { speechRecognizer?.cancel() }
-                            _state.value = _state.value.copy(
-                                isListening = false,
-                                partialTranscript = "",
-                                tier = EarTier.TIER1_WAKE_SLEEP
-                            )
+                            _state.update {
+                                it.copy(
+                                    isSpeechRecognizerActive = false,
+                                    isListening = it.isAcousticEarArmed,
+                                    partialTranscript = "",
+                                    tier = EarTier.TIER1_WAKE_SLEEP
+                                )
+                            }
                             if (continuousMode) {
                                 lockScreenWakeWordEngine.resumeAfterRecognizer()
                             }
@@ -1346,10 +1566,13 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                         ?.trim()
                         .orEmpty()
 
-                    _state.value = _state.value.copy(
-                        isListening = false,
-                        partialTranscript = ""
-                    )
+                    _state.update {
+                        it.copy(
+                            isSpeechRecognizerActive = false,
+                            isListening = it.isAcousticEarArmed,
+                            partialTranscript = ""
+                        )
+                    }
 
                     if (continuousMode) {
                         lockScreenWakeWordEngine.resumeAfterRecognizer()
@@ -1371,7 +1594,10 @@ class GokuEarAndVoiceEngine(private val context: Context) {
     }
 
     private fun containsWakePhrase(text: String): Boolean {
-        val lower = text.lowercase(Locale.ROOT).trim()
+        val lower = text.lowercase(Locale.ROOT)
+            .replace(Regex("[,\\.!?।:;\"'()]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
         return lower.contains("hey goku") ||
             lower.contains("ok goku") ||
             lower.contains("hi goku") ||
@@ -1393,11 +1619,17 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         val inContinuousWindow = System.currentTimeMillis() <= continuousWindowUntilMs
         val hasWakeWord = containsWakePhrase(transcript)
 
+        // Never execute stale mid-sentence transcripts delivered after GokuKillSwitch STOP
+        if (GokuKillSwitch.isStopped.value && !hasWakeWord) {
+            return
+        }
+
         // Strict Wake-Word Gate: reject ambient TV / conversation unless wake phrase or explicit direct window
         if (hasWakeWord || inContinuousWindow) {
+            if (hasWakeWord) GokuKillSwitch.reset()
             strictWakeGateActive = false
             val cleaned = transcript
-                .replace(Regex("^(hey|ok|hi|hello)?\\s*goku[,:\\s]*", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("^(hey|ok|hi|hello)?[,\\s]*goku[,:\\s]*", RegexOption.IGNORE_CASE), "")
                 .replace(Regex("^(हे\\s*)?गोकू[,:\\s]*"), "")
                 .trim()
 
@@ -1411,10 +1643,12 @@ class GokuEarAndVoiceEngine(private val context: Context) {
             }
         } else {
             // Silently ignore non-wake ambient chatter and remain in low-power Tier 1 VAD monitor
-            _state.value = _state.value.copy(
-                tier = EarTier.TIER1_WAKE_SLEEP,
-                partialTranscript = ""
-            )
+            _state.update {
+                it.copy(
+                    tier = EarTier.TIER1_WAKE_SLEEP,
+                    partialTranscript = ""
+                )
+            }
             if (continuousMode) {
                 lockScreenWakeWordEngine.resumeAfterRecognizer()
             }
@@ -1424,7 +1658,7 @@ class GokuEarAndVoiceEngine(private val context: Context) {
     private fun scheduleRestartListening(delayMs: Long) {
         restartRunnable?.let { mainHandler.removeCallbacks(it) }
         val r = Runnable {
-            if (continuousMode && !_state.value.isSpeaking) {
+            if (continuousMode && !_state.value.isSpeaking && !GokuKillSwitch.isStopped.value) {
                 startListening(continuous = true, openDirectWindow = false)
             }
         }
@@ -1433,6 +1667,7 @@ class GokuEarAndVoiceEngine(private val context: Context) {
     }
 
     fun release() {
+        GokuKillSwitch.unregisterStopHook(killSwitchStopHook)
         captureStartJob?.cancel()
         captureStartJob = null
         stopListening()
@@ -1440,7 +1675,13 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         pendingUtterances.values.forEach { it.complete(Unit) }
         pendingUtterances.clear()
         lockScreenWakeWordEngine.release()
+        onCommandRecognized = null
         mainHandler.post {
+            activeOneShotRecognizers.forEach { rec ->
+                runCatching { rec.cancel() }
+                runCatching { rec.destroy() }
+            }
+            activeOneShotRecognizers.clear()
             runCatching { speechRecognizer?.destroy() }
             speechRecognizer = null
             currentRecognizerIsOnDevice = null
@@ -1448,6 +1689,11 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         runCatching { tts?.shutdown() }
         tts = null
         ttsReady = false
+        synchronized(Companion) {
+            if (INSTANCE === this) {
+                INSTANCE = null
+            }
+        }
     }
 
     companion object {

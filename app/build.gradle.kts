@@ -9,6 +9,7 @@ plugins {
 }
 
 android {
+  // Aligned with `import com.example.R` across com.goku.ai.* and com.example.* test suites
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
@@ -16,8 +17,9 @@ android {
     applicationId = "com.aistudio.goku.xk7m9v"
     minSdk = 24
     targetSdk = 36
-    versionCode = 11
-    versionName = "10.1-godmode"
+    val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()?.takeIf { it > 0 } ?: 0
+    versionCode = 12 + ciRunNumber
+    versionName = if (ciRunNumber > 0) "10.1.$ciRunNumber-godmode" else "10.1-godmode"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

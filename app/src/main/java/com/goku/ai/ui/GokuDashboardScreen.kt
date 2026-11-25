@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -40,10 +41,12 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -54,6 +57,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -113,6 +117,7 @@ import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -136,13 +141,14 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.goku.ai.adb.AdbStatus
 import com.goku.ai.automation.CameraLiveEyeOcr
@@ -152,7 +158,6 @@ import com.goku.ai.brain.BrainVisualState
 import com.goku.ai.brain.ChatMessage
 import com.goku.ai.brain.ModelDownloadState
 import com.goku.ai.brain.OFFLINE_MODEL_PRESETS
-import com.goku.ai.brain.OfflineModelDownloadManager
 import com.goku.ai.brain.PendingConfirmation
 import com.goku.ai.data.ActionLogEntity
 import com.goku.ai.data.ExpenseRecordEntity
@@ -306,6 +311,7 @@ data class GokuDashboardUiState(
     val isOnline: Boolean = false,
     val activeProvider: String = "OFFLINE-READY",
     val isLocalModelLoaded: Boolean = false,
+    val modelDownloadState: ModelDownloadState = ModelDownloadState.Idle(),
     val isKillSwitchStopped: Boolean = false,
     val lastStopSource: String = "",
     val mistakeWarning: String? = null,
@@ -354,7 +360,12 @@ data class GokuDashboardCallbacks(
     val onExportSkills: () -> Unit,
     val onDismissExportedJson: () -> Unit,
     val onImportSkillsJson: (String) -> Unit,
-    val onLiveEyeOcrText: (String) -> Unit
+    val onLiveEyeOcrText: (String) -> Unit,
+    val onStartModelDownload: (String, String) -> Unit = { _, _ -> },
+    val onPauseModelDownload: () -> Unit = {},
+    val onResumeModelDownload: () -> Unit = {},
+    val onDeleteOfflineModel: () -> Unit = {},
+    val onImportLocalModelUri: (Uri) -> Unit = {}
 )
 
 // ============================================================================
@@ -415,6 +426,8 @@ fun GokuDashboardScreen(
                     )
                 )
                 .padding(innerPadding)
+                .consumeWindowInsets(innerPadding)
+                .imePadding()
         ) {
             when (selectedTab) {
                 0 -> CoreCommandTab(
@@ -507,6 +520,63 @@ private fun CoreCommandTab(
     onOpenLiveEye: () -> Unit
 ) {
     var commandText by rememberSaveable { mutableStateOf("") }
+    var showQuickTeachDialog by rememberSaveable { mutableStateOf(false) }
+    var quickTeachSkillName by rememberSaveable { mutableStateOf("Morning Routine") }
+    var quickTeachTrigger by rememberSaveable { mutableStateOf("morning routine") }
+
+    if (showQuickTeachDialog) {
+        AlertDialog(
+            onDismissRequest = { showQuickTeachDialog = false },
+            containerColor = GokuSurfaceDark,
+            title = { Text("Start Teach-by-Example Macro", color = GokuViolet) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Name your macro and choose the voice trigger phrase before recording screen taps.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = GokuTextMuted
+                    )
+                    OutlinedTextField(
+                        value = quickTeachSkillName,
+                        onValueChange = { quickTeachSkillName = it },
+                        label = { Text("Skill Name") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("quick_teach_skill_name_input")
+                    )
+                    OutlinedTextField(
+                        value = quickTeachTrigger,
+                        onValueChange = { quickTeachTrigger = it },
+                        label = { Text("Voice Trigger Phrase") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("quick_teach_trigger_input")
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val name = quickTeachSkillName.trim()
+                        val trig = quickTeachTrigger.trim()
+                        if (name.isNotBlank() && trig.isNotBlank()) {
+                            callbacks.onToggleTeachMode(true, name, trig)
+                            showQuickTeachDialog = false
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = GokuViolet),
+                    modifier = Modifier.testTag("quick_teach_start_btn")
+                ) {
+                    Text("Start Recording", color = Color.White)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showQuickTeachDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -845,7 +915,11 @@ private fun CoreCommandTab(
                 accent = if (uiState.isTeachRecording) GokuCrimson else GokuViolet,
                 tag = "chip_teach_mode",
                 onClick = {
-                    callbacks.onToggleTeachMode(!uiState.isTeachRecording, "Custom Macro", "run my macro")
+                    if (uiState.isTeachRecording) {
+                        callbacks.onToggleTeachMode(false, quickTeachSkillName, quickTeachTrigger)
+                    } else {
+                        showQuickTeachDialog = true
+                    }
                 }
             )
             QuickChip(
@@ -1532,6 +1606,8 @@ private fun VaultAndSettingsTab(
     var smartCallPolicy by rememberSaveable(uiState.settings.smartCallPolicy) { mutableStateOf(uiState.settings.smartCallPolicy) }
     var githubRepo by rememberSaveable(uiState.settings.githubRepo) { mutableStateOf(uiState.settings.githubRepo) }
     var githubToken by rememberSaveable(uiState.settings.githubToken) { mutableStateOf(uiState.settings.githubToken) }
+    var telegramBot by rememberSaveable(uiState.settings.telegramBot) { mutableStateOf(uiState.settings.telegramBot) }
+    var telegramChatId by rememberSaveable(uiState.settings.telegramChatId) { mutableStateOf(uiState.settings.telegramChatId) }
     var localModelPath by rememberSaveable(uiState.settings.localModelPath) { mutableStateOf(uiState.settings.localModelPath) }
     val ctx = LocalContext.current
 
@@ -1549,7 +1625,11 @@ private fun VaultAndSettingsTab(
 
         // Latest Offline AI Brain (1-Tap Download + HTTP Range Resume + 15s RAM Auto-Unload)
         item {
-            LatestOfflineAiBrainCard(isLoadedInRam = uiState.isLocalModelLoaded)
+            LatestOfflineAiBrainCard(
+                isLoadedInRam = uiState.isLocalModelLoaded,
+                downloadState = uiState.modelDownloadState,
+                callbacks = callbacks
+            )
         }
 
         // Personal Knowledge Graph Quick Add
@@ -1728,6 +1808,7 @@ private fun VaultAndSettingsTab(
                         onValueChange = { geminiKey = it },
                         label = { Text("Gemini Free API Key (Primary Cloud)") },
                         singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
@@ -1735,6 +1816,7 @@ private fun VaultAndSettingsTab(
                         onValueChange = { groqKey = it },
                         label = { Text("Groq Free API Key (Failover #1)") },
                         singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
@@ -1742,6 +1824,7 @@ private fun VaultAndSettingsTab(
                         onValueChange = { deepSeekKey = it },
                         label = { Text("DeepSeek API Key (Failover #2)") },
                         singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
@@ -1749,12 +1832,13 @@ private fun VaultAndSettingsTab(
                         onValueChange = { openRouterKey = it },
                         label = { Text("OpenRouter Free Key (Failover #3)") },
                         singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = localModelPath,
                         onValueChange = { localModelPath = it },
-                        label = { Text("Offline 4-Bit GGUF Model Path") },
+                        label = { Text("Offline MediaPipe LiteRT (.task) Model Path") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -1770,7 +1854,27 @@ private fun VaultAndSettingsTab(
                         onValueChange = { githubToken = it },
                         label = { Text("GitHub PAT (Optional Dream Backup)") },
                         singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = telegramBot,
+                        onValueChange = { telegramBot = it },
+                        label = { Text("Telegram Bot Token (Remote Bridge)") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("telegram_bot_token_input")
+                    )
+                    OutlinedTextField(
+                        value = telegramChatId,
+                        onValueChange = { telegramChatId = it },
+                        label = { Text("Telegram Chat ID (Authorized Owner)") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("telegram_chat_id_input")
                     )
                     Button(
                         onClick = {
@@ -1784,6 +1888,8 @@ private fun VaultAndSettingsTab(
                                     smartCallPolicy = smartCallPolicy,
                                     githubRepo = githubRepo,
                                     githubToken = githubToken,
+                                    telegramBot = telegramBot,
+                                    telegramChatId = telegramChatId,
                                     localModelPath = localModelPath
                                 )
                             )
@@ -1835,10 +1941,12 @@ private fun VaultAndSettingsTab(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
+private fun LatestOfflineAiBrainCard(
+    isLoadedInRam: Boolean,
+    downloadState: ModelDownloadState,
+    callbacks: GokuDashboardCallbacks
+) {
     val ctx = LocalContext.current
-    val downloadManager = remember(ctx) { OfflineModelDownloadManager.getInstance(ctx) }
-    val downloadState by downloadManager.state.collectAsStateWithLifecycle()
 
     var selectedPresetIndex by rememberSaveable { mutableIntStateOf(0) }
     var useCustomUrl by rememberSaveable { mutableStateOf(false) }
@@ -1848,7 +1956,7 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            downloadManager.importLocalModel(uri)
+            callbacks.onImportLocalModelUri(uri)
         }
     }
 
@@ -1975,9 +2083,9 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                         Button(
                             onClick = {
                                 if (useCustomUrl) {
-                                    downloadManager.startDownload(customUrl, "Custom Offline LLM")
+                                    callbacks.onStartModelDownload(customUrl, "Custom Offline LLM")
                                 } else {
-                                    downloadManager.startDownload(selectedPreset.directUrl, selectedPreset.name)
+                                    callbacks.onStartModelDownload(selectedPreset.directUrl, selectedPreset.name)
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = GokuCyan),
@@ -2042,7 +2150,7 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(
-                                onClick = { downloadManager.pauseDownload() },
+                                onClick = { callbacks.onPauseModelDownload() },
                                 colors = ButtonDefaults.buttonColors(containerColor = GokuAmber),
                                 modifier = Modifier
                                     .weight(1f)
@@ -2054,7 +2162,7 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                                 Text("Pause", color = GokuObsidianBg, fontWeight = FontWeight.Bold)
                             }
                             OutlinedButton(
-                                onClick = { downloadManager.deleteModel() },
+                                onClick = { callbacks.onDeleteOfflineModel() },
                                 modifier = Modifier.heightIn(min = 48.dp)
                             ) {
                                 Icon(Icons.Filled.Delete, contentDescription = "Cancel", tint = GokuCrimson)
@@ -2081,7 +2189,7 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(
-                                onClick = { downloadManager.resumeDownload() },
+                                onClick = { callbacks.onResumeModelDownload() },
                                 colors = ButtonDefaults.buttonColors(containerColor = GokuCyan),
                                 modifier = Modifier
                                     .weight(1f)
@@ -2093,7 +2201,7 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                                 Text("Resume (HTTP Range)", color = GokuObsidianBg, fontWeight = FontWeight.Bold)
                             }
                             OutlinedButton(
-                                onClick = { downloadManager.deleteModel() },
+                                onClick = { callbacks.onDeleteOfflineModel() },
                                 modifier = Modifier
                                     .heightIn(min = 48.dp)
                                     .testTag("offline_model_delete_btn")
@@ -2146,7 +2254,7 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                             }
                             Button(
                                 onClick = {
-                                    downloadManager.deleteModel()
+                                    callbacks.onDeleteOfflineModel()
                                     Toast.makeText(ctx, "Offline AI model deleted & RAM freed", Toast.LENGTH_SHORT).show()
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = GokuCrimson),
@@ -2174,11 +2282,11 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                             Button(
                                 onClick = {
                                     if (st.canResume) {
-                                        downloadManager.resumeDownload()
+                                        callbacks.onResumeModelDownload()
                                     } else if (useCustomUrl) {
-                                        downloadManager.startDownload(customUrl, "Custom Offline LLM")
+                                        callbacks.onStartModelDownload(customUrl, "Custom Offline LLM")
                                     } else {
-                                        downloadManager.startDownload(selectedPreset.directUrl, selectedPreset.name)
+                                        callbacks.onStartModelDownload(selectedPreset.directUrl, selectedPreset.name)
                                     }
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = GokuCyan),
@@ -2204,7 +2312,7 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                                 Text("Import")
                             }
                             OutlinedButton(
-                                onClick = { downloadManager.deleteModel() },
+                                onClick = { callbacks.onDeleteOfflineModel() },
                                 modifier = Modifier.heightIn(min = 48.dp)
                             ) {
                                 Text("Reset")
@@ -2230,10 +2338,19 @@ private fun LocalAdbPairDialog(
     onConnect5555: () -> Unit,
     onPair: (Int, String) -> Unit
 ) {
-    var portStr by remember(adbStatus.discoveredPairingPort) {
+    var portStr by rememberSaveable {
         mutableStateOf(adbStatus.discoveredPairingPort?.toString() ?: "")
     }
-    var codeStr by remember { mutableStateOf("") }
+    var userEditedPort by rememberSaveable { mutableStateOf(false) }
+    var codeStr by rememberSaveable { mutableStateOf("") }
+    var validationError by rememberSaveable { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(adbStatus.discoveredPairingPort) {
+        val discovered = adbStatus.discoveredPairingPort
+        if (discovered != null && (!userEditedPort || portStr.isBlank())) {
+            portStr = discovered.toString()
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -2248,27 +2365,63 @@ private fun LocalAdbPairDialog(
                 }
                 OutlinedTextField(
                     value = portStr,
-                    onValueChange = { portStr = it.filter { ch -> ch.isDigit() } },
-                    label = { Text("Pairing Port (e.g. 37123)") },
+                    onValueChange = {
+                        userEditedPort = true
+                        validationError = null
+                        portStr = it.filter { ch -> ch.isDigit() }.take(5)
+                    },
+                    label = { Text("Pairing Port (1-65535, e.g. 37123)") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("adb_pair_port_input")
                 )
                 OutlinedTextField(
                     value = codeStr,
-                    onValueChange = { codeStr = it.filter { ch -> ch.isDigit() }.take(6) },
+                    onValueChange = {
+                        validationError = null
+                        codeStr = it.filter { ch -> ch.isDigit() }.take(6)
+                    },
                     label = { Text("6-Digit Wireless Pairing Code") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("adb_pair_code_input")
                 )
+                validationError?.let { err ->
+                    Text(
+                        text = err,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = GokuCrimson
+                    )
+                }
                 TextButton(onClick = onConnect5555) {
                     Text("Already enabled tcpip 5555? Connect 127.0.0.1:5555")
                 }
             }
         },
         confirmButton = {
-            Button(onClick = {
-                onPair(portStr.toIntOrNull() ?: 0, codeStr)
-            }) { Text("Pair & Connect") }
+            Button(
+                onClick = {
+                    val port = portStr.toIntOrNull()
+                    val cleanCode = codeStr.filter { it.isDigit() }
+                    when {
+                        port == null || port !in 1..65535 -> {
+                            validationError = "Enter a valid TCP pairing port between 1 and 65535."
+                        }
+                        cleanCode.length != 6 -> {
+                            validationError = "Enter a valid 6-digit Wireless Debugging pairing code."
+                        }
+                        else -> {
+                            validationError = null
+                            onPair(port, cleanCode)
+                        }
+                    }
+                },
+                modifier = Modifier.testTag("adb_pair_confirm_btn")
+            ) { Text("Pair & Connect") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Close") }
@@ -2380,7 +2533,6 @@ private fun CameraLiveEyeDialog(
                                     } finally {
                                         runCatching { image.close() }
                                     }
-                                    if (isDisposed.get()) return
                                     if (bitmap == null) {
                                         mainExecutor.execute {
                                             if (!isDisposed.get()) {
@@ -2390,30 +2542,56 @@ private fun CameraLiveEyeDialog(
                                         }
                                         return
                                     }
-                                    val inputImage = InputImage.fromBitmap(bitmap, rotationDegrees)
-                                    CameraLiveEyeOcr.recognize(
-                                        image = inputImage,
-                                        onResult = { txt ->
-                                            mainExecutor.execute {
-                                                if (!isDisposed.get()) {
-                                                    isScanning = false
-                                                    if (txt.isBlank()) {
-                                                        statusText = "No readable text found; try closer lighting."
-                                                    } else {
-                                                        onTextExtracted(txt)
+                                    if (isDisposed.get()) {
+                                        if (!bitmap.isRecycled) runCatching { bitmap.recycle() }
+                                        return
+                                    }
+                                    var callbacksAttached = false
+                                    try {
+                                        val inputImage = InputImage.fromBitmap(bitmap, rotationDegrees)
+                                        callbacksAttached = true
+                                        CameraLiveEyeOcr.recognize(
+                                            image = inputImage,
+                                            onResult = { txt ->
+                                                try {
+                                                    mainExecutor.execute {
+                                                        if (!isDisposed.get()) {
+                                                            isScanning = false
+                                                            if (txt.isBlank()) {
+                                                                statusText = "No readable text found; try closer lighting."
+                                                            } else {
+                                                                onTextExtracted(txt)
+                                                            }
+                                                        }
                                                     }
+                                                } finally {
+                                                    if (!bitmap.isRecycled) runCatching { bitmap.recycle() }
+                                                }
+                                            },
+                                            onError = { err ->
+                                                try {
+                                                    mainExecutor.execute {
+                                                        if (!isDisposed.get()) {
+                                                            isScanning = false
+                                                            statusText = "OCR error: ${err.message}"
+                                                        }
+                                                    }
+                                                } finally {
+                                                    if (!bitmap.isRecycled) runCatching { bitmap.recycle() }
                                                 }
                                             }
-                                        },
-                                        onError = { err ->
-                                            mainExecutor.execute {
-                                                if (!isDisposed.get()) {
-                                                    isScanning = false
-                                                    statusText = "OCR error: ${err.message}"
-                                                }
+                                        )
+                                    } catch (err: Throwable) {
+                                        if (!callbacksAttached && !bitmap.isRecycled) {
+                                            runCatching { bitmap.recycle() }
+                                        }
+                                        mainExecutor.execute {
+                                            if (!isDisposed.get()) {
+                                                isScanning = false
+                                                statusText = "Vision scan error: ${err.message}"
                                             }
                                         }
-                                    )
+                                    }
                                 }
 
                                 override fun onError(exception: ImageCaptureException) {
@@ -2436,6 +2614,27 @@ private fun CameraLiveEyeDialog(
     )
 }
 
+private fun calculateInSampleSize(
+    options: BitmapFactory.Options,
+    reqWidth: Int = 1280,
+    reqHeight: Int = 1280
+): Int {
+    val height = options.outHeight
+    val width = options.outWidth
+    var inSampleSize = 1
+    if (height > reqHeight || width > reqWidth) {
+        val halfHeight = height / 2
+        val halfWidth = width / 2
+        while ((halfHeight / inSampleSize) >= reqHeight && (halfWidth / inSampleSize) >= reqWidth) {
+            inSampleSize *= 2
+        }
+        while ((height / inSampleSize) > reqHeight * 2 || (width / inSampleSize) > reqWidth * 2) {
+            inSampleSize *= 2
+        }
+    }
+    return inSampleSize.coerceAtLeast(1)
+}
+
 private fun imageProxyToBitmapSafe(image: ImageProxy): Bitmap? {
     return runCatching {
         if (image.format == ImageFormat.JPEG) {
@@ -2443,9 +2642,27 @@ private fun imageProxyToBitmapSafe(image: ImageProxy): Bitmap? {
             buffer.rewind()
             val bytes = ByteArray(buffer.remaining())
             buffer.get(bytes)
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            val boundsOptions = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOptions)
+            val decodeOptions = BitmapFactory.Options().apply {
+                inSampleSize = calculateInSampleSize(boundsOptions, reqWidth = 1280, reqHeight = 1280)
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions)
         } else {
-            image.toBitmap()
+            val raw = image.toBitmap()
+            if (raw.width > 1600 || raw.height > 1600) {
+                val scale = 1280f / maxOf(raw.width, raw.height).toFloat()
+                val targetW = (raw.width * scale).toInt().coerceAtLeast(1)
+                val targetH = (raw.height * scale).toInt().coerceAtLeast(1)
+                val scaled = Bitmap.createScaledBitmap(raw, targetW, targetH, true)
+                if (scaled !== raw) raw.recycle()
+                scaled
+            } else {
+                raw
+            }
         }
     }.getOrElse {
         runCatching { image.toBitmap() }.getOrNull()

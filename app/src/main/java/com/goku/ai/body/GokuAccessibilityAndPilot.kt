@@ -4,14 +4,18 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.res.Resources
 import android.graphics.Path
 import android.graphics.Rect
 import android.net.http.SslError
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.util.DisplayMetrics
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.webkit.SslErrorHandler
@@ -37,7 +41,10 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.InetAddress
+import java.net.URI
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 
@@ -45,22 +52,72 @@ import kotlin.coroutines.resume
 // 1. LIVE OTP BUS, MISTAKE BLOCKER BUS, TEACH RECORDER & ZERO-COPY BRIDGE
 // ============================================================================
 
+private fun AccessibilityNodeInfo.getHintTextCompat(): String {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        this.hintText?.toString().orEmpty()
+    } else {
+        ""
+    }
+}
+
+private fun AccessibilityNodeInfo.recycleCompat() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        @Suppress("DEPRECATION")
+        runCatching { this.recycle() }
+    }
+}
+
+private fun recycleNodesCompat(nodes: Iterable<AccessibilityNodeInfo>, keep: AccessibilityNodeInfo? = null) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        for (n in nodes) {
+            if (n !== keep) {
+                @Suppress("DEPRECATION")
+                runCatching { n.recycle() }
+            }
+        }
+    }
+}
+
+internal fun resolveRealScreenDimensions(context: Context): Pair<Int, Int> {
+    val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+    if (wm != null) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = runCatching { wm.currentWindowMetrics.bounds }.getOrNull()
+            if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
+                return bounds.width() to bounds.height()
+            }
+        }
+        val dm = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        val ok = runCatching {
+            wm.defaultDisplay?.getRealMetrics(dm)
+            dm.widthPixels > 0 && dm.heightPixels > 0
+        }.getOrDefault(false)
+        if (ok) {
+            return dm.widthPixels to dm.heightPixels
+        }
+    }
+    val sys = Resources.getSystem().displayMetrics
+    return sys.widthPixels.coerceAtLeast(720) to sys.heightPixels.coerceAtLeast(1280)
+}
+
 object OtpBus {
+    private val lock = Any()
     private val _latestOtp = MutableStateFlow<String?>(null)
     val latestOtp: StateFlow<String?> = _latestOtp.asStateFlow()
 
     @Volatile
     private var otpTimestamp: Long = 0L
 
-    fun publishOtp(code: String) {
+    fun publishOtp(code: String) = synchronized(lock) {
         val digits = code.filter { it.isDigit() }
         if (digits.length in 4..8) {
-            _latestOtp.value = digits
             otpTimestamp = System.currentTimeMillis()
+            _latestOtp.value = digits
         }
     }
 
-    fun peekFreshOtp(maxAgeMs: Long = 120_000L): String? {
+    fun peekFreshOtp(maxAgeMs: Long = 120_000L): String? = synchronized(lock) {
         val current = _latestOtp.value ?: return null
         if (System.currentTimeMillis() - otpTimestamp > maxAgeMs) {
             _latestOtp.value = null
@@ -69,7 +126,7 @@ object OtpBus {
         return current
     }
 
-    fun consumeFreshOtp(maxAgeMs: Long = 120_000L): String? {
+    fun consumeFreshOtp(maxAgeMs: Long = 120_000L): String? = synchronized(lock) {
         val current = _latestOtp.value ?: return null
         if (System.currentTimeMillis() - otpTimestamp > maxAgeMs) {
             _latestOtp.value = null
@@ -101,6 +158,7 @@ data class RecordedStep(
 )
 
 object TeachModeRecorder {
+    private val lock = Any()
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
 
@@ -110,26 +168,27 @@ object TeachModeRecorder {
     private var pendingName: String = "Custom Macro"
     private var pendingTrigger: String = "custom macro"
 
-    fun startRecording(skillName: String, triggerPhrase: String) {
+    fun startRecording(skillName: String, triggerPhrase: String) = synchronized(lock) {
         pendingName = skillName.ifBlank { "Taught Skill" }
         pendingTrigger = triggerPhrase.ifBlank { pendingName.lowercase(Locale.ROOT) }
         _recordedSteps.value = emptyList()
         _isRecording.value = true
     }
 
-    fun recordStep(action: String, target: String, packageName: String) {
+    fun recordStep(action: String, target: String, packageName: String) = synchronized(lock) {
         if (!_isRecording.value) return
         val cleanTarget = target.trim()
         if (cleanTarget.isEmpty()) return
         val current = _recordedSteps.value
         val last = current.lastOrNull()
+        val now = System.currentTimeMillis()
         if (last != null && last.action == action && last.target == cleanTarget &&
-            System.currentTimeMillis() - last.timestamp < 800L
+            now - last.timestamp < 800L
         ) return
-        _recordedSteps.value = current + RecordedStep(action, cleanTarget, packageName)
+        _recordedSteps.value = current + RecordedStep(action, cleanTarget, packageName, now)
     }
 
-    fun stopAndExport(): Triple<String, String, String> {
+    fun stopAndExport(): Triple<String, String, String> = synchronized(lock) {
         _isRecording.value = false
         val arr = JSONArray()
         _recordedSteps.value.forEach { step ->
@@ -428,16 +487,22 @@ class HeadlessWebAutomationWorker(private val context: Context) {
                     val mainHandler = Handler(Looper.getMainLooper())
                     var pendingPostLoadRunnable: Runnable? = null
                     var finished = false
-                    fun finishWith(res: Result<String>) {
-                        if (finished) return
-                        finished = true
-                        pendingPostLoadRunnable?.let { mainHandler.removeCallbacks(it) }
-                        pendingPostLoadRunnable = null
+                    var destroyed = false
+                    fun destroyWebViewSafely() {
+                        if (destroyed) return
+                        destroyed = true
                         runCatching {
                             webView.stopLoading()
                             webView.loadUrl("about:blank")
                             webView.destroy()
                         }
+                    }
+                    fun finishWith(res: Result<String>) {
+                        if (finished) return
+                        finished = true
+                        pendingPostLoadRunnable?.let { mainHandler.removeCallbacks(it) }
+                        pendingPostLoadRunnable = null
+                        destroyWebViewSafely()
                         if (cont.isActive) cont.resume(res)
                     }
 
@@ -467,8 +532,10 @@ class HeadlessWebAutomationWorker(private val context: Context) {
                             request: WebResourceRequest?
                         ): Boolean {
                             val redirectUrl = request?.url?.toString().orEmpty()
-                            if (!redirectUrl.startsWith("https://", ignoreCase = true)) {
-                                finishWith(Result.failure(IllegalArgumentException("Blocked non-HTTPS redirect")))
+                            if (!isAllowedPublicHttpsSyntax(redirectUrl)) {
+                                if (request?.isForMainFrame == true) {
+                                    finishWith(Result.failure(IllegalArgumentException("Blocked non-HTTPS or private/local main-frame redirect")))
+                                }
                                 return true
                             }
                             return false
@@ -503,11 +570,7 @@ class HeadlessWebAutomationWorker(private val context: Context) {
                             finished = true
                             pendingPostLoadRunnable?.let { mainHandler.removeCallbacks(it) }
                             pendingPostLoadRunnable = null
-                            runCatching {
-                                webView.stopLoading()
-                                webView.loadUrl("about:blank")
-                                webView.destroy()
-                            }
+                            destroyWebViewSafely()
                         }
                     }
 
@@ -519,7 +582,7 @@ class HeadlessWebAutomationWorker(private val context: Context) {
         } ?: Result.failure(IllegalStateException("Headless WebView timed out after 16 seconds."))
     }
 
-    private fun normalizeHttpsUrl(raw: String): String? {
+    private suspend fun normalizeHttpsUrl(raw: String): String? {
         val trimmed = raw.trim()
         val withScheme = when {
             trimmed.startsWith("https://", ignoreCase = true) -> trimmed
@@ -527,7 +590,49 @@ class HeadlessWebAutomationWorker(private val context: Context) {
             trimmed.contains(".") && !trimmed.contains(" ") -> "https://$trimmed"
             else -> return null
         }
-        return withScheme.takeIf { it.startsWith("https://", ignoreCase = true) }
+        if (!isAllowedPublicHttpsSyntax(withScheme)) return null
+        val host = runCatching { URI(withScheme).host }.getOrNull() ?: return null
+        val resolvesPublic = withContext(Dispatchers.IO) {
+            val addresses = runCatching { InetAddress.getAllByName(host) }.getOrNull() ?: return@withContext false
+            addresses.isNotEmpty() && addresses.all { addr ->
+                val rawBytes = addr.address
+                val isUniqueLocalIpv6 = rawBytes.size == 16 && (rawBytes[0].toInt() and 0xFE) == 0xFC
+                !addr.isAnyLocalAddress &&
+                    !addr.isLoopbackAddress &&
+                    !addr.isLinkLocalAddress &&
+                    !addr.isSiteLocalAddress &&
+                    !addr.isMulticastAddress &&
+                    !isUniqueLocalIpv6
+            }
+        }
+        return withScheme.takeIf { resolvesPublic }
+    }
+
+    private fun isAllowedPublicHttpsSyntax(urlStr: String): Boolean {
+        val uri = runCatching { URI(urlStr.trim()) }.getOrNull() ?: return false
+        if (!uri.scheme.equals("https", ignoreCase = true)) return false
+        val host = uri.host?.lowercase(Locale.ROOT)?.trim()?.trimEnd('.')?.removePrefix("[")?.removeSuffix("]")
+            ?: return false
+        if (host.isEmpty() || host == "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) {
+            return false
+        }
+        if (host == "::1" || host == "0.0.0.0" ||
+            (host.contains(":") && (host.startsWith("fe80:") || host.startsWith("fc") || host.startsWith("fd")))
+        ) {
+            return false
+        }
+        // Reject integer/hex single-label IP forms and private IPv4 literals without blocking Main thread on DNS
+        if (host.all { it.isDigit() } || host.startsWith("0x")) return false
+        val parts = host.split(".")
+        if (parts.size == 4 && parts.all { p -> p.toIntOrNull()?.let { it in 0..255 } == true }) {
+            val a = parts[0].toInt()
+            val b = parts[1].toInt()
+            if (a == 0 || a == 10 || a == 127) return false
+            if (a == 169 && b == 254) return false
+            if (a == 172 && b in 16..31) return false
+            if (a == 192 && b == 168) return false
+        }
+        return true
     }
 
     private fun decodeJsString(raw: String?): String {
@@ -549,6 +654,7 @@ class GokuAccessibilityService : AccessibilityService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var lastTimelineRecordMs = 0L
     private var lastAdSkipMs = 0L
+    private val otpWindowThrottle = ConcurrentHashMap<String, Long>()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -588,14 +694,14 @@ class GokuAccessibilityService : AccessibilityService() {
             val root = rootInActiveWindow ?: return
             try {
                 // 1. Safe Auto-Ad & Popup Skipper (0.2s reaction with 1.2s cooldown; guarded against financial/system apps)
+                val nowForSkip = System.currentTimeMillis()
                 if (vault.settings.autoAdSkipEnabled &&
                     pkg != packageName &&
                     !SafeAdSkipGuard.isProtectedPackage(pkg) &&
-                    System.currentTimeMillis() - lastAdSkipMs > 1200L
+                    nowForSkip - lastAdSkipMs > 1200L
                 ) {
-                    if (trySkipAdOrPopup(root, pkg)) {
-                        lastAdSkipMs = System.currentTimeMillis()
-                    }
+                    lastAdSkipMs = nowForSkip
+                    trySkipAdOrPopup(root, pkg)
                 }
 
                 // 2. SMS OTP Autopilot Auto-Fill
@@ -623,8 +729,7 @@ class GokuAccessibilityService : AccessibilityService() {
                     }
                 }
             } finally {
-                @Suppress("DEPRECATION")
-                runCatching { root.recycle() }
+                root.recycleCompat()
             }
         }
     }
@@ -633,9 +738,19 @@ class GokuAccessibilityService : AccessibilityService() {
         // Gracefully pause without crashing
     }
 
+    override fun onUnbind(intent: Intent?): Boolean {
+        if (instance === this) instance = null
+        _isConnected.value = false
+        otpWindowThrottle.clear()
+        lastTimelineRecordMs = 0L
+        lastAdSkipMs = 0L
+        return super.onUnbind(intent)
+    }
+
     override fun onDestroy() {
         if (instance === this) instance = null
         _isConnected.value = false
+        otpWindowThrottle.clear()
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -643,74 +758,156 @@ class GokuAccessibilityService : AccessibilityService() {
     private fun trySkipAdOrPopup(root: AccessibilityNodeInfo, pkg: String): Boolean {
         if (SafeAdSkipGuard.isProtectedPackage(pkg)) return false
 
-        val explicitAdSkipLabels = listOf("skip ad", "skip ads", "skip video")
-        val softPopupLabels = listOf("no thanks", "not now", "dismiss")
+        val softPopupLabels = setOf("no thanks", "not now", "dismiss")
         val screenContext = extractTreeText(root, maxNodes = 40)
         val isSensitiveContext = SafeAdSkipGuard.containsSensitiveDialogContext(screenContext)
 
+        val obtainedChildren = ArrayList<AccessibilityNodeInfo>(90)
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var visited = 0
-        while (queue.isNotEmpty() && visited < 90) {
-            visited++
-            val node = queue.removeFirst()
-            val label = (node.text?.toString() ?: node.contentDescription?.toString() ?: "")
-                .lowercase(Locale.ROOT).trim()
-            if (label.isNotEmpty()) {
-                val isExplicitAd = explicitAdSkipLabels.any { label == it || label.startsWith("skip ad") }
-                val isSafePopup = !isSensitiveContext && softPopupLabels.any { label == it }
-                if (isExplicitAd || isSafePopup) {
-                    if (clickNodeOrParent(node)) return true
+        try {
+            while (queue.isNotEmpty() && visited < 90) {
+                visited++
+                val node = queue.removeFirst()
+                val label = (node.text?.toString() ?: node.contentDescription?.toString() ?: "")
+                    .lowercase(Locale.ROOT).trim()
+                if (label.isNotEmpty()) {
+                    val isExplicitAd = EXPLICIT_AD_SKIP_REGEX.matches(label)
+                    val isSafePopup = !isSensitiveContext && label in softPopupLabels
+                    if (isExplicitAd || isSafePopup) {
+                        if (clickNodeOrParent(node)) return true
+                    }
+                }
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { child ->
+                        obtainedChildren.add(child)
+                        queue.add(child)
+                    }
                 }
             }
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { queue.add(it) }
-            }
+            return false
+        } finally {
+            recycleNodesCompat(obtainedChildren, keep = root)
         }
-        return false
+    }
+
+    private fun isExcludedNonOtpField(meta: String): Boolean {
+        return EXCLUDED_OTP_FIELD_REGEX.containsMatchIn(meta)
+    }
+
+    private fun isOtpMetadataMatch(meta: String): Boolean {
+        if (isExcludedNonOtpField(meta)) return false
+        return meta.contains("otp") ||
+            meta.contains("one-time") ||
+            meta.contains("one time") ||
+            meta.contains("verification code") ||
+            meta.contains("security code") ||
+            meta.contains("auth code") ||
+            meta.contains("passcode") ||
+            meta.contains("code") ||
+            meta.contains("verify")
     }
 
     private fun tryAutoFillOtp(root: AccessibilityNodeInfo, pkg: String): Boolean {
         if (pkg == packageName || SafeAdSkipGuard.isProtectedPackage(pkg)) return false
-        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        val candidate = focused ?: findFirstOtpEditText(root) ?: return false
-        if (!candidate.isEditable || candidate.isPassword) return false
-        val hint = ((candidate.hintText?.toString() ?: "") + " " +
-            (candidate.viewIdResourceName ?: "") + " " +
-            (candidate.contentDescription?.toString() ?: "")).lowercase(Locale.ROOT)
-        if (hint.contains("otp") || hint.contains("code") || hint.contains("verify")) {
-            val otp = OtpBus.peekFreshOtp() ?: return false
-            val args = Bundle().apply {
-                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, otp)
-            }
-            val applied = candidate.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-            if (applied) {
-                OtpBus.consumeFreshOtp()
-            }
-            return applied
+        val windowSig = "$pkg:${root.windowId}"
+        val nowMs = System.currentTimeMillis()
+        val prevMs = otpWindowThrottle[windowSig] ?: 0L
+        if (nowMs - prevMs < OTP_DEBOUNCE_MS) return false
+        if (otpWindowThrottle.size > 64) {
+            otpWindowThrottle.clear()
         }
-        return false
+        otpWindowThrottle[windowSig] = nowMs
+
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        var foundFromTree: AccessibilityNodeInfo? = null
+        try {
+            val candidate = if (focused != null && focused.isEditable) {
+                focused
+            } else {
+                foundFromTree = findFirstOtpEditText(root)
+                foundFromTree
+            } ?: return false
+
+            if (!candidate.isEditable) return false
+            val hint = (candidate.getHintTextCompat() + " " +
+                (candidate.viewIdResourceName ?: "") + " " +
+                (candidate.contentDescription?.toString() ?: "") + " " +
+                (candidate.text?.toString() ?: "")).lowercase(Locale.ROOT)
+            if (isExcludedNonOtpField(hint)) return false
+            val explicitlyOtpTagged = hint.contains("otp") ||
+                hint.contains("verification") ||
+                hint.contains("verify") ||
+                hint.contains("one-time") ||
+                hint.contains("one time") ||
+                hint.contains("passcode") ||
+                (!candidate.isPassword && hint.contains("code"))
+            if (explicitlyOtpTagged) {
+                val otp = OtpBus.peekFreshOtp() ?: return false
+                val args = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, otp)
+                }
+                val applied = candidate.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                if (applied) {
+                    OtpBus.consumeFreshOtp()
+                }
+                return applied
+            }
+            return false
+        } finally {
+            if (focused != null && focused !== root) focused.recycleCompat()
+            if (foundFromTree != null && foundFromTree !== root && foundFromTree !== focused) {
+                foundFromTree.recycleCompat()
+            }
+        }
     }
 
     private fun findFirstOtpEditText(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val obtainedChildren = ArrayList<AccessibilityNodeInfo>(80)
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var visited = 0
-        while (queue.isNotEmpty() && visited < 80) {
-            visited++
-            val node = queue.removeFirst()
-            if (node.isEditable && !node.isPassword) {
-                val meta = ((node.hintText?.toString() ?: "") + " " + (node.viewIdResourceName ?: ""))
-                    .lowercase(Locale.ROOT)
-                if (meta.contains("otp") || meta.contains("code") || meta.contains("verify")) {
-                    return node
+        var editableInspected = 0
+        var matched: AccessibilityNodeInfo? = null
+        try {
+            while (queue.isNotEmpty() && visited < 120 && editableInspected < MAX_OTP_EDITABLE_NODES) {
+                visited++
+                val node = queue.removeFirst()
+                if (node.isEditable) {
+                    editableInspected++
+                    val meta = (node.getHintTextCompat() + " " +
+                        (node.viewIdResourceName ?: "") + " " +
+                        (node.contentDescription?.toString() ?: "") + " " +
+                        (node.text?.toString() ?: ""))
+                        .lowercase(Locale.ROOT)
+                    if (!isExcludedNonOtpField(meta)) {
+                        val isMatch = if (node.isPassword) {
+                            meta.contains("otp") || meta.contains("verification") || meta.contains("verify") || meta.contains("pin_otp")
+                        } else {
+                            isOtpMetadataMatch(meta)
+                        }
+                        if (isMatch) {
+                            matched = node
+                            return node
+                        }
+                    }
+                }
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { child ->
+                        obtainedChildren.add(child)
+                        queue.add(child)
+                    }
                 }
             }
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { queue.add(it) }
+            return null
+        } finally {
+            for (child in obtainedChildren) {
+                if (child !== matched && child !== root) {
+                    child.recycleCompat()
+                }
             }
         }
-        return null
     }
 
     private fun checkForRiskyScreen(screenText: String) {
@@ -729,84 +926,149 @@ class GokuAccessibilityService : AccessibilityService() {
         }
     }
 
-    /**
-     * Self-Healing Node Finder:
-     * 1) Exact viewIdResourceName match
-     * 2) Exact text / contentDescription match
-     * 3) Case-insensitive contains match
-     * 4) Clickable parent walk or spatial gesture tap at node center bounds
-     */
-    fun findAndTapNode(targetQuery: String): Boolean {
-        if (GokuKillSwitch.isStopped.value) return false
-        val root = rootInActiveWindow ?: return false
+    private fun selectBestMatchingNode(
+        allNodes: List<AccessibilityNodeInfo>,
+        targetQuery: String,
+        screenWidth: Int,
+        screenHeight: Int
+    ): AccessibilityNodeInfo? {
         val query = targetQuery.lowercase(Locale.ROOT).trim()
-        val allNodes = collectNodes(root, maxNodes = 160)
-        val dm = Resources.getSystem().displayMetrics
+        if (query.isEmpty()) return null
+        val wordBoundaryRegex = Regex("\\b${Regex.escape(query)}\\b", RegexOption.IGNORE_CASE)
 
-        val matched = allNodes.firstOrNull {
-            it.viewIdResourceName?.lowercase(Locale.ROOT)?.endsWith(query) == true
-        } ?: allNodes.firstOrNull {
-            it.text?.toString()?.lowercase(Locale.ROOT)?.trim() == query ||
-                it.contentDescription?.toString()?.lowercase(Locale.ROOT)?.trim() == query
-        } ?: allNodes.firstOrNull {
-            it.text?.toString()?.lowercase(Locale.ROOT)?.contains(query) == true ||
-                it.contentDescription?.toString()?.lowercase(Locale.ROOT)?.contains(query) == true
+        return allNodes.firstOrNull { node ->
+            val resId = node.viewIdResourceName?.lowercase(Locale.ROOT) ?: return@firstOrNull false
+            resId == query || resId.substringAfterLast('/') == query
+        } ?: allNodes.firstOrNull { node ->
+            node.text?.toString()?.lowercase(Locale.ROOT)?.trim() == query ||
+                node.contentDescription?.toString()?.lowercase(Locale.ROOT)?.trim() == query
+        } ?: allNodes.firstOrNull { node ->
+            val text = node.text?.toString().orEmpty()
+            val desc = node.contentDescription?.toString().orEmpty()
+            wordBoundaryRegex.containsMatchIn(text) || wordBoundaryRegex.containsMatchIn(desc)
+        } ?: if (query.length >= 4) {
+            allNodes.firstOrNull { node ->
+                node.text?.toString()?.lowercase(Locale.ROOT)?.contains(query) == true ||
+                    node.contentDescription?.toString()?.lowercase(Locale.ROOT)?.contains(query) == true
+            }
+        } else {
+            null
         } ?: SpatialIconNavigator.findUnlabeledIconNode(
             allNodes = allNodes,
             targetQuery = targetQuery,
-            screenWidth = dm.widthPixels,
-            screenHeight = dm.heightPixels
+            screenWidth = screenWidth,
+            screenHeight = screenHeight
         )
+    }
 
-        if (matched != null) {
-            if (clickNodeOrParent(matched)) return true
+    /**
+     * Resolves screen center coordinates for a UI node matching [targetQuery] so Local ADB
+     * can dispatch hardware-grade `input tap` before falling back to Accessibility click/gesture.
+     */
+    fun findNodeCenterCoordinates(targetQuery: String): Pair<Int, Int>? {
+        if (GokuKillSwitch.isStopped.value) return null
+        val root = rootInActiveWindow ?: return null
+        val allNodes = collectNodes(root, maxNodes = 160)
+        try {
+            val (screenW, screenH) = resolveRealScreenDimensions(this)
+            val matched = selectBestMatchingNode(allNodes, targetQuery, screenW, screenH) ?: return null
             val bounds = Rect()
             matched.getBoundsInScreen(bounds)
             val cx = bounds.exactCenterX()
             val cy = bounds.exactCenterY()
-            val maxW = dm.widthPixels.coerceAtLeast(1).toFloat()
-            val maxH = dm.heightPixels.coerceAtLeast(1).toFloat()
-            if (!bounds.isEmpty && cx in 0f..maxW && cy in 0f..maxH) {
-                return performTap(cx, cy)
+            val maxW = screenW.coerceAtLeast(1).toFloat()
+            val maxH = screenH.coerceAtLeast(1).toFloat()
+            return if (!bounds.isEmpty && cx in 0f..maxW && cy in 0f..maxH) {
+                cx.toInt() to cy.toInt()
+            } else {
+                null
             }
+        } finally {
+            recycleNodesCompat(allNodes)
         }
-        return false
+    }
+
+    /**
+     * Self-Healing Node Finder:
+     * 1) Exact viewIdResourceName match
+     * 2) Exact text / contentDescription match
+     * 3) Word-boundary match (prevents "ok" from matching "book")
+     * 4) Case-insensitive contains match (queries >= 4 chars)
+     * 5) Clickable parent walk or spatial gesture tap at node center bounds
+     */
+    fun findAndTapNode(targetQuery: String): Boolean {
+        if (GokuKillSwitch.isStopped.value) return false
+        val root = rootInActiveWindow ?: return false
+        val allNodes = collectNodes(root, maxNodes = 160)
+        try {
+            val (screenW, screenH) = resolveRealScreenDimensions(this)
+            val matched = selectBestMatchingNode(allNodes, targetQuery, screenW, screenH)
+
+            if (matched != null) {
+                if (clickNodeOrParent(matched)) return true
+                val bounds = Rect()
+                matched.getBoundsInScreen(bounds)
+                val cx = bounds.exactCenterX()
+                val cy = bounds.exactCenterY()
+                val maxW = screenW.coerceAtLeast(1).toFloat()
+                val maxH = screenH.coerceAtLeast(1).toFloat()
+                if (!bounds.isEmpty && cx in 0f..maxW && cy in 0f..maxH) {
+                    return performTap(cx, cy)
+                }
+            }
+            return false
+        } finally {
+            recycleNodesCompat(allNodes)
+        }
     }
 
     fun inputText(text: String, fieldHint: String? = null): Boolean {
         if (GokuKillSwitch.isStopped.value) return false
         val root = rootInActiveWindow ?: return false
         val allNodes = collectNodes(root, maxNodes = 140)
-        val target = if (!fieldHint.isNullOrBlank()) {
-            val q = fieldHint.lowercase(Locale.ROOT)
-            allNodes.firstOrNull { n ->
-                n.isEditable && (
-                    n.hintText?.toString()?.lowercase(Locale.ROOT)?.contains(q) == true ||
-                        n.text?.toString()?.lowercase(Locale.ROOT)?.contains(q) == true ||
-                        n.viewIdResourceName?.lowercase(Locale.ROOT)?.contains(q) == true
-                    )
-            }
-        } else {
-            root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: allNodes.firstOrNull { it.isEditable }
-        } ?: return false
+        var focusedNode: AccessibilityNodeInfo? = null
+        try {
+            val target = if (!fieldHint.isNullOrBlank()) {
+                val q = fieldHint.lowercase(Locale.ROOT)
+                allNodes.firstOrNull { n ->
+                    n.isEditable && (
+                        n.getHintTextCompat().lowercase(Locale.ROOT).contains(q) ||
+                            n.text?.toString()?.lowercase(Locale.ROOT)?.contains(q) == true ||
+                            n.viewIdResourceName?.lowercase(Locale.ROOT)?.contains(q) == true
+                        )
+                }
+            } else {
+                focusedNode = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                focusedNode ?: allNodes.firstOrNull { it.isEditable }
+            } ?: return false
 
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+            }
+            return target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        } finally {
+            if (focusedNode != null && !allNodes.any { it === focusedNode }) {
+                focusedNode.recycleCompat()
+            }
+            recycleNodesCompat(allNodes)
         }
-        return target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 
     fun readScreenCompactText(): String {
         val root = rootInActiveWindow ?: return _lastScreenText.value
-        val text = extractTreeText(root, maxNodes = 100)
-        if (text.isNotBlank()) _lastScreenText.value = text
-        return text
+        return try {
+            val text = extractTreeText(root, maxNodes = 100)
+            if (text.isNotBlank()) _lastScreenText.value = text
+            text
+        } finally {
+            root.recycleCompat()
+        }
     }
 
     fun performTap(x: Float, y: Float): Boolean {
-        val dm = Resources.getSystem().displayMetrics
-        val maxW = dm.widthPixels.coerceAtLeast(1).toFloat()
-        val maxH = dm.heightPixels.coerceAtLeast(1).toFloat()
+        val (screenW, screenH) = resolveRealScreenDimensions(this)
+        val maxW = screenW.coerceAtLeast(1).toFloat()
+        val maxH = screenH.coerceAtLeast(1).toFloat()
         if (!x.isFinite() || !y.isFinite() || x < 0f || y < 0f || x > maxW || y > maxH) {
             return false
         }
@@ -816,9 +1078,9 @@ class GokuAccessibilityService : AccessibilityService() {
     }
 
     fun performSwipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long = 260L): Boolean {
-        val dm = Resources.getSystem().displayMetrics
-        val maxW = dm.widthPixels.coerceAtLeast(1).toFloat()
-        val maxH = dm.heightPixels.coerceAtLeast(1).toFloat()
+        val (screenW, screenH) = resolveRealScreenDimensions(this)
+        val maxW = screenW.coerceAtLeast(1).toFloat()
+        val maxH = screenH.coerceAtLeast(1).toFloat()
         if (!x1.isFinite() || !y1.isFinite() || !x2.isFinite() || !y2.isFinite() ||
             x1 < 0f || y1 < 0f || x2 < 0f || y2 < 0f ||
             x1 > maxW || y1 > maxH || x2 > maxW || y2 > maxH
@@ -839,15 +1101,22 @@ class GokuAccessibilityService : AccessibilityService() {
 
     private fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
         var current: AccessibilityNodeInfo? = node
+        val obtainedParents = ArrayList<AccessibilityNodeInfo>(5)
         var depth = 0
-        while (current != null && depth < 5) {
-            if (current.isClickable) {
-                if (current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+        try {
+            while (current != null && depth < 5) {
+                if (current.isClickable) {
+                    if (current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                }
+                val p = current.parent
+                if (p != null) obtainedParents.add(p)
+                current = p
+                depth++
             }
-            current = current.parent
-            depth++
+            return false
+        } finally {
+            recycleNodesCompat(obtainedParents, keep = node)
         }
-        return false
     }
 
     private fun collectNodes(root: AccessibilityNodeInfo, maxNodes: Int): List<AccessibilityNodeInfo> {
@@ -858,8 +1127,13 @@ class GokuAccessibilityService : AccessibilityService() {
             val n = queue.removeFirst()
             list.add(n)
             for (i in 0 until n.childCount) {
+                if (list.size + queue.size >= maxNodes) break
                 n.getChild(i)?.let { queue.add(it) }
             }
+        }
+        while (queue.isNotEmpty()) {
+            val leftover = queue.removeFirst()
+            if (leftover !== root) leftover.recycleCompat()
         }
         return list
     }
@@ -867,24 +1141,38 @@ class GokuAccessibilityService : AccessibilityService() {
     private fun extractTreeText(root: AccessibilityNodeInfo, maxNodes: Int): String {
         val sb = StringBuilder()
         val nodes = collectNodes(root, maxNodes)
-        for (n in nodes) {
-            val t = n.text?.toString()?.trim()
-            val d = n.contentDescription?.toString()?.trim()
-            val chosen = when {
-                !t.isNullOrEmpty() -> t
-                !d.isNullOrEmpty() -> d
-                else -> null
+        try {
+            for (n in nodes) {
+                val t = n.text?.toString()?.trim()
+                val d = n.contentDescription?.toString()?.trim()
+                val chosen = when {
+                    !t.isNullOrEmpty() -> t
+                    !d.isNullOrEmpty() -> d
+                    else -> null
+                }
+                if (chosen != null) {
+                    if (sb.isNotEmpty()) sb.append(" | ")
+                    sb.append(chosen)
+                    if (sb.length >= 1600) break
+                }
             }
-            if (chosen != null) {
-                if (sb.isNotEmpty()) sb.append(" | ")
-                sb.append(chosen)
-                if (sb.length >= 1600) break
-            }
+            return sb.toString()
+        } finally {
+            recycleNodesCompat(nodes, keep = root)
         }
-        return sb.toString()
     }
 
     companion object {
+        private const val OTP_DEBOUNCE_MS = 350L
+        private const val MAX_OTP_EDITABLE_NODES = 40
+        private val EXCLUDED_OTP_FIELD_REGEX = Regex(
+            "(?:promo|coupon|referral|postal|zip|pin_?code|ifsc|invite|voucher)",
+            RegexOption.IGNORE_CASE
+        )
+        private val EXPLICIT_AD_SKIP_REGEX = Regex(
+            "^skip\\s+(?:ads?|video|intro|promo|promotion|trial)(?:\\s*[»>►•|\\-]?\\s*(?:in\\s*\\d+\\s*s?)?)?$"
+        )
+
         @Volatile
         var instance: GokuAccessibilityService? = null
             private set
@@ -908,7 +1196,7 @@ class UniversalAppPilot(
     private val context: Context,
     private val adbEngine: LocalAdbEngine
 ) {
-    private val consecutiveFailures = AtomicInteger(0)
+    private val consecutiveFailuresByKey = ConcurrentHashMap<String, AtomicInteger>()
     val headlessWebWorker: HeadlessWebAutomationWorker by lazy {
         HeadlessWebAutomationWorker(context.applicationContext)
     }
@@ -930,35 +1218,72 @@ class UniversalAppPilot(
         )
     }
 
-    suspend fun tapTarget(target: String): Pair<Boolean, String> {
+    private suspend fun attemptTapOnce(target: String): Pair<Boolean, String>? {
         if (GokuKillSwitch.isStopped.value) return false to "Stopped by GokuKillSwitch"
         val a11y = GokuAccessibilityService.instance
-        if (a11y != null) {
-            val ok = a11y.findAndTapNode(target)
-            if (ok) {
-                consecutiveFailures.set(0)
-                return true to "Tapped '$target' via AccessibilityService"
-            }
-        }
-        // Plan-B fallback: if coordinate pair "x,y" provided, use ADB tap or gesture
+        val adbConnected = adbEngine.status.value.isConnected && !adbEngine.useAccessibilityFallback.value
         val coords = target.split(",").mapNotNull { it.trim().toIntOrNull() }
+
+        // 1. Coordinate pair "x,y": try Local ADB first whenever connected, then Accessibility gesture
         if (coords.size == 2) {
-            if (!adbEngine.useAccessibilityFallback.value) {
+            if (adbConnected) {
                 val res = adbEngine.dispatchAdbTap(coords[0], coords[1])
                 if (res.success) {
-                    consecutiveFailures.set(0)
                     return true to "Tapped (${coords[0]}, ${coords[1]}) via Local ADB"
                 }
             }
             if (a11y != null && a11y.performTap(coords[0].toFloat(), coords[1].toFloat())) {
-                consecutiveFailures.set(0)
                 return true to "Tapped (${coords[0]}, ${coords[1]}) via Spatial Gesture"
             }
+            return null
         }
-        if (consecutiveFailures.incrementAndGet() >= 3) {
-            consecutiveFailures.set(0)
+
+        // 2. Named target: if Local ADB is connected and node bounds are known, try ADB tap first
+        if (adbConnected && a11y != null) {
+            val nodeCoords = a11y.findNodeCenterCoordinates(target)
+            if (nodeCoords != null) {
+                val res = adbEngine.dispatchAdbTap(nodeCoords.first, nodeCoords.second)
+                if (res.success) {
+                    return true to "Tapped '$target' (${nodeCoords.first}, ${nodeCoords.second}) via Local ADB"
+                }
+            }
+        }
+
+        // 3. Fallback to Accessibility click / spatial gesture
+        if (a11y != null && a11y.findAndTapNode(target)) {
+            return true to "Tapped '$target' via AccessibilityService"
+        }
+        return null
+    }
+
+    suspend fun tapTarget(target: String): Pair<Boolean, String> {
+        if (GokuKillSwitch.isStopped.value) return false to "Stopped by GokuKillSwitch"
+        val activePkg = GokuAccessibilityService.lastPackageName.value.ifBlank { "unknown" }
+        val failKey = "$activePkg|${target.lowercase(Locale.ROOT).trim()}"
+        if (consecutiveFailuresByKey.size > 100) {
+            consecutiveFailuresByKey.clear()
+        }
+
+        val firstAttempt = attemptTapOnce(target)
+        if (firstAttempt != null) {
+            if (firstAttempt.first) {
+                consecutiveFailuresByKey.remove(failKey)
+            }
+            return firstAttempt
+        }
+
+        val failCounter = consecutiveFailuresByKey.computeIfAbsent(failKey) { AtomicInteger(0) }
+        if (failCounter.incrementAndGet() >= 3) {
+            failCounter.set(0)
             scrollDown()
-            return false to "Loop-Breaker triggered after 3 retries for '$target'; scrolled and switched strategy."
+            delay(350L)
+            if (GokuKillSwitch.isStopped.value) return false to "Stopped by GokuKillSwitch"
+            val retryAfterScroll = attemptTapOnce(target)
+            if (retryAfterScroll != null && retryAfterScroll.first) {
+                consecutiveFailuresByKey.remove(failKey)
+                return true to "${retryAfterScroll.second} (recovered after Loop-Breaker scroll)"
+            }
+            return false to "Loop-Breaker triggered after 3 retries for '$target'; scrolled and retried without finding target."
         }
         return false to "Could not locate '$target' on active screen."
     }
@@ -977,9 +1302,9 @@ class UniversalAppPilot(
     }
 
     suspend fun scrollDown(): Boolean {
-        val dm = Resources.getSystem().displayMetrics
-        val w = dm.widthPixels.coerceAtLeast(720).toFloat()
-        val h = dm.heightPixels.coerceAtLeast(1280).toFloat()
+        val (screenW, screenH) = resolveRealScreenDimensions(context)
+        val w = screenW.coerceAtLeast(720).toFloat()
+        val h = screenH.coerceAtLeast(1280).toFloat()
         val cx = w * 0.5f
         val y1 = h * 0.72f
         val y2 = h * 0.25f

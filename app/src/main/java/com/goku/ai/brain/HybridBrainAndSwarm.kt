@@ -1,6 +1,7 @@
 package com.goku.ai.brain
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -30,32 +31,42 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.getAndUpdate
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.coroutineContext
+import kotlin.coroutines.resume
 
 // ============================================================================
 // 1. UI, SWARM & OFFLINE MODEL DOWNLOAD STATE MODELS
@@ -244,6 +255,7 @@ class OfflineModelDownloadManager(private val context: Context) {
 
     private val opMutex = Mutex()
     private val opLock = Any()
+    private val transferGeneration = AtomicLong(0L)
     private val isTransferActive = AtomicBoolean(false)
     private var activeJob: Job? = null
     @Volatile
@@ -313,35 +325,40 @@ class OfflineModelDownloadManager(private val context: Context) {
             // Prevent duplicate rapid taps while already downloading/importing
             if (isTransferActive.get() || (activeJob?.isActive == true && !pauseRequested.get())) return
 
-            // If switching to a different model URL, clear any partial .tmp from previous model
-            if (cleanUrl != lastUrl && tempFile.exists()) {
-                tempFile.delete()
-                lastKnownTotalBytes = 0L
-            }
-
+            val switchedUrl = cleanUrl != lastUrl
             lastUrl = cleanUrl
             lastModelName = modelName.ifBlank { cleanUrl.substringAfterLast('/').ifBlank { "Offline AI Model" } }
-            saveMeta(lastModelName, lastUrl, lastKnownTotalBytes)
-            launchDownloadJobLocked()
+            val myGen = transferGeneration.incrementAndGet()
+            launchDownloadJobLocked(myGen = myGen, resetPartialForNewUrl = switchedUrl)
         }
     }
 
     fun pauseDownload() {
+        val pauseGen: Long
+        val previousJob: Job?
         synchronized(opLock) {
+            pauseGen = transferGeneration.incrementAndGet()
             pauseRequested.set(true)
             activeCall?.cancel()
-            activeJob?.cancel()
+            previousJob = activeJob
+            previousJob?.cancel()
             isTransferActive.set(false)
         }
-        val partialBytes = if (tempFile.exists()) tempFile.length() else 0L
-        val total = lastKnownTotalBytes.coerceAtLeast(partialBytes)
-        val pct = if (total > 0L) ((partialBytes * 100L) / total).toInt().coerceIn(0, 99) else 0
-        _state.value = ModelDownloadState.Paused(
-            modelName = lastModelName,
-            progressPercent = pct,
-            downloadedMb = bytesToMb(partialBytes),
-            totalMb = bytesToMb(total)
-        )
+        scope.launch {
+            runCatching { previousJob?.join() }
+            opMutex.withLock {
+                if (transferGeneration.get() != pauseGen) return@withLock
+                val partialBytes = if (tempFile.exists()) tempFile.length() else 0L
+                val total = lastKnownTotalBytes.coerceAtLeast(partialBytes)
+                val pct = if (total > 0L) ((partialBytes * 100L) / total).toInt().coerceIn(0, 99) else 0
+                _state.value = ModelDownloadState.Paused(
+                    modelName = lastModelName,
+                    progressPercent = pct,
+                    downloadedMb = bytesToMb(partialBytes),
+                    totalMb = bytesToMb(total)
+                )
+            }
+        }
     }
 
     fun resumeDownload() {
@@ -352,12 +369,14 @@ class OfflineModelDownloadManager(private val context: Context) {
                 lastUrl = OFFLINE_MODEL_PRESETS.first().directUrl
                 lastModelName = OFFLINE_MODEL_PRESETS.first().name
             }
-            launchDownloadJobLocked()
+            val myGen = transferGeneration.incrementAndGet()
+            launchDownloadJobLocked(myGen = myGen, resetPartialForNewUrl = false)
         }
     }
 
     fun deleteModel() {
         synchronized(opLock) {
+            val deleteGen = transferGeneration.incrementAndGet()
             pauseRequested.set(true)
             activeCall?.cancel()
             val previousJob = activeJob
@@ -367,6 +386,7 @@ class OfflineModelDownloadManager(private val context: Context) {
             activeJob = scope.launch {
                 runCatching { previousJob?.join() }
                 opMutex.withLock {
+                    if (transferGeneration.get() != deleteGen) return@withLock
                     runCatching { finalModelFile.delete() }
                     runCatching { tempFile.delete() }
                     runCatching { metaFile.delete() }
@@ -387,6 +407,7 @@ class OfflineModelDownloadManager(private val context: Context) {
     fun importLocalModel(uri: Uri) {
         synchronized(opLock) {
             if (isTransferActive.get() || (activeJob?.isActive == true && !pauseRequested.get())) return
+            val myGen = transferGeneration.incrementAndGet()
             val previousJob = activeJob
             pauseRequested.set(false)
             isTransferActive.set(true)
@@ -394,6 +415,7 @@ class OfflineModelDownloadManager(private val context: Context) {
                 try {
                     previousJob?.cancelAndJoin()
                     opMutex.withLock {
+                        if (transferGeneration.get() != myGen) return@withLock
                         runCatching {
                             modelsDir.mkdirs()
                             val resolver = context.contentResolver
@@ -416,13 +438,13 @@ class OfflineModelDownloadManager(private val context: Context) {
                                     val buffer = ByteArray(64 * 1024)
                                     var copied = 0L
                                     var lastEmit = 0L
-                                    while (isActive && !pauseRequested.get()) {
+                                    while (isActive && !pauseRequested.get() && transferGeneration.get() == myGen) {
                                         val read = input.read(buffer)
                                         if (read == -1) break
                                         out.write(buffer, 0, read)
                                         copied += read
                                         val now = System.currentTimeMillis()
-                                        if (now - lastEmit >= 250L) {
+                                        if (now - lastEmit >= 250L && transferGeneration.get() == myGen) {
                                             lastEmit = now
                                             val pct = if (totalBytes > 0L) ((copied * 100L) / totalBytes).toInt().coerceIn(0, 99) else 50
                                             _state.value = ModelDownloadState.Downloading(
@@ -437,9 +459,11 @@ class OfflineModelDownloadManager(private val context: Context) {
                                 }
                             } ?: throw IllegalStateException("Unable to open selected model file.")
 
-                            if (pauseRequested.get() || !isActive) {
-                                runCatching { tempFile.delete() }
-                                refreshStateFromDisk()
+                            if (pauseRequested.get() || !isActive || transferGeneration.get() != myGen) {
+                                if (transferGeneration.get() == myGen) {
+                                    runCatching { tempFile.delete() }
+                                    refreshStateFromDisk()
+                                }
                                 return@withLock
                             }
 
@@ -448,28 +472,35 @@ class OfflineModelDownloadManager(private val context: Context) {
                                 throw IllegalStateException("Selected file is too small to be a valid MediaPipe .task/.bin model.")
                             }
 
+                            if (transferGeneration.get() != myGen) return@withLock
                             onModelChanged?.invoke()
                             finalizeAtomicRename(displayName, "local://imported")
                         }.onFailure { err ->
-                            if (err !is CancellationException) {
-                                _state.value = ModelDownloadState.Error(
-                                    message = "Local import failed: ${err.message ?: "Unknown error"}",
-                                    canResume = false
-                                )
-                            } else {
-                                runCatching { tempFile.delete() }
+                            if (transferGeneration.get() == myGen) {
+                                if (err !is CancellationException) {
+                                    _state.value = ModelDownloadState.Error(
+                                        message = "Local import failed: ${err.message ?: "Unknown error"}",
+                                        canResume = false
+                                    )
+                                } else {
+                                    runCatching { tempFile.delete() }
+                                }
                             }
                         }
                     }
                 } finally {
-                    isTransferActive.set(false)
+                    if (transferGeneration.get() == myGen) {
+                        isTransferActive.set(false)
+                    }
                 }
             }
         }
     }
 
-    private fun launchDownloadJobLocked() {
+    private fun launchDownloadJobLocked(myGen: Long, resetPartialForNewUrl: Boolean) {
         val previousJob = activeJob
+        val targetUrl = lastUrl
+        val targetModelName = lastModelName
         pauseRequested.set(false)
         isTransferActive.set(true)
         activeJob = scope.launch {
@@ -477,11 +508,18 @@ class OfflineModelDownloadManager(private val context: Context) {
             try {
                 previousJob?.cancelAndJoin()
                 opMutex.withLock {
+                    if (transferGeneration.get() != myGen) return@withLock
                     modelsDir.mkdirs()
+                    if (resetPartialForNewUrl && tempFile.exists()) {
+                        runCatching { tempFile.delete() }
+                        lastKnownTotalBytes = 0L
+                    }
+                    saveMeta(targetModelName, targetUrl, lastKnownTotalBytes)
+
                     var existingBytes = if (tempFile.exists()) tempFile.length() else 0L
 
                     val requestBuilder = Request.Builder()
-                        .url(lastUrl)
+                        .url(targetUrl)
                         .header("User-Agent", "Goku-10.1-godmode-Android")
                     if (existingBytes > 0L) {
                         requestBuilder.header("Range", "bytes=$existingBytes-")
@@ -493,13 +531,25 @@ class OfflineModelDownloadManager(private val context: Context) {
                     val response = call.execute()
 
                     response.use { resp ->
+                        if (transferGeneration.get() != myGen) return@withLock
+
                         if (resp.code == 416) {
-                            // Partial file mismatch or already complete; restart cleanly
-                            tempFile.delete()
+                            // Verify whether existing tempFile is already complete before deleting
+                            val serverTotal = parseTotalFromContentRange(resp.header("Content-Range"))
+                            val expectedTotal = serverTotal ?: lastKnownTotalBytes.takeIf { it > 0L }
+                            if (expectedTotal != null &&
+                                existingBytes == expectedTotal &&
+                                existingBytes >= MIN_VALID_MODEL_BYTES
+                            ) {
+                                onModelChanged?.invoke()
+                                finalizeAtomicRename(targetModelName, targetUrl)
+                                return@withLock
+                            }
+                            runCatching { tempFile.delete() }
                             lastKnownTotalBytes = 0L
                             existingBytes = 0L
                             _state.value = ModelDownloadState.Error(
-                                message = "Range reset required — tap Resume to restart cleanly.",
+                                message = "Range mismatch detected — partial file cleared. Tap Resume to restart cleanly.",
                                 canResume = true
                             )
                             return@withLock
@@ -545,7 +595,7 @@ class OfflineModelDownloadManager(private val context: Context) {
                         }
                         if (totalBytes > 0L) {
                             lastKnownTotalBytes = totalBytes
-                            saveMeta(lastModelName, lastUrl, totalBytes)
+                            saveMeta(targetModelName, targetUrl, totalBytes)
                         }
 
                         var downloadedBytes = existingBytes
@@ -553,7 +603,7 @@ class OfflineModelDownloadManager(private val context: Context) {
                         var lastEmitMs = System.currentTimeMillis()
 
                         _state.value = ModelDownloadState.Downloading(
-                            modelName = lastModelName,
+                            modelName = targetModelName,
                             progressPercent = computePercent(downloadedBytes, totalBytes),
                             downloadedMb = bytesToMb(downloadedBytes),
                             totalMb = bytesToMb(totalBytes)
@@ -562,7 +612,7 @@ class OfflineModelDownloadManager(private val context: Context) {
                         body.byteStream().use { input ->
                             FileOutputStream(tempFile, isPartialResume).use { output ->
                                 val buffer = ByteArray(64 * 1024)
-                                while (isActive && !pauseRequested.get()) {
+                                while (isActive && !pauseRequested.get() && transferGeneration.get() == myGen) {
                                     val read = input.read(buffer)
                                     if (read == -1) break
                                     output.write(buffer, 0, read)
@@ -571,10 +621,10 @@ class OfflineModelDownloadManager(private val context: Context) {
 
                                     val now = System.currentTimeMillis()
                                     val deltaMs = now - lastEmitMs
-                                    if (deltaMs >= 300L) {
+                                    if (deltaMs >= 300L && transferGeneration.get() == myGen) {
                                         val speedMbPerSec = (windowBytes.toFloat() / (1024f * 1024f)) / (deltaMs / 1000f)
                                         _state.value = ModelDownloadState.Downloading(
-                                            modelName = lastModelName,
+                                            modelName = targetModelName,
                                             progressPercent = computePercent(downloadedBytes, totalBytes),
                                             downloadedMb = bytesToMb(downloadedBytes),
                                             totalMb = bytesToMb(totalBytes),
@@ -588,10 +638,12 @@ class OfflineModelDownloadManager(private val context: Context) {
                             }
                         }
 
+                        if (transferGeneration.get() != myGen) return@withLock
+
                         if (pauseRequested.get() || !isActive) {
-                            val partial = tempFile.length()
+                            val partial = if (tempFile.exists()) tempFile.length() else 0L
                             _state.value = ModelDownloadState.Paused(
-                                modelName = lastModelName,
+                                modelName = targetModelName,
                                 progressPercent = computePercent(partial, totalBytes),
                                 downloadedMb = bytesToMb(partial),
                                 totalMb = bytesToMb(totalBytes)
@@ -601,7 +653,7 @@ class OfflineModelDownloadManager(private val context: Context) {
 
                         if (totalBytes > 0L && downloadedBytes < totalBytes) {
                             _state.value = ModelDownloadState.Paused(
-                                modelName = lastModelName,
+                                modelName = targetModelName,
                                 progressPercent = computePercent(downloadedBytes, totalBytes),
                                 downloadedMb = bytesToMb(downloadedBytes),
                                 totalMb = bytesToMb(totalBytes)
@@ -609,10 +661,10 @@ class OfflineModelDownloadManager(private val context: Context) {
                             return@withLock
                         }
 
-                        val actualBytes = tempFile.length()
+                        val actualBytes = if (tempFile.exists()) tempFile.length() else 0L
                         if (actualBytes < MIN_VALID_MODEL_BYTES) {
                             val actualMb = bytesToMb(actualBytes)
-                            tempFile.delete()
+                            runCatching { tempFile.delete() }
                             _state.value = ModelDownloadState.Error(
                                 message = "Downloaded file appears incomplete or invalid (${"%.2f".format(Locale.US, actualMb)} MB).",
                                 canResume = false
@@ -620,16 +672,17 @@ class OfflineModelDownloadManager(private val context: Context) {
                             return@withLock
                         }
 
+                        if (transferGeneration.get() != myGen) return@withLock
                         onModelChanged?.invoke()
-                        finalizeAtomicRename(lastModelName, lastUrl)
+                        finalizeAtomicRename(targetModelName, targetUrl)
                     }
                 }
             } catch (ce: CancellationException) {
-                if (!pauseRequested.get()) {
+                if (!pauseRequested.get() && transferGeneration.get() == myGen) {
                     refreshStateFromDisk()
                 }
             } catch (e: Exception) {
-                if (pauseRequested.get()) return@launch
+                if (pauseRequested.get() || transferGeneration.get() != myGen) return@launch
                 val canResume = tempFile.exists() && tempFile.length() > 0L
                 _state.value = ModelDownloadState.Error(
                     message = "Network interrupted: ${e.message ?: "Check connection"}. ${if (canResume) "Progress saved — tap Resume." else ""}",
@@ -639,7 +692,9 @@ class OfflineModelDownloadManager(private val context: Context) {
                 if (activeCall === currentCall) {
                     activeCall = null
                 }
-                isTransferActive.set(false)
+                if (transferGeneration.get() == myGen) {
+                    isTransferActive.set(false)
+                }
             }
         }
     }
@@ -783,37 +838,61 @@ object StructuredActionParser {
     }
 
     private fun extractBalancedJsonObject(text: String): String? {
-        val start = text.indexOf('{')
-        if (start < 0) return null
-        var depth = 0
-        var inString = false
-        var escaped = false
-        for (i in start until text.length) {
-            val ch = text[i]
-            if (escaped) {
-                escaped = false
-                continue
-            }
-            if (ch == '\\' && inString) {
-                escaped = true
-                continue
-            }
-            if (ch == '"') {
-                inString = !inString
-                continue
-            }
-            if (!inString) {
-                if (ch == '{') depth++
-                else if (ch == '}') {
-                    depth--
-                    if (depth == 0) {
-                        return text.substring(start, i + 1)
+        var firstValidFallback: String? = null
+        var firstReplyFallback: String? = null
+        var idx = 0
+        while (idx < text.length) {
+            val start = text.indexOf('{', idx)
+            if (start < 0) break
+            var depth = 0
+            var inString = false
+            var escaped = false
+            var endPos = -1
+            for (i in start until text.length) {
+                val ch = text[i]
+                if (escaped) {
+                    escaped = false
+                    continue
+                }
+                if (ch == '\\' && inString) {
+                    escaped = true
+                    continue
+                }
+                if (ch == '"') {
+                    inString = !inString
+                    continue
+                }
+                if (!inString) {
+                    if (ch == '{') depth++
+                    else if (ch == '}') {
+                        depth--
+                        if (depth == 0) {
+                            endPos = i
+                            break
+                        }
                     }
                 }
             }
+            if (endPos > start) {
+                val candidate = text.substring(start, endPos + 1)
+                val parsed = runCatching { JSONObject(candidate) }.getOrNull()
+                if (parsed != null) {
+                    if (parsed.has("action")) {
+                        return candidate
+                    }
+                    if (firstReplyFallback == null && parsed.has("reply")) {
+                        firstReplyFallback = candidate
+                    }
+                    if (firstValidFallback == null) {
+                        firstValidFallback = candidate
+                    }
+                }
+                idx = endPos + 1
+            } else {
+                idx = start + 1
+            }
         }
-        val fallbackEnd = text.lastIndexOf('}')
-        return if (fallbackEnd > start) text.substring(start, fallbackEnd + 1) else null
+        return firstReplyFallback ?: firstValidFallback
     }
 }
 
@@ -833,13 +912,26 @@ class OnDeviceLlmEngine(
     private val _isLoadedInRam = MutableStateFlow(false)
     val isLoadedInRam: StateFlow<Boolean> = _isLoadedInRam.asStateFlow()
 
+    private val stopHook: () -> Unit = {
+        scope.launch { unloadNow() }
+    }
+    private val modelChangedHook: () -> Unit = {
+        scope.launch { unloadNow() }
+    }
+
     init {
-        downloadManager.onModelChanged = {
-            scope.launch { unloadNow() }
+        downloadManager.onModelChanged = modelChangedHook
+        GokuKillSwitch.registerStopHook(stopHook)
+    }
+
+    fun close() {
+        GokuKillSwitch.unregisterStopHook(stopHook)
+        if (downloadManager.onModelChanged === modelChangedHook) {
+            downloadManager.onModelChanged = null
         }
-        GokuKillSwitch.registerStopHook {
-            scope.launch { unloadNow() }
-        }
+        cancelIdleUnloadTimer()
+        scope.launch { unloadNow() }
+        scope.cancel()
     }
 
     private fun resolveActiveModelFile(): File? {
@@ -860,12 +952,16 @@ class OnDeviceLlmEngine(
 
     fun isModelAvailable(): Boolean = resolveActiveModelFile() != null
 
+    private fun cancelIdleUnloadTimer() {
+        synchronized(timerLock) {
+            unloadTimerJob?.cancel()
+            unloadTimerJob = null
+        }
+    }
+
     suspend fun unloadNow(fromTimer: Boolean = false) {
         if (!fromTimer) {
-            synchronized(timerLock) {
-                unloadTimerJob?.cancel()
-                unloadTimerJob = null
-            }
+            cancelIdleUnloadTimer()
         }
         engineMutex.withLock {
             runCatching { llmInference?.close() }
@@ -927,7 +1023,8 @@ class OnDeviceLlmEngine(
 
     private suspend fun runMediaPipeInference(modelFile: File, prompt: String): String? {
         return engineMutex.withLock {
-            runCatching {
+            cancelIdleUnloadTimer()
+            try {
                 if (llmInference == null || loadedModelPath != modelFile.absolutePath) {
                     runCatching { llmInference?.close() }
                     val options = LlmInference.LlmInferenceOptions.builder()
@@ -939,25 +1036,29 @@ class OnDeviceLlmEngine(
                     loadedModelPath = modelFile.absolutePath
                     _isLoadedInRam.value = true
                 }
-                scheduleFifteenSecondIdleUnload()
-                val engine = llmInference ?: return@runCatching null
+                val engine = llmInference ?: return@withLock null
                 val sessionOptions = LlmInferenceSession.LlmInferenceSessionOptions.builder()
                     .setTopK(40)
                     .setTemperature(0.65f)
                     .setRandomSeed(42)
                     .build()
-                val response = LlmInferenceSession.createFromOptions(engine, sessionOptions).use { session ->
+                LlmInferenceSession.createFromOptions(engine, sessionOptions).use { session ->
                     session.addQueryChunk(prompt)
                     session.generateResponse()?.trim()
                 }
-                scheduleFifteenSecondIdleUnload()
-                response
-            }.onFailure {
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
                 runCatching { llmInference?.close() }
                 llmInference = null
                 loadedModelPath = null
                 _isLoadedInRam.value = false
-            }.getOrNull()
+                null
+            } finally {
+                if (llmInference != null && !GokuKillSwitch.isStopped.value) {
+                    scheduleFifteenSecondIdleUnload()
+                }
+            }
         }
     }
 
@@ -1043,7 +1144,7 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
         val openRouterKey = vault.settings.openRouterApiKey
 
         // Provider 1: Google Gemini Free Tier REST API
-        if (geminiKey.isNotBlank()) {
+        if (geminiKey.isNotBlank() && isActive && !GokuKillSwitch.isStopped.value) {
             callGeminiRest(geminiKey, userPrompt, systemPrompt)?.let {
                 _activeProvider.value = "GEMINI-CLOUD"
                 return@withContext StructuredActionParser.parse(it, "GEMINI-CLOUD")
@@ -1051,7 +1152,7 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
         }
 
         // Provider 2: Groq Free Tier OpenAI-Compatible Endpoint
-        if (groqKey.isNotBlank()) {
+        if (groqKey.isNotBlank() && isActive && !GokuKillSwitch.isStopped.value) {
             callOpenAiCompatible(
                 endpoint = "https://api.groq.com/openai/v1/chat/completions",
                 apiKey = groqKey,
@@ -1065,7 +1166,7 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
         }
 
         // Provider 3: DeepSeek OpenAI-Compatible Endpoint
-        if (deepSeekKey.isNotBlank()) {
+        if (deepSeekKey.isNotBlank() && isActive && !GokuKillSwitch.isStopped.value) {
             callOpenAiCompatible(
                 endpoint = "https://api.deepseek.com/v1/chat/completions",
                 apiKey = deepSeekKey,
@@ -1079,7 +1180,7 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
         }
 
         // Provider 4: OpenRouter Free Model Failover
-        if (openRouterKey.isNotBlank()) {
+        if (openRouterKey.isNotBlank() && isActive && !GokuKillSwitch.isStopped.value) {
             callOpenAiCompatible(
                 endpoint = "https://openrouter.ai/api/v1/chat/completions",
                 apiKey = openRouterKey,
@@ -1096,22 +1197,44 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
         null
     }
 
-    private fun callGeminiRest(apiKey: String, userPrompt: String, systemPrompt: String): String? {
+    private suspend fun executeCancellable(req: Request): Response? {
+        return suspendCancellableCoroutine { cont ->
+            val call = http.newCall(req)
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (cont.isActive) cont.resume(null)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    if (cont.isActive) {
+                        cont.resume(response)
+                    } else {
+                        runCatching { response.close() }
+                    }
+                }
+            })
+        }
+    }
+
+    private suspend fun callGeminiRest(apiKey: String, userPrompt: String, systemPrompt: String): String? {
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        val payload = JSONObject().apply {
+            put("contents", JSONArray().put(JSONObject().apply {
+                put("role", "user")
+                put("parts", JSONArray().put(JSONObject().put("text", "$systemPrompt\n\nUser: $userPrompt")))
+            }))
+        }
+        val req = Request.Builder()
+            .url(url)
+            .header("x-goog-api-key", apiKey)
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        val resp = executeCancellable(req) ?: return null
         return runCatching {
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$apiKey"
-            val payload = JSONObject().apply {
-                put("contents", JSONArray().put(JSONObject().apply {
-                    put("role", "user")
-                    put("parts", JSONArray().put(JSONObject().put("text", "$systemPrompt\n\nUser: $userPrompt")))
-                }))
-            }
-            val req = Request.Builder()
-                .url(url)
-                .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                .build()
-            http.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return null
-                val body = JSONObject(resp.body?.string() ?: return null)
+            resp.use { r ->
+                if (!r.isSuccessful) return@runCatching null
+                val body = JSONObject(r.body?.string() ?: return@runCatching null)
                 body.optJSONArray("candidates")
                     ?.optJSONObject(0)
                     ?.optJSONObject("content")
@@ -1124,30 +1247,31 @@ class OnlineMultiModelRouter(private val vault: GokuVaultRepository) {
         }.getOrNull()
     }
 
-    private fun callOpenAiCompatible(
+    private suspend fun callOpenAiCompatible(
         endpoint: String,
         apiKey: String,
         model: String,
         userPrompt: String,
         systemPrompt: String
     ): String? {
+        val payload = JSONObject().apply {
+            put("model", model)
+            put("max_tokens", 320)
+            put("messages", JSONArray().apply {
+                put(JSONObject().put("role", "system").put("content", systemPrompt))
+                put(JSONObject().put("role", "user").put("content", userPrompt))
+            })
+        }
+        val req = Request.Builder()
+            .url(endpoint)
+            .header("Authorization", "Bearer $apiKey")
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        val resp = executeCancellable(req) ?: return null
         return runCatching {
-            val payload = JSONObject().apply {
-                put("model", model)
-                put("max_tokens", 320)
-                put("messages", JSONArray().apply {
-                    put(JSONObject().put("role", "system").put("content", systemPrompt))
-                    put(JSONObject().put("role", "user").put("content", userPrompt))
-                })
-            }
-            val req = Request.Builder()
-                .url(endpoint)
-                .header("Authorization", "Bearer $apiKey")
-                .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                .build()
-            http.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return null
-                val body = JSONObject(resp.body?.string() ?: return null)
+            resp.use { r ->
+                if (!r.isSuccessful) return@runCatching null
+                val body = JSONObject(r.body?.string() ?: return@runCatching null)
                 body.optJSONArray("choices")
                     ?.optJSONObject(0)
                     ?.optJSONObject("message")
@@ -1197,15 +1321,28 @@ class HybridBrainAndSwarm(
     private val _isOnline = MutableStateFlow(false)
     val isOnline: StateFlow<Boolean> = _isOnline.asStateFlow()
 
+    private val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
     private val commandMutex = Mutex()
 
+    @Volatile
     private var torchEnabled = false
 
+    private fun isDeviceLocked(): Boolean = runCatching {
+        keyguardManager?.isKeyguardLocked == true
+    }.getOrDefault(false)
+
+    private val stopHook: () -> Unit = {
+        _pendingConfirmation.value = null
+        _brainState.value = BrainVisualState.STOPPED
+    }
+
     init {
-        GokuKillSwitch.registerStopHook {
-            _pendingConfirmation.value = null
-            _brainState.value = BrainVisualState.STOPPED
-        }
+        GokuKillSwitch.registerStopHook(stopHook)
+    }
+
+    fun close() {
+        GokuKillSwitch.unregisterStopHook(stopHook)
+        offlineLlm.close()
     }
 
     fun isNetworkAvailable(): Boolean {
@@ -1213,20 +1350,33 @@ class HybridBrainAndSwarm(
             ?: return false
         val network = cm.activeNetwork ?: return false
         val caps = cm.getNetworkCapabilities(network) ?: return false
-        val online = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        val online = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
         _isOnline.value = online
         return online
     }
 
-    suspend fun confirmPendingAction(approved: Boolean): String = commandMutex.withLock {
-        confirmPendingActionLocked(approved)
+    suspend fun confirmPendingAction(approved: Boolean): String {
+        GokuKillSwitch.registerJob(coroutineContext.job)
+        return commandMutex.withLock {
+            if (GokuKillSwitch.isStopped.value) return@withLock "Stopped."
+            confirmPendingActionLocked(approved)
+        }
     }
 
     private suspend fun confirmPendingActionLocked(approved: Boolean): String {
+        if (approved && isDeviceLocked()) {
+            val lockMsg = "Security Lock: Phone locked hai boss. Sensitive action confirm karne ke liye pehle device unlock karein."
+            vault.logAction("CRITIC", "PendingConfirmation", "Blocked voice confirmation while keyguard locked", 100, "STOPPED")
+            appendGokuMessage(lockMsg, "LOCK-SCREEN-GUARD", 100)
+            voiceEngine.speak(lockMsg)
+            return lockMsg
+        }
         val pending = _pendingConfirmation.getAndUpdate { null }
             ?: return "Koi pending confirmation nahi hai."
         return try {
             if (approved) {
+                if (GokuKillSwitch.isStopped.value) return "Stopped."
                 _brainState.value = BrainVisualState.ACTING
                 val res = pending.onConfirm()
                 appendGokuMessage(res, "SWARM-CONFIRMED", pending.confidence)
@@ -1240,7 +1390,7 @@ class HybridBrainAndSwarm(
                 cancelMsg
             }
         } finally {
-            if (_brainState.value != BrainVisualState.STOPPED) {
+            if (!GokuKillSwitch.isStopped.value && _brainState.value != BrainVisualState.STOPPED) {
                 _brainState.value = BrainVisualState.IDLE
             }
         }
@@ -1261,10 +1411,14 @@ class HybridBrainAndSwarm(
             return stopReply
         }
 
+        // Register caller coroutine Job before acquiring commandMutex so "Goku stop" cancels both running and queued commands
+        GokuKillSwitch.registerJob(coroutineContext.job)
+
         return commandMutex.withLock {
             try {
-                // 0B. Direct Multimodal Gemini Vision Live-Eye Result passthrough
+                // 0B. Direct Multimodal Gemini Vision Live-Eye Result passthrough (guard against late post-stop callbacks)
                 if (trimmed.startsWith("[VISION-READY]")) {
+                    if (GokuKillSwitch.isStopped.value) return@withLock "Stopped."
                     val visionText = trimmed.removePrefix("[VISION-READY]").trim()
                     appendUserMessage("Camera Live-Eye Vision Scan")
                     vault.workingMemory.addTurn("GOKU", visionText)
@@ -1302,6 +1456,7 @@ class HybridBrainAndSwarm(
                 // TIER 2: 0-SECOND FAST REFLEX ENGINE (INSTANT LOCAL EXECUTION)
                 // --------------------------------------------------------------------
                 val reflexResult = tryFastReflex(resolvedInput, dryRun)
+                if (GokuKillSwitch.isStopped.value) return@withLock "Stopped."
                 if (reflexResult != null) {
                     val (reply, badge, confidence) = reflexResult
                     val elapsed = System.currentTimeMillis() - startMs
@@ -1317,9 +1472,18 @@ class HybridBrainAndSwarm(
                 // --------------------------------------------------------------------
                 val matchedSkill = vault.findMatchingSkill(resolvedInput)
                 if (matchedSkill != null) {
+                    if (GokuKillSwitch.isStopped.value) return@withLock "Stopped."
+                    if (isDeviceLocked()) {
+                        val lockMsg = "Security Lock: Phone locked hai boss. Skill '${matchedSkill.name}' chalane ke liye pehle device unlock karein."
+                        vault.logAction("CRITIC", resolvedInput, "Blocked skill while keyguard locked", 100, "STOPPED")
+                        appendGokuMessage(lockMsg, "LOCK-SCREEN-GUARD", 100)
+                        if (speakReply) voiceEngine.speak(lockMsg)
+                        return@withLock lockMsg
+                    }
                     _brainState.value = BrainVisualState.ACTING
                     val skillStart = System.currentTimeMillis()
                     val (ok, detail) = pilot.executeStepsJson(matchedSkill.stepsJson, dryRun = dryRun)
+                    if (GokuKillSwitch.isStopped.value) return@withLock "Stopped."
                     val skillMs = System.currentTimeMillis() - skillStart
                     val usedAdb = !adbEngine.useAccessibilityFallback.value
                     vault.recordSkillBenchmark(matchedSkill, usedAdb, skillMs, ok)
@@ -1361,7 +1525,19 @@ class HybridBrainAndSwarm(
                     offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary)
                 }
 
+                if (GokuKillSwitch.isStopped.value) return@withLock "Stopped."
+
+                if (isDeviceLocked() && structuredResult.action in SENSITIVE_LOCK_GUARD_ACTIONS) {
+                    val lockMsg = "Security Lock: Phone locked hai boss. ${structuredResult.action} ke liye pehle device unlock karein."
+                    vault.logAction("CRITIC", resolvedInput, "Blocked ${structuredResult.action} while keyguard locked", 100, "STOPPED")
+                    vault.workingMemory.addTurn("GOKU", lockMsg)
+                    appendGokuMessage(lockMsg, "LOCK-SCREEN-GUARD", 100)
+                    if (speakReply) voiceEngine.speak(lockMsg)
+                    return@withLock lockMsg
+                }
+
                 val (aiReply, providerBadge) = executeStructuredAction(structuredResult, resolvedInput, dryRun)
+                if (GokuKillSwitch.isStopped.value) return@withLock "Stopped."
 
                 // Critic verification pass
                 val elapsed = System.currentTimeMillis() - startMs
@@ -1371,7 +1547,7 @@ class HybridBrainAndSwarm(
                 if (speakReply) voiceEngine.speak(aiReply)
                 aiReply
             } finally {
-                if (_brainState.value != BrainVisualState.STOPPED) {
+                if (!GokuKillSwitch.isStopped.value && _brainState.value != BrainVisualState.STOPPED) {
                     _brainState.value = BrainVisualState.IDLE
                 }
             }
@@ -1475,9 +1651,11 @@ class HybridBrainAndSwarm(
                 val timeMatch = Regex("(\\d{1,2})(?::(\\d{2}))?").find(result.target)
                 val hour = timeMatch?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 23) ?: 7
                 val minute = timeMatch?.groupValues?.get(2)?.toIntOrNull()?.coerceIn(0, 59) ?: 0
-                if (!dryRun) setAlarmIntent(hour, minute)
-                val replyMsg = if (dryRun) "[DRY-RUN] Would set alarm for $hour:${"%02d".format(Locale.US, minute)}"
-                else "Alarm $hour:${"%02d".format(Locale.US, minute)} ke liye set kar diya boss."
+                val replyMsg = if (dryRun) {
+                    "[DRY-RUN] Would set alarm for $hour:${"%02d".format(Locale.US, minute)}"
+                } else {
+                    setAlarmIntent(hour, minute).second
+                }
                 replyMsg to "${result.badge}+ALARM"
             }
             "CALL" -> {
@@ -1558,6 +1736,13 @@ class HybridBrainAndSwarm(
                 .replace(Regex("(background\\s+mein?\\s*(chalao|kholo)?|in\\s+background|run|open)", RegexOption.IGNORE_CASE), "")
                 .trim()
             if (appQuery.isNotEmpty()) {
+                if (isDeviceLocked()) {
+                    return Triple(
+                        "Security Lock: Phone locked hai boss. '$appQuery' background mein chalane ke liye pehle device unlock karein.",
+                        "LOCK-SCREEN-GUARD",
+                        100
+                    )
+                }
                 _brainState.value = BrainVisualState.ACTING
                 val bgResult = launchAppInVirtualDisplay(appQuery, dryRun)
                     ?: launchAppByName(appQuery, dryRun)
@@ -1590,6 +1775,13 @@ class HybridBrainAndSwarm(
                 .replace(Regex("^(yaad rakhna|yaad rakho|yaad rakh|remember)\\s*", RegexOption.IGNORE_CASE), "")
                 .trim()
             if (body.isNotEmpty()) {
+                if (isDeviceLocked()) {
+                    return Triple(
+                        "Security Lock: Phone locked hai boss. Memory Vault mein save karne ke liye pehle device unlock karein.",
+                        "LOCK-SCREEN-GUARD",
+                        100
+                    )
+                }
                 val parts = body.split("=", ":", " is ", " hai ", limit = 2)
                 val key = parts[0].trim().take(60)
                 val value = parts.getOrNull(1)?.trim()?.ifBlank { body } ?: body
@@ -1600,6 +1792,13 @@ class HybridBrainAndSwarm(
 
         // 4. Expense Guardian Summary
         if (lower.contains("expense") || lower.contains("kharch") || lower.contains("bill summary")) {
+            if (isDeviceLocked()) {
+                return Triple(
+                    "Security Lock: Phone locked hai boss. Expense summary dekhne ke liye pehle device unlock karein.",
+                    "LOCK-SCREEN-GUARD",
+                    100
+                )
+            }
             val summary = vault.buildMonthlyExpenseSummaryHinglish()
             return Triple(summary, "EXPENSE-GUARDIAN", 98)
         }
@@ -1645,8 +1844,12 @@ class HybridBrainAndSwarm(
             } else if ((period.startsWith("a") || period == "subah") && hour == 12) {
                 hour = 0
             }
-            if (!dryRun) setAlarmIntent(hour, minute)
-            return Triple("Alarm $hour:${"%02d".format(Locale.US, minute)} ke liye set kar diya boss.", "INTENT-0.05S", 97)
+            val alarmMsg = if (dryRun) {
+                "[DRY-RUN] Would set alarm for $hour:${"%02d".format(Locale.US, minute)}"
+            } else {
+                setAlarmIntent(hour, minute).second
+            }
+            return Triple(alarmMsg, "INTENT-0.05S", 97)
         }
 
         // 9. Call with Dual-Verification & Hindi "Haan" / "Nahi" Safety Gate
@@ -1662,12 +1865,14 @@ class HybridBrainAndSwarm(
             }
         }
 
-        // 10. SMS with Dual-Verification & Hindi "Haan" / "Nahi" Safety Gate
+        // 10. SMS with Dual-Verification & Hindi "Haan" / "Nahi" Safety Gate (supports multi-word contact names)
         if (lower.startsWith("sms ") || lower.startsWith("send sms ")) {
-            val rest = input.replace(Regex("^(send\\s+)?sms\\s+", RegexOption.IGNORE_CASE), "").trim()
-            val parts = rest.split(" ", limit = 2)
-            if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
-                return prepareSmsWithSafetyGate(parts[0].trim(), parts[1].trim(), dryRun)
+            val rest = input
+                .replace(Regex("^(?:send\\s+)?sms\\s+(?:to\\s+)?", RegexOption.IGNORE_CASE), "")
+                .trim()
+            val parsedSms = parseSmsTargetAndBody(rest)
+            if (parsedSms != null) {
+                return prepareSmsWithSafetyGate(parsedSms.first, parsedSms.second, dryRun)
             }
         }
 
@@ -1687,6 +1892,13 @@ class HybridBrainAndSwarm(
         if (lower.startsWith("autofill ") || lower.startsWith("fill form ")) {
             val url = input.replace(Regex("^(autofill|fill\\s+form)\\s+", RegexOption.IGNORE_CASE), "").trim()
             if (url.isNotBlank()) {
+                if (isDeviceLocked()) {
+                    return Triple(
+                        "Security Lock: Phone locked hai boss. Form auto-fill karne ke liye pehle device unlock karein.",
+                        "LOCK-SCREEN-GUARD",
+                        100
+                    )
+                }
                 _brainState.value = BrainVisualState.ACTING
                 val (ok, msg) = if (dryRun) true to "[DRY-RUN] Would auto-fill $url using Vault profile."
                 else pilot.runHeadlessWebAutoFill(url, vault)
@@ -1707,6 +1919,13 @@ class HybridBrainAndSwarm(
                 .replace(Regex("\\s*(kholo|chala do|open karo)$", RegexOption.IGNORE_CASE), "")
                 .trim()
             if (appQuery.isNotEmpty()) {
+                if (isDeviceLocked()) {
+                    return Triple(
+                        "Security Lock: Phone locked hai boss. '$appQuery' kholne ke liye pehle device unlock karein.",
+                        "LOCK-SCREEN-GUARD",
+                        100
+                    )
+                }
                 val launched = launchAppByName(appQuery, dryRun)
                 if (launched != null) {
                     vault.workingMemory.addTurn("SYSTEM", "Opened $appQuery", "app:$appQuery")
@@ -1719,6 +1938,13 @@ class HybridBrainAndSwarm(
         // 12. Screen Actions (Tap / Scroll / Home / Back)
         if (lower.startsWith("tap ") || lower.startsWith("click ")) {
             val target = input.substringAfter(" ").trim()
+            if (isDeviceLocked()) {
+                return Triple(
+                    "Security Lock: Phone locked hai boss. Screen par '$target' tap karne ke liye pehle device unlock karein.",
+                    "LOCK-SCREEN-GUARD",
+                    100
+                )
+            }
             _brainState.value = BrainVisualState.ACTING
             val (ok, msg) = if (dryRun) true to "[DRY-RUN] Would tap '$target'" else pilot.tapTarget(target)
             val suffix = if (ok && !dryRun) {
@@ -1741,10 +1967,20 @@ class HybridBrainAndSwarm(
             return Triple("Back button press kar diya.", "BODY-PILOT", 98)
         }
 
-        // 13. Visual Timeline Memory Search
+        // 13. Visual Timeline Memory Search (strip Hinglish filler/FTS stopwords)
         if (lower.contains("timeline") || lower.contains("kal screen") || lower.contains("screen history")) {
-            val q = lower.replace("timeline", "").replace("screen history", "").trim()
-            val hits = vault.searchVisualTimeline(q.ifBlank { "a" })
+            if (isDeviceLocked()) {
+                return Triple(
+                    "Security Lock: Phone locked hai boss. Visual Timeline history dekhne ke liye pehle device unlock karein.",
+                    "LOCK-SCREEN-GUARD",
+                    100
+                )
+            }
+            val cleanedTokens = lower
+                .replace(Regex("\\b(timeline|screen\\s+history|kal\\s+screen|screen|history|kal|aaj|mein|me|par|pe|kya|dekha|tha|thi|batao|dikhao|mera|meri|mere|goku|hey)\\b"), " ")
+                .trim()
+                .replace(Regex("\\s+"), " ")
+            val hits = vault.searchVisualTimeline(cleanedTokens.ifBlank { "a" })
             val msg = if (hits.isEmpty()) {
                 "Visual Memory Vault mein koi matching screen snapshot nahi mila."
             } else {
@@ -1755,6 +1991,57 @@ class HybridBrainAndSwarm(
         }
 
         return null
+    }
+
+    /**
+     * Parses SMS recipient (including multi-word contacts like "Rahul Sharma" or phone numbers)
+     * and message body from fast-reflex commands.
+     */
+    private suspend fun parseSmsTargetAndBody(rest: String): Pair<String, String>? {
+        if (rest.isBlank()) return null
+
+        // 1. Explicit delimiter ("Rahul Sharma: hello", "Rahul Sharma - hello", "Rahul Sharma saying hello", "Rahul Sharma ko hello")
+        val delimMatch = Regex("^(.+?)\\s*(?::|-\\s+|\\bsaying\\b|\\bmessage\\b|\\bthat\\b|\\bko\\b)\\s+(.+)$", RegexOption.IGNORE_CASE)
+            .find(rest)
+        if (delimMatch != null) {
+            val target = delimMatch.groupValues[1].trim()
+            val body = delimMatch.groupValues[2].trim()
+                .replace(Regex("\\s*(?:bhejo|bhej\\s+do|send\\s+karo)$", RegexOption.IGNORE_CASE), "")
+                .trim()
+            if (target.isNotEmpty() && body.isNotEmpty()) {
+                return target to body
+            }
+        }
+
+        // 2. Leading phone number ("+91 98765 43210 I am reaching soon")
+        val phonePrefixMatch = Regex("^(\\+?\\d[\\d\\s-]{6,16})\\s+(.+)$").find(rest)
+        if (phonePrefixMatch != null) {
+            val phoneCandidate = phonePrefixMatch.groupValues[1].trim()
+            val body = phonePrefixMatch.groupValues[2].trim()
+            if (extractFirstPhoneNumber(phoneCandidate) != null && body.isNotEmpty()) {
+                return phoneCandidate to body
+            }
+        }
+
+        // 3. Multi-word Vault contact prefix resolution (try 3-word, 2-word, then 1-word prefixes)
+        val words = rest.split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (words.size < 2) return null
+        val maxPrefix = minOf(3, words.size - 1)
+        for (len in maxPrefix downTo 2) {
+            val candidate = words.take(len).joinToString(" ")
+            val exactNode = vault.searchMemories(candidate).firstOrNull {
+                it.key.equals(candidate, ignoreCase = true) && extractFirstPhoneNumber(it.value) != null
+            }
+            if (exactNode != null) {
+                val body = words.drop(len).joinToString(" ").trim()
+                if (body.isNotEmpty()) return candidate to body
+            }
+        }
+
+        // 4. Default single-word recipient + remaining message body
+        val target = words[0].trim()
+        val body = words.drop(1).joinToString(" ").trim()
+        return if (target.isNotEmpty() && body.isNotEmpty()) target to body else null
     }
 
     /**
@@ -1800,6 +2087,13 @@ class HybridBrainAndSwarm(
             }
         }
         if (stepsArr.length() < 2) return null
+        if (isDeviceLocked()) {
+            return Triple(
+                "Security Lock: Phone locked hai boss. Multi-step automation chalane ke liye pehle device unlock karein.",
+                "LOCK-SCREEN-GUARD",
+                100
+            )
+        }
 
         _brainState.value = BrainVisualState.ACTING
         val stepsJson = stepsArr.toString()
@@ -1836,6 +2130,13 @@ class HybridBrainAndSwarm(
     }
 
     private suspend fun prepareCallWithSafetyGate(targetRaw: String, dryRun: Boolean): Triple<String, String, Int> {
+        if (isDeviceLocked()) {
+            return Triple(
+                "Security Lock: Phone locked hai boss. Call lagane ke liye pehle device unlock karein.",
+                "LOCK-SCREEN-GUARD",
+                100
+            )
+        }
         val finalNumber = resolvePhoneNumber(targetRaw)
         vault.workingMemory.addTurn("SYSTEM", "Target contact $targetRaw", "contact:$targetRaw")
         if (finalNumber.isBlank()) {
@@ -1859,6 +2160,13 @@ class HybridBrainAndSwarm(
     }
 
     private suspend fun prepareSmsWithSafetyGate(targetRaw: String, body: String, dryRun: Boolean): Triple<String, String, Int> {
+        if (isDeviceLocked()) {
+            return Triple(
+                "Security Lock: Phone locked hai boss. SMS bhejne ke liye pehle device unlock karein.",
+                "LOCK-SCREEN-GUARD",
+                100
+            )
+        }
         val finalNumber = resolvePhoneNumber(targetRaw)
         vault.workingMemory.addTurn("SYSTEM", "Target SMS $targetRaw", "contact:$targetRaw")
         if (finalNumber.isBlank()) {
@@ -1901,14 +2209,48 @@ class HybridBrainAndSwarm(
         return normalized.takeIf { digits in 7..15 }
     }
 
-    private fun setAlarmIntent(hour: Int, minute: Int) {
+    private suspend fun setAlarmIntent(hour: Int, minute: Int): Pair<Boolean, String> {
+        val formattedTime = "$hour:${"%02d".format(Locale.US, minute)}"
         val alarmIntent = Intent(AlarmClock.ACTION_SET_ALARM).apply {
             putExtra(AlarmClock.EXTRA_HOUR, hour)
             putExtra(AlarmClock.EXTRA_MINUTES, minute)
             putExtra(AlarmClock.EXTRA_MESSAGE, "Goku Alarm")
+            putExtra(AlarmClock.EXTRA_SKIP_UI, true)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        runCatching { context.startActivity(alarmIntent) }
+        val canResolve = runCatching {
+            alarmIntent.resolveActivity(context.packageManager) != null
+        }.getOrDefault(false)
+
+        if (canResolve) {
+            val launched = try {
+                context.startActivity(alarmIntent)
+                true
+            } catch (_: SecurityException) {
+                false
+            } catch (_: Throwable) {
+                false
+            }
+            if (launched) {
+                return true to "Alarm $formattedTime ke liye set kar diya boss."
+            }
+        }
+
+        // Android 14-16 BAL restriction, missing SET_ALARM, or no Clock app: persist an honest in-app Vault reminder fallback
+        val reminderKey = "alarm_reminder_$formattedTime"
+        vault.saveMemory(
+            key = reminderKey,
+            value = "Alarm reminder requested for $formattedTime (system Clock launch restricted in background)",
+            category = "ALARM_REMINDER"
+        )
+        vault.logAction(
+            stage = "EXECUTOR",
+            command = "Alarm Fallback ($formattedTime)",
+            detail = "System Clock launch blocked (BAL/permission/unavailable); saved fallback reminder in Vault.",
+            confidence = 85,
+            status = "WARN"
+        )
+        return false to "System Clock background mein open nahi ho paya (Android 14-16 BAL/permission restriction). Maine $formattedTime ka fallback alarm reminder Vault mein save kar diya hai — Goku app foreground mein kholkar alarm set kar sakte ho."
     }
 
     private fun toggleTorch(turnOn: Boolean): String {
@@ -2006,20 +2348,26 @@ class HybridBrainAndSwarm(
     }
 
     private fun appendUserMessage(text: String) {
-        _messages.value = (_messages.value + ChatMessage(isUser = true, text = text)).takeLast(60)
+        _messages.update { (it + ChatMessage(isUser = true, text = text)).takeLast(60) }
     }
 
     private fun appendGokuMessage(text: String, badge: String, confidence: Int) {
-        _messages.value = (_messages.value + ChatMessage(
-            isUser = false,
-            text = text,
-            engineBadge = badge,
-            confidence = confidence
-        )).takeLast(60)
+        _messages.update {
+            (it + ChatMessage(
+                isUser = false,
+                text = text,
+                engineBadge = badge,
+                confidence = confidence
+            )).takeLast(60)
+        }
     }
 
     fun clearConversation() {
         vault.workingMemory.clear()
         _messages.value = emptyList()
+    }
+
+    companion object {
+        private val SENSITIVE_LOCK_GUARD_ACTIONS = setOf("CALL", "SMS", "OPEN_APP", "VIRTUAL_APP")
     }
 }

@@ -27,21 +27,21 @@ import com.goku.ai.adb.AdbPairingOverlayBus
 import com.goku.ai.adb.LocalAdbEngine
 import com.goku.ai.automation.AntiTheftIntruderGuard
 import com.goku.ai.automation.CameraLiveEyeManager
-import com.goku.ai.automation.EmergencySosManager
 import com.goku.ai.automation.GokuDeviceAdminReceiver
 import com.goku.ai.automation.SelfCodingPluginEngine
 import com.goku.ai.automation.SensorReflexManager
 import com.goku.ai.body.GokuAccessibilityService
 import com.goku.ai.body.MistakeBlockerBus
 import com.goku.ai.body.TeachModeRecorder
-import com.goku.ai.body.UniversalAppPilot
 import com.goku.ai.brain.HybridBrainAndSwarm
+import com.goku.ai.brain.OfflineModelDownloadManager
 import com.goku.ai.data.GokuVaultRepository
 import com.goku.ai.data.LearnedSkillEntity
 import com.goku.ai.services.FloatingOrbOverlayService
 import com.goku.ai.services.GokuHeadlessCommandBus
 import com.goku.ai.services.GokuKeepAliveService
 import com.goku.ai.services.GokuNotificationListenerService
+import com.goku.ai.services.PostBootMicUnlockBus
 import com.goku.ai.ui.GokuCyberTheme
 import com.goku.ai.ui.GokuDashboardCallbacks
 import com.goku.ai.ui.GokuDashboardScreen
@@ -51,9 +51,11 @@ import com.goku.ai.ui.PermissionWizardStatus
 import com.goku.ai.voice.GokuEarAndVoiceEngine
 import com.goku.ai.voice.GokuKillSwitch
 import com.goku.ai.voice.SherpaOnnxKwsBridge
+import android.widget.Toast
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -63,6 +65,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Verifies that EVERY critical runtime permission required by Goku V10.1
@@ -168,13 +171,17 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
     private val voiceEngine: GokuEarAndVoiceEngine = runtime.voiceEngine
     private val sensorManager = SensorReflexManager.getInstance(ctx)
     private val intruderGuard = AntiTheftIntruderGuard.getInstance(ctx)
-    private val pilot: UniversalAppPilot = runtime.pilot
-    private val sosManager: EmergencySosManager = runtime.sosManager
     private val pluginEngine: SelfCodingPluginEngine = runtime.pluginEngine
     private val brain: HybridBrainAndSwarm = runtime.brain
+    private val modelDownloadManager: OfflineModelDownloadManager = OfflineModelDownloadManager.getInstance(ctx)
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private val settingsIoDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private val hasUserEditedSettings = AtomicBoolean(false)
+    private var refreshPermissionsJob: Job? = null
+
+    @Volatile
+    var pendingVoiceStartAfterPermission: Boolean = false
 
     private val _uiState = MutableStateFlow(GokuDashboardUiState())
     val uiState: StateFlow<GokuDashboardUiState> = _uiState.asStateFlow()
@@ -184,10 +191,14 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
         // keep executing seamlessly even after MainActivity / GokuViewModel is closed.
         GokuHeadlessCommandBus.ensureVoiceCallbackWired(ctx)
 
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(settingsIoDispatcher) {
             prepareKwsDirectory(ctx)
-            val snapshot = loadSettingsSnapshot()
-            _uiState.update { it.copy(settings = snapshot) }
+            if (!hasUserEditedSettings.get()) {
+                val snapshot = loadSettingsSnapshot()
+                _uiState.update { state ->
+                    if (!hasUserEditedSettings.get()) state.copy(settings = snapshot) else state
+                }
+            }
         }
 
         pluginEngine.scheduleNightlyDreamMode()
@@ -216,6 +227,9 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
             brain.offlineLlm.isLoadedInRam.collect { loaded -> _uiState.update { it.copy(isLocalModelLoaded = loaded) } }
         }
         viewModelScope.launch {
+            modelDownloadManager.state.collect { dl -> _uiState.update { it.copy(modelDownloadState = dl) } }
+        }
+        viewModelScope.launch {
             voiceEngine.state.collect { vs -> _uiState.update { it.copy(voiceState = vs) } }
         }
         viewModelScope.launch {
@@ -236,7 +250,7 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update {
                     it.copy(
                         permissionStatus = it.permissionStatus.copy(
-                            deviceAdminEnabled = guardState.isDeviceAdminActive || isDeviceAdminActive(ctx)
+                            deviceAdminEnabled = guardState.isDeviceAdminActive
                         )
                     )
                 }
@@ -289,32 +303,37 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshPermissionStatus() {
-        brain.isNetworkAvailable()
-        intruderGuard.refreshAdminStatus()
-        val pm = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
-        val batteryExempt = pm?.isIgnoringBatteryOptimizations(ctx.packageName) ?: false
-        val overlayOk = Settings.canDrawOverlays(ctx)
-        val allRuntimeOk = hasAllCriticalRuntimePermissions(ctx)
-        val enabledListeners = Settings.Secure.getString(ctx.contentResolver, "enabled_notification_listeners").orEmpty()
-        val notifConnected = GokuNotificationListenerService.isConnected.value ||
-            enabledListeners.contains(ctx.packageName)
-        val deviceAdminOk = isDeviceAdminActive(ctx)
+        refreshPermissionsJob?.cancel()
+        refreshPermissionsJob = viewModelScope.launch(Dispatchers.IO) {
+            brain.isNetworkAvailable()
+            intruderGuard.refreshAdminStatus()
+            val pm = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val batteryExempt = pm?.isIgnoringBatteryOptimizations(ctx.packageName) ?: false
+            val overlayOk = Settings.canDrawOverlays(ctx)
+            val allRuntimeOk = hasAllCriticalRuntimePermissions(ctx)
+            val enabledListeners = runCatching {
+                Settings.Secure.getString(ctx.contentResolver, "enabled_notification_listeners").orEmpty()
+            }.getOrDefault("")
+            val notifConnected = GokuNotificationListenerService.isConnected.value ||
+                enabledListeners.contains(ctx.packageName)
+            val deviceAdminOk = isDeviceAdminActive(ctx)
 
-        _uiState.update {
-            it.copy(
-                permissionStatus = PermissionWizardStatus(
-                    runtimePermissionsGranted = allRuntimeOk,
-                    accessibilityEnabled = GokuAccessibilityService.isConnected.value,
-                    overlayEnabled = overlayOk,
-                    notificationListenerEnabled = notifConnected,
-                    batteryOptimizationIgnored = batteryExempt,
-                    keepAliveRunning = GokuKeepAliveService.isRunning.value,
-                    floatingOrbRunning = FloatingOrbOverlayService.isOverlayActive.value,
-                    deviceAdminEnabled = deviceAdminOk
-                ),
-                isVirtualDisplayActive = adbEngine.virtualDisplayRunner.isActive.value,
-                activeVirtualDisplayId = adbEngine.virtualDisplayRunner.virtualDisplayId.value
-            )
+            _uiState.update {
+                it.copy(
+                    permissionStatus = PermissionWizardStatus(
+                        runtimePermissionsGranted = allRuntimeOk,
+                        accessibilityEnabled = GokuAccessibilityService.isConnected.value,
+                        overlayEnabled = overlayOk,
+                        notificationListenerEnabled = notifConnected,
+                        batteryOptimizationIgnored = batteryExempt,
+                        keepAliveRunning = GokuKeepAliveService.isRunning.value,
+                        floatingOrbRunning = FloatingOrbOverlayService.isOverlayActive.value,
+                        deviceAdminEnabled = deviceAdminOk
+                    ),
+                    isVirtualDisplayActive = adbEngine.virtualDisplayRunner.isActive.value,
+                    activeVirtualDisplayId = adbEngine.virtualDisplayRunner.virtualDisplayId.value
+                )
+            }
         }
     }
 
@@ -323,11 +342,51 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleListening() {
-        if (_uiState.value.voiceState.isListening) {
+        val vs = _uiState.value.voiceState
+        if (vs.isListening || vs.isAcousticEarArmed || vs.isSpeechRecognizerActive) {
             voiceEngine.stopListening()
         } else {
             GokuHeadlessCommandBus.startVoiceListeningIfPermitted(ctx, openDirectWindow = true)
         }
+    }
+
+    fun startListeningIfPermitted() {
+        val vs = _uiState.value.voiceState
+        if (!vs.isListening && !vs.isAcousticEarArmed && !vs.isSpeechRecognizerActive) {
+            GokuHeadlessCommandBus.startVoiceListeningIfPermitted(ctx, openDirectWindow = true)
+        }
+    }
+
+    fun unlockPostBootMicAndListen() {
+        PostBootMicUnlockBus.setMicNeedsUnlock(false)
+        GokuHeadlessCommandBus.ensureVoiceCallbackWired(ctx)
+        voiceEngine.unlockPostBootMicAndListen()
+    }
+
+    fun onPermissionsDeniedFeedback(detail: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            vault.logAction("SYSTEM", "Permissions Denied", detail, 75, "WARN")
+        }
+    }
+
+    fun startOfflineModelDownload(url: String, modelName: String) {
+        modelDownloadManager.startDownload(url, modelName)
+    }
+
+    fun pauseOfflineModelDownload() {
+        modelDownloadManager.pauseDownload()
+    }
+
+    fun resumeOfflineModelDownload() {
+        modelDownloadManager.resumeDownload()
+    }
+
+    fun deleteOfflineModel() {
+        modelDownloadManager.deleteModel()
+    }
+
+    fun importLocalOfflineModel(uri: Uri) {
+        modelDownloadManager.importLocalModel(uri)
     }
 
     fun toggleVirtualDisplay(enable: Boolean) {
@@ -489,26 +548,28 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateSettings(updated: GokuSettingsSnapshot) {
+        hasUserEditedSettings.set(true)
         _uiState.update { it.copy(settings = updated) }
         viewModelScope.launch(settingsIoDispatcher) {
-            val s = vault.settings
-            s.geminiApiKey = updated.geminiKey
-            s.groqApiKey = updated.groqKey
-            s.deepSeekApiKey = updated.deepSeekKey
-            s.openRouterApiKey = updated.openRouterKey
-            s.sosContactsCsv = updated.sosContacts
-            s.githubRepo = updated.githubRepo
-            s.githubToken = updated.githubToken
-            s.telegramBotToken = updated.telegramBot
-            s.telegramChatId = updated.telegramChatId
-            s.smartCallPolicy = updated.smartCallPolicy
-            s.localModelPath = updated.localModelPath
-            s.dryRunMode = updated.dryRunMode
-            s.autoAdSkipEnabled = updated.autoAdSkip
-            s.otpAutopilotEnabled = updated.otpAutopilot
-            s.mistakeBlockerEnabled = updated.mistakeBlocker
-            s.workFocusMode = updated.workFocusMode
-            s.smartCallEnabled = updated.smartCallEnabled
+            vault.settings.batchUpdate(
+                geminiKey = updated.geminiKey,
+                groqKey = updated.groqKey,
+                deepSeekKey = updated.deepSeekKey,
+                openRouterKey = updated.openRouterKey,
+                sosContacts = updated.sosContacts,
+                githubRepo = updated.githubRepo,
+                githubToken = updated.githubToken,
+                telegramBot = updated.telegramBot,
+                telegramChatId = updated.telegramChatId,
+                smartCallPolicy = updated.smartCallPolicy,
+                smartCallEnabled = updated.smartCallEnabled,
+                dryRunMode = updated.dryRunMode,
+                autoAdSkip = updated.autoAdSkip,
+                otpAutopilot = updated.otpAutopilot,
+                mistakeBlocker = updated.mistakeBlocker,
+                workFocusMode = updated.workFocusMode,
+                localModelPath = updated.localModelPath
+            )
         }
     }
 
@@ -542,18 +603,48 @@ class MainActivity : ComponentActivity() {
 
     private val runtimePermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) {
+    ) { permissionsMap ->
         viewModel.refreshPermissionStatus()
-        GokuKeepAliveService.startSafe(this)
+        val micGranted = permissionsMap[Manifest.permission.RECORD_AUDIO] == true ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val anyGranted = permissionsMap.values.any { it }
+        val deniedList = permissionsMap.filterValues { !it }.keys
+
+        if (micGranted || anyGranted) {
+            GokuKeepAliveService.startSafe(this, isFromForeground = true)
+        }
+        val shouldStartVoice = viewModel.pendingVoiceStartAfterPermission
+        viewModel.pendingVoiceStartAfterPermission = false
+        if (micGranted && shouldStartVoice) {
+            viewModel.startListeningIfPermitted()
+        }
+        if (deniedList.isNotEmpty()) {
+            val shortNames = deniedList.map { it.substringAfterLast('.') }.take(4).joinToString(", ")
+            val suffix = if (deniedList.size > 4) " (+${deniedList.size - 4} more)" else ""
+            viewModel.onPermissionsDeniedFeedback("Denied: $shortNames$suffix")
+            Toast.makeText(
+                this,
+                "Permissions denied ($shortNames$suffix). Features requiring them remain inactive.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        if (savedInstanceState?.getBoolean(KEY_PENDING_VOICE_START, false) == true) {
+            viewModel.pendingVoiceStartAfterPermission = true
+        }
+
         CameraLiveEyeManager.attachContext(applicationContext)
         GokuKeepAliveService.createNotificationChannels(this)
-        GokuKeepAliveService.startSafe(this)
+
+        val handledMicUnlock = handleUnlockMicAndMinimizeIntent(intent)
+        if (!handledMicUnlock) {
+            GokuKeepAliveService.startSafe(this, isFromForeground = true)
+        }
 
         setContent {
             val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -566,6 +657,7 @@ class MainActivity : ComponentActivity() {
                             if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                                 != PackageManager.PERMISSION_GRANTED
                             ) {
+                                viewModel.pendingVoiceStartAfterPermission = true
                                 requestAllRuntimePermissions()
                             } else {
                                 viewModel.toggleListening()
@@ -614,16 +706,61 @@ class MainActivity : ComponentActivity() {
                         onExportSkills = { viewModel.exportSkills() },
                         onDismissExportedJson = { viewModel.dismissExportedJson() },
                         onImportSkillsJson = { viewModel.importSkillsJson(it) },
-                        onLiveEyeOcrText = { viewModel.handleLiveEyeOcr(it) }
+                        onLiveEyeOcrText = { viewModel.handleLiveEyeOcr(it) },
+                        onStartModelDownload = { url, name -> viewModel.startOfflineModelDownload(url, name) },
+                        onPauseModelDownload = { viewModel.pauseOfflineModelDownload() },
+                        onResumeModelDownload = { viewModel.resumeOfflineModelDownload() },
+                        onDeleteOfflineModel = { viewModel.deleteOfflineModel() },
+                        onImportLocalModelUri = { uri -> viewModel.importLocalOfflineModel(uri) }
                     )
                 )
             }
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleUnlockMicAndMinimizeIntent(intent)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_PENDING_VOICE_START, viewModel.pendingVoiceStartAfterPermission)
+    }
+
     override fun onResume() {
         super.onResume()
         viewModel.refreshPermissionStatus()
+    }
+
+    private fun handleUnlockMicAndMinimizeIntent(launchIntent: Intent?): Boolean {
+        if (launchIntent?.getBooleanExtra(EXTRA_UNLOCK_MIC_AND_MINIMIZE, false) != true) {
+            return false
+        }
+        // Consume extra immediately so configuration changes do not re-minimize the activity
+        launchIntent.removeExtra(EXTRA_UNLOCK_MIC_AND_MINIMIZE)
+
+        val hasMic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        if (!hasMic) {
+            viewModel.pendingVoiceStartAfterPermission = true
+            requestAllRuntimePermissions()
+            return false
+        }
+
+        PostBootMicUnlockBus.setMicNeedsUnlock(false)
+        // Promote KeepAlive service to MICROPHONE FGS while MainActivity holds foreground eligibility
+        val unlockServiceIntent = Intent(this, GokuKeepAliveService::class.java).apply {
+            action = GokuKeepAliveService.ACTION_UNLOCK_MIC
+            putExtra(GokuKeepAliveService.EXTRA_START_VOICE_IN_SERVICE, false)
+        }
+        runCatching { ContextCompat.startForegroundService(this, unlockServiceIntent) }
+            .onFailure { GokuKeepAliveService.startSafe(this, isFromForeground = true) }
+
+        viewModel.unlockPostBootMicAndListen()
+        moveTaskToBack(true)
+        return true
     }
 
     private fun requestAllRuntimePermissions() {
@@ -646,5 +783,10 @@ class MainActivity : ComponentActivity() {
             }
         }.toTypedArray()
         runtimePermissionsLauncher.launch(perms)
+    }
+
+    companion object {
+        const val EXTRA_UNLOCK_MIC_AND_MINIMIZE = "com.goku.ai.extra.UNLOCK_MIC_AND_MINIMIZE"
+        private const val KEY_PENDING_VOICE_START = "goku_pending_voice_start_after_perm"
     }
 }

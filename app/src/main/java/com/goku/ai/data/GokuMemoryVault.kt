@@ -2,6 +2,8 @@ package com.goku.ai.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
+import android.os.UserManager
 import androidx.room.Dao
 import androidx.room.Database
 import androidx.room.Entity
@@ -17,6 +19,8 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -27,7 +31,6 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 import kotlin.math.ln
@@ -269,12 +272,13 @@ object FtsQuerySanitizer {
      * stripping special FTS syntax characters so malformed inputs never throw SQLiteException.
      */
     fun toPrefixMatchQuery(raw: String, useOrOperator: Boolean = false): String {
-        val tokens = raw.lowercase(Locale.ROOT)
+        val rawTokens = raw.lowercase(Locale.ROOT)
             .split(Regex("[^a-z0-9\\u0900-\\u097F]+"))
             .map { it.trim() }
             .filter { it.length >= 2 && it !in FTS_RESERVED_WORDS }
             .distinct()
-            .take(8)
+        val meaningful = rawTokens.filter { it !in HINGLISH_FTS_STOP_WORDS }
+        val tokens = (if (meaningful.isNotEmpty()) meaningful else rawTokens).take(8)
         if (tokens.isEmpty()) return ""
         val separator = if (useOrOperator) " OR " else " "
         return tokens.joinToString(separator) { "$it*" }
@@ -292,6 +296,11 @@ object FtsQuerySanitizer {
     }
 
     private val FTS_RESERVED_WORDS = setOf("and", "or", "not", "near")
+    private val HINGLISH_FTS_STOP_WORDS = setOf(
+        "kya", "hai", "hain", "mera", "meri", "mere", "karo", "batao", "bata", "mujhe",
+        "ko", "ka", "ki", "ke", "mein", "me", "par", "pe", "se", "ho", "tha", "thi", "the",
+        "kal", "aaj", "dikhao", "dekh", "dekha", "goku", "hey", "please", "what", "is", "are", "my"
+    )
 }
 
 // ============================================================================
@@ -509,7 +518,8 @@ data class ConversationTurn(
 )
 
 class ShortTermWorkingMemory(private val maxTurns: Int = 15) {
-    private val turns = CopyOnWriteArrayList<ConversationTurn>()
+    private val lock = Any()
+    private val turns = ArrayList<ConversationTurn>()
 
     @Volatile
     var lastMentionedContact: String? = null
@@ -523,23 +533,29 @@ class ShortTermWorkingMemory(private val maxTurns: Int = 15) {
     var lastScreenSummary: String = ""
 
     fun addTurn(role: String, text: String, entity: String? = null) {
-        turns.add(ConversationTurn(role = role, text = text, referencedEntity = entity))
-        while (turns.size > maxTurns) {
-            turns.removeAt(0)
-        }
-        if (!entity.isNullOrBlank()) {
-            if (entity.startsWith("contact:")) {
-                lastMentionedContact = entity.removePrefix("contact:")
-            } else if (entity.startsWith("app:")) {
-                lastMentionedApp = entity.removePrefix("app:")
+        synchronized(lock) {
+            turns.add(ConversationTurn(role = role, text = text, referencedEntity = entity))
+            while (turns.size > maxTurns) {
+                turns.removeAt(0)
+            }
+            if (!entity.isNullOrBlank()) {
+                if (entity.startsWith("contact:")) {
+                    lastMentionedContact = entity.removePrefix("contact:")
+                } else if (entity.startsWith("app:")) {
+                    lastMentionedApp = entity.removePrefix("app:")
+                }
             }
         }
     }
 
-    fun getRecentTurns(limit: Int = 8): List<ConversationTurn> = turns.takeLast(limit)
+    fun getRecentTurns(limit: Int = 8): List<ConversationTurn> = synchronized(lock) {
+        turns.takeLast(limit)
+    }
 
     fun buildCompressedContext(): String {
-        val recent = turns.takeLast(6).joinToString("\n") { "${it.role}: ${it.text.take(140)}" }
+        val recent = synchronized(lock) {
+            turns.takeLast(6).joinToString("\n") { "${it.role}: ${it.text.take(140)}" }
+        }
         val screenPart = if (lastScreenSummary.isNotBlank()) {
             "\n[SCREEN]: ${lastScreenSummary.take(220)}"
         } else ""
@@ -555,25 +571,29 @@ class ShortTermWorkingMemory(private val maxTurns: Int = 15) {
         val lower = rawInput.lowercase(Locale.ROOT)
         val contact = lastMentionedContact
         if (!contact.isNullOrBlank()) {
+            val safeContact = Regex.escapeReplacement(contact)
             val contactPronouns = listOf("usse", "unhe", "unse", "usko", "unko", "call him", "call her", "message him", "message her")
             if (contactPronouns.any { lower.contains(it) }) {
                 resolved = resolved
-                    .replace(Regex("\\b(usse|unhe|unse|usko|unko)\\b", RegexOption.IGNORE_CASE), contact)
-                    .replace(Regex("\\b(him|her)\\b", RegexOption.IGNORE_CASE), contact)
+                    .replace(Regex("\\b(usse|unhe|unse|usko|unko)\\b", RegexOption.IGNORE_CASE), safeContact)
+                    .replace(Regex("\\b(him|her)\\b", RegexOption.IGNORE_CASE), safeContact)
             }
         }
         val app = lastMentionedApp
         if (!app.isNullOrBlank() && (lower.contains("wahi app") || lower.contains("same app") || lower.contains("that app"))) {
+            val safeApp = Regex.escapeReplacement(app)
             resolved = resolved
-                .replace(Regex("wahi app|same app|that app", RegexOption.IGNORE_CASE), app)
+                .replace(Regex("wahi app|same app|that app", RegexOption.IGNORE_CASE), safeApp)
         }
         return resolved
     }
 
     fun clear() {
-        turns.clear()
-        lastMentionedContact = null
-        lastMentionedApp = null
+        synchronized(lock) {
+            turns.clear()
+            lastMentionedContact = null
+            lastMentionedApp = null
+        }
     }
 }
 
@@ -594,7 +614,8 @@ class LocalRagDocumentBrain(
     private val screenTimelineDao: ScreenTimelineDao? = null
 ) {
     private val indexLock = Any()
-    private val chunks = CopyOnWriteArrayList<RagChunk>()
+    private val persistMutex = Mutex()
+    private val lruChunks = LinkedHashMap<String, RagChunk>(64, 0.75f, true)
     private val invertedIndex = ConcurrentHashMap<String, MutableSet<RagChunk>>()
 
     fun indexDocument(docName: String, content: String, chunkSize: Int = 360) {
@@ -613,6 +634,13 @@ class LocalRagDocumentBrain(
         }
     }
 
+    suspend fun removeDocumentPersistent(docName: String) = withContext(Dispatchers.IO) {
+        persistMutex.withLock {
+            removeDocument(docName)
+            runCatching { ragDao?.deleteByDocName(docName) }
+        }
+    }
+
     /**
      * Persists document chunks into SQLite (`rag_documents` + `rag_documents_fts` virtual table)
      * with Zstd/GZIP compression while also updating the instant in-memory inverted index.
@@ -622,20 +650,22 @@ class LocalRagDocumentBrain(
         content: String,
         chunkSize: Int = 360
     ) = withContext(Dispatchers.IO) {
-        indexDocument(docName, content, chunkSize)
-        val dao = ragDao ?: return@withContext
-        val created = buildChunks(docName, content, chunkSize)
-        dao.deleteByDocName(docName)
-        if (created.isNotEmpty()) {
-            val entities = created.map { c ->
-                RagDocumentEntity(
-                    docName = c.docName,
-                    chunkIndex = c.chunkIndex,
-                    content = c.text,
-                    compressedContent = TextCompressor.compress(c.text)
-                )
+        persistMutex.withLock {
+            indexDocument(docName, content, chunkSize)
+            val dao = ragDao ?: return@withLock
+            val created = buildChunks(docName, content, chunkSize)
+            dao.deleteByDocName(docName)
+            if (created.isNotEmpty()) {
+                val entities = created.map { c ->
+                    RagDocumentEntity(
+                        docName = c.docName,
+                        chunkIndex = c.chunkIndex,
+                        content = c.text,
+                        compressedContent = TextCompressor.compress(c.text)
+                    )
+                }
+                dao.insertAll(entities)
             }
-            dao.insertAll(entities)
         }
     }
 
@@ -648,8 +678,8 @@ class LocalRagDocumentBrain(
 
         val scoreByChunk = HashMap<RagChunk, Double>()
         synchronized(indexLock) {
-            if (chunks.isEmpty()) return emptyList()
-            val totalDocs = chunks.size.coerceAtLeast(1).toDouble()
+            if (lruChunks.isEmpty()) return emptyList()
+            val totalDocs = lruChunks.size.coerceAtLeast(1).toDouble()
 
             for (tok in qTokens) {
                 val postings = invertedIndex[tok]
@@ -670,12 +700,16 @@ class LocalRagDocumentBrain(
                     }
                 }
             }
+            val ranked = scoreByChunk.entries
+                .sortedByDescending { it.value }
+                .take(topK)
+                .map { it.key }
+            // Touch top hits in LRU map so hot chunks stay resident
+            for (hit in ranked) {
+                lruChunks[chunkCacheKey(hit)]
+            }
+            return ranked
         }
-
-        return scoreByChunk.entries
-            .sortedByDescending { it.value }
-            .take(topK)
-            .map { it.key }
     }
 
     /**
@@ -698,6 +732,9 @@ class LocalRagDocumentBrain(
                 }
             }
         }
+
+        val ragResults = ArrayList<RagChunk>()
+        val memoryResults = ArrayList<RagChunk>()
 
         // 1. Persistent SQLite FTS4 Rag Documents (strict AND -> broad OR -> LIKE / token LIKE)
         val dao = ragDao
@@ -737,22 +774,21 @@ class LocalRagDocumentBrain(
                     entity.content
                 }
                 if (text.isNotBlank()) {
-                    addHit(
+                    ragResults.add(
                         RagChunk(
                             docName = entity.docName,
                             chunkIndex = entity.chunkIndex,
                             text = text,
                             tokens = tokenize(text)
-                        ),
-                        cacheInMemory = true
+                        )
                     )
                 }
             }
         }
 
-        // 2. Persistent Room Memory Nodes (saved facts, contacts, relations survive cold restart)
+        // 2. ALWAYS query Persistent Room Memory Nodes (saved facts, contacts, relations never skipped even when ragDao fills topK)
         val memDao = memoryNodeDao
-        if (memDao != null && merged.size < topK) {
+        if (memDao != null) {
             val matchedNodes = LinkedHashMap<Long, MemoryNodeEntity>()
             runCatching { memDao.search(cleanedQuestion) }
                 .getOrDefault(emptyList())
@@ -768,16 +804,27 @@ class LocalRagDocumentBrain(
             matchedNodes.values.take(topK).forEach { node ->
                 val rel = if (node.relationTag.isNotBlank()) " (${node.relationTag})" else ""
                 val text = "${node.key} = ${node.value}$rel"
-                addHit(
+                memoryResults.add(
                     RagChunk(
                         docName = "memory:${node.key}",
                         chunkIndex = 0,
                         text = text,
                         tokens = tokenize(text)
-                    ),
-                    cacheInMemory = true
+                    )
                 )
             }
+        }
+
+        // Merge both RAG document hits and Memory Node hits fairly so neither starves the other
+        val memReserve = if (memoryResults.isNotEmpty()) minOf(memoryResults.size, maxOf(1, topK / 2)) else 0
+        val ragQuota = (topK - memReserve).coerceAtLeast(0)
+        ragResults.take(ragQuota).forEach { addHit(it, cacheInMemory = true) }
+        memoryResults.take(memReserve).forEach { addHit(it, cacheInMemory = true) }
+        ragResults.drop(ragQuota).forEach {
+            if (merged.size < topK) addHit(it, cacheInMemory = true)
+        }
+        memoryResults.drop(memReserve).forEach {
+            if (merged.size < topK) addHit(it, cacheInMemory = true)
         }
 
         // 3. Persistent SQLite FTS4 Screen Timeline (recall past screen context after reboot)
@@ -818,7 +865,9 @@ class LocalRagDocumentBrain(
     suspend fun queryFts(question: String, topK: Int = 5): List<RagChunk> =
         queryPersistentFts(question, topK)
 
-    fun indexedCount(): Int = synchronized(indexLock) { chunks.size }
+    fun indexedCount(): Int = synchronized(indexLock) { lruChunks.size }
+
+    private fun chunkCacheKey(chunk: RagChunk): String = "${chunk.docName}#${chunk.chunkIndex}"
 
     private fun addChunkToMemoryCache(chunk: RagChunk) {
         synchronized(indexLock) {
@@ -827,11 +876,23 @@ class LocalRagDocumentBrain(
     }
 
     private fun addChunkToMemoryCacheLocked(chunk: RagChunk) {
-        val alreadyExists = chunks.any { it.docName == chunk.docName && it.chunkIndex == chunk.chunkIndex }
-        if (alreadyExists) return
-        chunks.add(chunk)
+        val key = chunkCacheKey(chunk)
+        val existing = lruChunks[key]
+        if (existing != null) {
+            if (existing.text == chunk.text) return
+            removeSingleChunkFromIndexLocked(existing)
+        }
+        lruChunks[key] = chunk
         for (tok in chunk.tokens) {
             invertedIndex.computeIfAbsent(tok) { ConcurrentHashMap.newKeySet() }.add(chunk)
+        }
+        // Strict LRU eviction cap (max 500 chunks in RAM) updating both LRU map and invertedIndex
+        while (lruChunks.size > MAX_MEMORY_CHUNKS) {
+            val eldestIter = lruChunks.entries.iterator()
+            if (!eldestIter.hasNext()) break
+            val eldestChunk = eldestIter.next().value
+            eldestIter.remove()
+            removeSingleChunkFromIndexLocked(eldestChunk)
         }
     }
 
@@ -844,6 +905,8 @@ class LocalRagDocumentBrain(
     }
 
     companion object {
+        private const val MAX_MEMORY_CHUNKS = 500
+
         private val QUERY_STOP_WORDS = setOf(
             "kya", "hai", "hain", "mera", "meri", "mere", "karo", "batao", "bata", "mujhe",
             "ko", "ka", "ki", "ke", "mein", "me", "par", "pe", "se", "ho", "tha", "thi",
@@ -851,18 +914,28 @@ class LocalRagDocumentBrain(
         )
     }
 
-    private fun removeFromMemoryIndexLocked(docName: String) {
-        val toRemove = chunks.filter { it.docName == docName }
-        if (toRemove.isEmpty()) return
-        chunks.removeAll(toRemove.toSet())
-        for (chunk in toRemove) {
-            for (tok in chunk.tokens) {
-                val postings = invertedIndex[tok] ?: continue
-                postings.remove(chunk)
-                if (postings.isEmpty()) {
-                    invertedIndex.remove(tok)
-                }
+    private fun removeSingleChunkFromIndexLocked(chunk: RagChunk) {
+        for (tok in chunk.tokens) {
+            val postings = invertedIndex[tok] ?: continue
+            postings.remove(chunk)
+            if (postings.isEmpty()) {
+                invertedIndex.remove(tok)
             }
+        }
+    }
+
+    private fun removeFromMemoryIndexLocked(docName: String) {
+        val toRemove = ArrayList<RagChunk>()
+        val iter = lruChunks.entries.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (entry.value.docName == docName) {
+                toRemove.add(entry.value)
+                iter.remove()
+            }
+        }
+        for (chunk in toRemove) {
+            removeSingleChunkFromIndexLocked(chunk)
         }
     }
 
@@ -896,142 +969,353 @@ class LocalRagDocumentBrain(
 
 class GokuEncryptedSettings(context: Context) {
     private val appContext = context.applicationContext
-    private val prefs: SharedPreferences by lazy { createSecurePrefs(appContext) }
+    private val prefsLock = Any()
+    @Volatile
+    private var securePrefs: SharedPreferences? = null
+    @Volatile
+    private var readOnlyLockedMode: Boolean = false
+    private val inMemorySecretFallback = ConcurrentHashMap<String, String>()
+    private val operationalFallbackPrefs: SharedPreferences by lazy {
+        appContext.getSharedPreferences("goku_v10_fallback_prefs", Context.MODE_PRIVATE)
+    }
     private val defaultTaskModelPath: String = File(appContext.filesDir, "models/goku_offline.task").absolutePath
 
-    private fun createSecurePrefs(context: Context): SharedPreferences {
-        fun buildEncrypted(): SharedPreferences {
-            val masterKey = MasterKey.Builder(context)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            return EncryptedSharedPreferences.create(
-                context,
-                "goku_v10_secure_prefs",
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
-        }
+    private fun isUserUnlocked(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return true
+        val um = appContext.getSystemService(Context.USER_SERVICE) as? UserManager ?: return true
+        return runCatching { um.isUserUnlocked }.getOrDefault(true)
+    }
 
-        val secure = runCatching { buildEncrypted() }.getOrElse {
-            // Corrupted XML/keyset after restore/backup: wipe corrupted store once and retry
-            runCatching { context.deleteSharedPreferences("goku_v10_secure_prefs") }
-            runCatching { buildEncrypted() }.getOrNull()
-        }
+    private fun hasExistingSecurePrefsFile(): Boolean {
+        return runCatching {
+            val dataDir = appContext.applicationInfo?.dataDir ?: return@runCatching false
+            File(File(dataDir, "shared_prefs"), "goku_v10_secure_prefs.xml").exists()
+        }.getOrDefault(false)
+    }
 
-        val fallback = context.getSharedPreferences("goku_v10_fallback_prefs", Context.MODE_PRIVATE)
-        if (secure != null) {
-            // Migrate any values saved in fallback prefs into encrypted store to avoid split-brain
-            runCatching {
-                val pending = fallback.all
-                if (pending.isNotEmpty()) {
-                    val editor = secure.edit()
-                    pending.forEach { (k, v) ->
-                        when (v) {
-                            is String -> editor.putString(k, v)
-                            is Boolean -> editor.putBoolean(k, v)
-                            is Int -> editor.putInt(k, v)
-                            is Long -> editor.putLong(k, v)
-                            is Float -> editor.putFloat(k, v)
-                            is Set<*> -> @Suppress("UNCHECKED_CAST") editor.putStringSet(k, v as Set<String>)
-                        }
-                    }
-                    editor.apply()
-                    fallback.edit().clear().apply()
+    fun isInReadOnlyLockedMode(): Boolean = !isUserUnlocked() || readOnlyLockedMode
+
+    private fun isPermanentCorruption(t: Throwable): Boolean {
+        var cur: Throwable? = t
+        while (cur != null) {
+            val name = cur.javaClass.simpleName
+            if (cur is javax.crypto.AEADBadTagException ||
+                name.contains("InvalidProtocolBufferException") ||
+                name.contains("KeyPermanentlyInvalidatedException") ||
+                cur.message?.contains("decryption failed", ignoreCase = true) == true ||
+                cur.message?.contains("Could not verify", ignoreCase = true) == true
+            ) {
+                return true
+            }
+            cur = cur.cause
+        }
+        return false
+    }
+
+    private fun getSecurePrefsOrNull(): SharedPreferences? {
+        if (!isUserUnlocked()) {
+            readOnlyLockedMode = true
+            return null
+        }
+        securePrefs?.let {
+            readOnlyLockedMode = false
+            return it
+        }
+        synchronized(prefsLock) {
+            if (!isUserUnlocked()) {
+                readOnlyLockedMode = true
+                return null
+            }
+            securePrefs?.let {
+                readOnlyLockedMode = false
+                return it
+            }
+
+            fun buildEncrypted(): SharedPreferences {
+                val masterKey = MasterKey.Builder(appContext)
+                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                    .build()
+                return EncryptedSharedPreferences.create(
+                    appContext,
+                    "goku_v10_secure_prefs",
+                    masterKey,
+                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+                )
+            }
+
+            val created = try {
+                buildEncrypted()
+            } catch (t: Throwable) {
+                // Wipe only on permanent keyset/cipher corruption (never wipe API keys on transient Keystore locks)
+                if (isPermanentCorruption(t)) {
+                    runCatching { appContext.deleteSharedPreferences("goku_v10_secure_prefs") }
+                    runCatching { buildEncrypted() }.getOrNull()
+                } else {
+                    null
                 }
             }
-            return secure
+
+            if (created != null) {
+                readOnlyLockedMode = false
+                runCatching {
+                    val editor = created.edit()
+                    var changed = false
+
+                    // Migrate any secrets buffered in memory while Keystore was unavailable (strictly under prefsLock)
+                    if (inMemorySecretFallback.isNotEmpty()) {
+                        inMemorySecretFallback.forEach { (k, v) ->
+                            editor.putString(k, v)
+                        }
+                        inMemorySecretFallback.clear()
+                        changed = true
+                    }
+
+                    // Migrate legacy operational prefs ONLY when not already present in real encrypted prefs
+                    val pending = operationalFallbackPrefs.all
+                    if (pending.isNotEmpty()) {
+                        pending.forEach { (k, v) ->
+                            if (!created.contains(k)) {
+                                when (v) {
+                                    is String -> editor.putString(k, v)
+                                    is Boolean -> editor.putBoolean(k, v)
+                                    is Int -> editor.putInt(k, v)
+                                    is Long -> editor.putLong(k, v)
+                                    is Float -> editor.putFloat(k, v)
+                                    is Set<*> -> @Suppress("UNCHECKED_CAST") editor.putStringSet(k, v as Set<String>)
+                                }
+                            }
+                        }
+                        operationalFallbackPrefs.edit().clear().apply()
+                        changed = true
+                    }
+                    if (changed) editor.apply()
+                }
+                securePrefs = created
+            } else if (hasExistingSecurePrefsFile()) {
+                // Real encrypted prefs exist on disk but Keystore is locked: enter Read-Only Locked Mode
+                readOnlyLockedMode = true
+            }
+            return created
         }
-        return fallback
+    }
+
+    private fun getSecret(key: String): String {
+        val secure = getSecurePrefsOrNull()
+        if (secure != null) {
+            return secure.getString(key, "") ?: ""
+        }
+        if (isInReadOnlyLockedMode()) return ""
+        return inMemorySecretFallback[key] ?: ""
+    }
+
+    private fun setSecret(key: String, value: String) {
+        val trimmed = value.trim()
+        synchronized(prefsLock) {
+            val secure = getSecurePrefsOrNull()
+            if (secure != null) {
+                secure.edit().putString(key, trimmed).apply()
+                inMemorySecretFallback.remove(key)
+            } else if (!isInReadOnlyLockedMode() && !hasExistingSecurePrefsFile()) {
+                // Never write API keys or tokens to plaintext SharedPreferences; keep transient in memory only
+                inMemorySecretFallback[key] = trimmed
+            }
+        }
+    }
+
+    private fun getOperationalString(key: String, defaultValue: String): String {
+        val secure = getSecurePrefsOrNull()
+        if (secure != null) {
+            return secure.getString(key, defaultValue) ?: defaultValue
+        }
+        if (isInReadOnlyLockedMode()) return defaultValue
+        return operationalFallbackPrefs.getString(key, defaultValue) ?: defaultValue
+    }
+
+    private fun setOperationalString(key: String, value: String) {
+        synchronized(prefsLock) {
+            val secure = getSecurePrefsOrNull()
+            if (secure != null) {
+                secure.edit().putString(key, value.trim()).apply()
+            } else if (!isInReadOnlyLockedMode() && !hasExistingSecurePrefsFile()) {
+                operationalFallbackPrefs.edit().putString(key, value.trim()).apply()
+            }
+        }
+    }
+
+    private fun getOperationalBoolean(key: String, defaultValue: Boolean): Boolean {
+        val secure = getSecurePrefsOrNull()
+        if (secure != null) {
+            return secure.getBoolean(key, defaultValue)
+        }
+        if (isInReadOnlyLockedMode()) return defaultValue
+        return operationalFallbackPrefs.getBoolean(key, defaultValue)
+    }
+
+    private fun setOperationalBoolean(key: String, value: Boolean) {
+        synchronized(prefsLock) {
+            val secure = getSecurePrefsOrNull()
+            if (secure != null) {
+                secure.edit().putBoolean(key, value).apply()
+            } else if (!isInReadOnlyLockedMode() && !hasExistingSecurePrefsFile()) {
+                operationalFallbackPrefs.edit().putBoolean(key, value).apply()
+            }
+        }
     }
 
     var geminiApiKey: String
-        get() = prefs.getString("gemini_api_key", "") ?: ""
-        set(value) = prefs.edit().putString("gemini_api_key", value.trim()).apply()
+        get() = getSecret("gemini_api_key")
+        set(value) = setSecret("gemini_api_key", value)
 
     var groqApiKey: String
-        get() = prefs.getString("groq_api_key", "") ?: ""
-        set(value) = prefs.edit().putString("groq_api_key", value.trim()).apply()
+        get() = getSecret("groq_api_key")
+        set(value) = setSecret("groq_api_key", value)
 
     var deepSeekApiKey: String
-        get() = prefs.getString("deepseek_api_key", "") ?: ""
-        set(value) = prefs.edit().putString("deepseek_api_key", value.trim()).apply()
+        get() = getSecret("deepseek_api_key")
+        set(value) = setSecret("deepseek_api_key", value)
 
     var openRouterApiKey: String
-        get() = prefs.getString("openrouter_api_key", "") ?: ""
-        set(value) = prefs.edit().putString("openrouter_api_key", value.trim()).apply()
+        get() = getSecret("openrouter_api_key")
+        set(value) = setSecret("openrouter_api_key", value)
 
     var sosContactsCsv: String
-        get() = prefs.getString("sos_contacts", "") ?: ""
-        set(value) = prefs.edit().putString("sos_contacts", value.trim()).apply()
+        get() = getOperationalString("sos_contacts", "")
+        set(value) = setOperationalString("sos_contacts", value)
 
     var githubToken: String
-        get() = prefs.getString("github_token", "") ?: ""
-        set(value) = prefs.edit().putString("github_token", value.trim()).apply()
+        get() = getSecret("github_token")
+        set(value) = setSecret("github_token", value)
 
     var githubRepo: String
-        get() = prefs.getString("github_repo", "") ?: ""
-        set(value) = prefs.edit().putString("github_repo", value.trim()).apply()
+        get() = getOperationalString("github_repo", "")
+        set(value) = setOperationalString("github_repo", value)
 
     var telegramBotToken: String
-        get() = prefs.getString("telegram_bot_token", "") ?: ""
-        set(value) = prefs.edit().putString("telegram_bot_token", value.trim()).apply()
+        get() = getSecret("telegram_bot_token")
+        set(value) = setSecret("telegram_bot_token", value)
 
     var telegramChatId: String
-        get() = prefs.getString("telegram_chat_id", "") ?: ""
-        set(value) = prefs.edit().putString("telegram_chat_id", value.trim()).apply()
+        get() = getOperationalString("telegram_chat_id", "")
+        set(value) = setOperationalString("telegram_chat_id", value)
 
     var smartCallPolicy: String
-        get() = prefs.getString(
+        get() = getOperationalString(
             "smart_call_policy",
             "Delivery wala ho toh gate par rakhne bolna, bank ya loan wala ho toh politely mana kar dena."
-        ) ?: ""
-        set(value) = prefs.edit().putString("smart_call_policy", value.trim()).apply()
+        )
+        set(value) = setOperationalString("smart_call_policy", value)
 
     var smartCallEnabled: Boolean
-        get() = prefs.getBoolean("smart_call_enabled", false)
-        set(value) = prefs.edit().putBoolean("smart_call_enabled", value).apply()
+        get() = getOperationalBoolean("smart_call_enabled", false)
+        set(value) = setOperationalBoolean("smart_call_enabled", value)
 
     var dryRunMode: Boolean
-        get() = prefs.getBoolean("dry_run_mode", false)
-        set(value) = prefs.edit().putBoolean("dry_run_mode", value).apply()
+        get() = getOperationalBoolean("dry_run_mode", false)
+        set(value) = setOperationalBoolean("dry_run_mode", value)
 
     var autoAdSkipEnabled: Boolean
-        get() = prefs.getBoolean("auto_ad_skip", true)
-        set(value) = prefs.edit().putBoolean("auto_ad_skip", value).apply()
+        get() = getOperationalBoolean("auto_ad_skip", true)
+        set(value) = setOperationalBoolean("auto_ad_skip", value)
 
     var otpAutopilotEnabled: Boolean
-        get() = prefs.getBoolean("otp_autopilot", true)
-        set(value) = prefs.edit().putBoolean("otp_autopilot", value).apply()
+        get() = getOperationalBoolean("otp_autopilot", true)
+        set(value) = setOperationalBoolean("otp_autopilot", value)
 
     var mistakeBlockerEnabled: Boolean
-        get() = prefs.getBoolean("mistake_blocker", true)
-        set(value) = prefs.edit().putBoolean("mistake_blocker", value).apply()
+        get() = getOperationalBoolean("mistake_blocker", true)
+        set(value) = setOperationalBoolean("mistake_blocker", value)
 
     var workFocusMode: Boolean
-        get() = prefs.getBoolean("work_focus_mode", false)
-        set(value) = prefs.edit().putBoolean("work_focus_mode", value).apply()
+        get() = getOperationalBoolean("work_focus_mode", false)
+        set(value) = setOperationalBoolean("work_focus_mode", value)
 
     var localModelPath: String
         get() {
-            val saved = prefs.getString("local_model_path", null)?.trim().orEmpty()
+            val saved = getOperationalString("local_model_path", "").trim()
             return if (saved.isBlank() || saved.endsWith("goku-4bit.gguf", ignoreCase = true)) {
                 defaultTaskModelPath
             } else {
                 saved
             }
         }
-        set(value) = prefs.edit().putString("local_model_path", value.trim()).apply()
+        set(value) = setOperationalString("local_model_path", value)
 
     fun getSosContactsList(): List<String> {
         return sosContactsCsv.split(",", ";", "\n")
             .map { it.trim() }
             .filter { it.length >= 6 }
     }
+
+    /**
+     * Batches all 17 encrypted & operational setting writes into a single SharedPreferences.Editor
+     * transaction, avoiding 17 separate disk apply() operations while preserving in-memory secret
+     * isolation whenever Android Keystore is temporarily unavailable.
+     */
+    fun batchUpdate(
+        geminiKey: String = this.geminiApiKey,
+        groqKey: String = this.groqApiKey,
+        deepSeekKey: String = this.deepSeekApiKey,
+        openRouterKey: String = this.openRouterApiKey,
+        sosContacts: String = this.sosContactsCsv,
+        githubRepo: String = this.githubRepo,
+        githubToken: String = this.githubToken,
+        telegramBot: String = this.telegramBotToken,
+        telegramChatId: String = this.telegramChatId,
+        smartCallPolicy: String = this.smartCallPolicy,
+        smartCallEnabled: Boolean = this.smartCallEnabled,
+        dryRunMode: Boolean = this.dryRunMode,
+        autoAdSkip: Boolean = this.autoAdSkipEnabled,
+        otpAutopilot: Boolean = this.otpAutopilotEnabled,
+        mistakeBlocker: Boolean = this.mistakeBlockerEnabled,
+        workFocusMode: Boolean = this.workFocusMode,
+        localModelPath: String = this.localModelPath
+    ) {
+        synchronized(prefsLock) {
+            val secure = getSecurePrefsOrNull()
+            if (secure == null && (isInReadOnlyLockedMode() || hasExistingSecurePrefsFile())) {
+                // Direct Boot / locked Keystore: never write fallback prefs that could overwrite real encrypted settings on unlock
+                return
+            }
+            val prefs = secure ?: operationalFallbackPrefs
+            prefs.edit().apply {
+                if (secure != null) {
+                    putString("gemini_api_key", geminiKey.trim())
+                    putString("groq_api_key", groqKey.trim())
+                    putString("deepseek_api_key", deepSeekKey.trim())
+                    putString("openrouter_api_key", openRouterKey.trim())
+                    putString("github_token", githubToken.trim())
+                    putString("telegram_bot_token", telegramBot.trim())
+                    inMemorySecretFallback.clear()
+                } else {
+                    inMemorySecretFallback["gemini_api_key"] = geminiKey.trim()
+                    inMemorySecretFallback["groq_api_key"] = groqKey.trim()
+                    inMemorySecretFallback["deepseek_api_key"] = deepSeekKey.trim()
+                    inMemorySecretFallback["openrouter_api_key"] = openRouterKey.trim()
+                    inMemorySecretFallback["github_token"] = githubToken.trim()
+                    inMemorySecretFallback["telegram_bot_token"] = telegramBot.trim()
+                }
+                putString("sos_contacts", sosContacts.trim())
+                putString("github_repo", githubRepo.trim())
+                putString("telegram_chat_id", telegramChatId.trim())
+                putString("smart_call_policy", smartCallPolicy.trim())
+                putBoolean("smart_call_enabled", smartCallEnabled)
+                putBoolean("dry_run_mode", dryRunMode)
+                putBoolean("auto_ad_skip", autoAdSkip)
+                putBoolean("otp_autopilot", otpAutopilot)
+                putBoolean("mistake_blocker", mistakeBlocker)
+                putBoolean("work_focus_mode", workFocusMode)
+                putString("local_model_path", localModelPath.trim())
+                apply()
+            }
+        }
+    }
 }
 
 class GokuVaultRepository(context: Context) {
     private val db = GokuDatabase.getInstance(context)
+    private val memoryWriteMutex = Mutex()
+    private val skillWriteMutex = Mutex()
     val settings = GokuEncryptedSettings(context)
     val workingMemory = ShortTermWorkingMemory()
     val ragBrain = LocalRagDocumentBrain(
@@ -1052,14 +1336,16 @@ class GokuVaultRepository(context: Context) {
         category: String = "FACT",
         relationTag: String = ""
     ) = withContext(Dispatchers.IO) {
-        val existing = db.memoryNodeDao().findByKey(key)
-        val node = if (existing != null) {
-            existing.copy(value = value, category = category, relationTag = relationTag, updatedAt = System.currentTimeMillis())
-        } else {
-            MemoryNodeEntity(key = key, value = value, category = category, relationTag = relationTag)
+        memoryWriteMutex.withLock {
+            val existing = db.memoryNodeDao().findByKey(key)
+            val node = if (existing != null) {
+                existing.copy(value = value, category = category, relationTag = relationTag, updatedAt = System.currentTimeMillis())
+            } else {
+                MemoryNodeEntity(key = key, value = value, category = category, relationTag = relationTag)
+            }
+            db.memoryNodeDao().upsert(node)
+            ragBrain.indexDocumentPersistent("memory:${node.key}", "${node.key}: $value ($relationTag)")
         }
-        db.memoryNodeDao().upsert(node)
-        ragBrain.indexDocumentPersistent("memory:${node.key}", "${node.key}: $value ($relationTag)")
     }
 
     suspend fun searchMemories(query: String): List<MemoryNodeEntity> = withContext(Dispatchers.IO) {
@@ -1088,12 +1374,12 @@ class GokuVaultRepository(context: Context) {
     }
 
     suspend fun deleteMemory(id: Long) = withContext(Dispatchers.IO) {
-        val existing = db.memoryNodeDao().findById(id)
-        db.memoryNodeDao().deleteById(id)
-        if (existing != null) {
-            val docName = "memory:${existing.key}"
-            ragBrain.removeDocument(docName)
-            runCatching { db.ragDocumentDao().deleteByDocName(docName) }
+        memoryWriteMutex.withLock {
+            val existing = db.memoryNodeDao().findById(id)
+            db.memoryNodeDao().deleteById(id)
+            if (existing != null) {
+                ragBrain.removeDocumentPersistent("memory:${existing.key}")
+            }
         }
     }
 
@@ -1127,32 +1413,44 @@ class GokuVaultRepository(context: Context) {
     suspend fun compactOldTimelineEntries(): Int = withContext(Dispatchers.IO) {
         val sevenDaysAgo = System.currentTimeMillis() - 7L * 24L * 60L * 60L * 1000L
         val thirtyDaysAgo = System.currentTimeMillis() - 30L * 24L * 60L * 60L * 1000L
-        val old = db.screenTimelineDao().findUnsummarizedOlderThan(sevenDaysAgo)
-        old.forEach { entry ->
-            val text = TextCompressor.decompress(entry.compressedText)
-            val compactSummary = text.take(180)
-            db.screenTimelineDao().update(
-                entry.copy(
-                    compressedText = TextCompressor.compress(compactSummary),
-                    summary = compactSummary,
-                    isSummarized = true
+        var totalCompacted = 0
+        var batches = 0
+        while (batches < MAX_TIMELINE_COMPACT_BATCHES) {
+            val old = db.screenTimelineDao().findUnsummarizedOlderThan(sevenDaysAgo)
+            if (old.isEmpty()) break
+            old.forEach { entry ->
+                val text = TextCompressor.decompress(entry.compressedText)
+                val compactSummary = text.take(180)
+                db.screenTimelineDao().update(
+                    entry.copy(
+                        compressedText = TextCompressor.compress(compactSummary),
+                        summary = compactSummary,
+                        isSummarized = true
+                    )
                 )
-            )
+            }
+            totalCompacted += old.size
+            batches++
+            if (old.size < 200) break
         }
         val purged = db.screenTimelineDao().purgeOldSummarized(thirtyDaysAgo)
-        old.size + purged
+        totalCompacted + purged
     }
 
     suspend fun upsertSkill(skill: LearnedSkillEntity): Long = withContext(Dispatchers.IO) {
-        db.learnedSkillDao().upsert(skill)
+        skillWriteMutex.withLock {
+            db.learnedSkillDao().upsert(skill)
+        }
     }
 
     suspend fun findMatchingSkill(input: String): LearnedSkillEntity? = withContext(Dispatchers.IO) {
         val lower = input.lowercase(Locale.ROOT).trim()
+        if (lower.isEmpty()) return@withContext null
         val exact = db.learnedSkillDao().findByTrigger(lower)
         if (exact != null) return@withContext exact
         db.learnedSkillDao().getAllSnapshot().firstOrNull {
-            lower.contains(it.triggerPhrase.lowercase(Locale.ROOT))
+            val trigger = it.triggerPhrase.lowercase(Locale.ROOT).trim()
+            trigger.isNotEmpty() && lower.contains(trigger)
         }
     }
 
@@ -1162,32 +1460,47 @@ class GokuVaultRepository(context: Context) {
         latencyMs: Long,
         succeeded: Boolean
     ) = withContext(Dispatchers.IO) {
-        val updated = if (usedAdb) {
-            val newAvg = ((skill.adbAvgMs * 3) + latencyMs) / 4
-            val newRate = (skill.adbSuccessRate * 0.8f) + (if (succeeded) 0.2f else 0f)
-            skill.copy(
-                adbAvgMs = newAvg,
-                adbSuccessRate = newRate,
-                preferredEngine = if (newRate >= skill.a11ySuccessRate && newAvg <= skill.a11yAvgMs) "INTENT_ADB" else "ACCESSIBILITY",
-                usageCount = skill.usageCount + 1,
-                updatedAt = System.currentTimeMillis()
-            )
-        } else {
-            val newAvg = ((skill.a11yAvgMs * 3) + latencyMs) / 4
-            val newRate = (skill.a11ySuccessRate * 0.8f) + (if (succeeded) 0.2f else 0f)
-            skill.copy(
-                a11yAvgMs = newAvg,
-                a11ySuccessRate = newRate,
-                preferredEngine = if (skill.adbSuccessRate >= newRate && skill.adbAvgMs <= newAvg) "INTENT_ADB" else "ACCESSIBILITY",
-                usageCount = skill.usageCount + 1,
-                updatedAt = System.currentTimeMillis()
-            )
+        skillWriteMutex.withLock {
+            val latest = db.learnedSkillDao().findByTrigger(skill.triggerPhrase) ?: skill
+            val updated = if (usedAdb) {
+                val newAvg = ((latest.adbAvgMs * 3) + latencyMs) / 4
+                val newRate = (latest.adbSuccessRate * 0.8f) + (if (succeeded) 0.2f else 0f)
+                val nextPreferred = if (succeeded) {
+                    if (newRate >= latest.a11ySuccessRate && newAvg <= latest.a11yAvgMs) "INTENT_ADB" else "ACCESSIBILITY"
+                } else {
+                    latest.preferredEngine
+                }
+                latest.copy(
+                    adbAvgMs = newAvg,
+                    adbSuccessRate = newRate,
+                    preferredEngine = nextPreferred,
+                    usageCount = latest.usageCount + 1,
+                    updatedAt = System.currentTimeMillis()
+                )
+            } else {
+                val newAvg = ((latest.a11yAvgMs * 3) + latencyMs) / 4
+                val newRate = (latest.a11ySuccessRate * 0.8f) + (if (succeeded) 0.2f else 0f)
+                val nextPreferred = if (succeeded) {
+                    if (latest.adbSuccessRate >= newRate && latest.adbAvgMs <= newAvg) "INTENT_ADB" else "ACCESSIBILITY"
+                } else {
+                    latest.preferredEngine
+                }
+                latest.copy(
+                    a11yAvgMs = newAvg,
+                    a11ySuccessRate = newRate,
+                    preferredEngine = nextPreferred,
+                    usageCount = latest.usageCount + 1,
+                    updatedAt = System.currentTimeMillis()
+                )
+            }
+            db.learnedSkillDao().upsert(updated)
         }
-        db.learnedSkillDao().upsert(updated)
     }
 
     suspend fun deleteSkill(id: Long) = withContext(Dispatchers.IO) {
-        db.learnedSkillDao().deleteById(id)
+        skillWriteMutex.withLock {
+            db.learnedSkillDao().deleteById(id)
+        }
     }
 
     /**
@@ -1234,38 +1547,47 @@ class GokuVaultRepository(context: Context) {
         }
 
         val freqKey = "pattern:$normalizedTrigger"
-        val existingNode = db.memoryNodeDao().findByKey(freqKey)
-        val newCount = (existingNode?.value?.toIntOrNull() ?: 0) + 1
-        db.memoryNodeDao().upsert(
-            (existingNode ?: MemoryNodeEntity(key = freqKey, value = "1", category = "PATTERN_FREQ"))
-                .copy(
-                    value = newCount.toString(),
-                    category = "PATTERN_FREQ",
-                    relationTag = skillDisplayName.take(60),
+        return@withContext skillWriteMutex.withLock {
+            if (db.learnedSkillDao().findByTrigger(normalizedTrigger) != null) {
+                return@withLock null
+            }
+            val existingNode = memoryWriteMutex.withLock {
+                val cur = db.memoryNodeDao().findByKey(freqKey)
+                val nextCount = (cur?.value?.toIntOrNull() ?: 0) + 1
+                db.memoryNodeDao().upsert(
+                    (cur ?: MemoryNodeEntity(key = freqKey, value = "1", category = "PATTERN_FREQ"))
+                        .copy(
+                            value = nextCount.toString(),
+                            category = "PATTERN_FREQ",
+                            relationTag = skillDisplayName.take(60),
+                            updatedAt = System.currentTimeMillis()
+                        )
+                )
+                nextCount
+            }
+
+            if (existingNode >= AUTO_COMPILE_THRESHOLD) {
+                val compiledSkill = LearnedSkillEntity(
+                    name = "Auto: ${skillDisplayName.take(48)}",
+                    triggerPhrase = normalizedTrigger,
+                    stepsJson = stepsJson,
+                    preferredEngine = "INTENT_ADB",
+                    usageCount = existingNode,
                     updatedAt = System.currentTimeMillis()
                 )
-        )
-
-        if (newCount >= AUTO_COMPILE_THRESHOLD) {
-            val compiledSkill = LearnedSkillEntity(
-                name = "Auto: ${skillDisplayName.take(48)}",
-                triggerPhrase = normalizedTrigger,
-                stepsJson = stepsJson,
-                preferredEngine = "INTENT_ADB",
-                usageCount = newCount,
-                updatedAt = System.currentTimeMillis()
-            )
-            val newId = db.learnedSkillDao().upsert(compiledSkill)
-            logAction(
-                stage = "PLANNER",
-                command = "Auto-Shortcut Compiled!",
-                detail = "Compiled '${compiledSkill.name}' (trigger='$normalizedTrigger') after ${newCount}x repeats",
-                confidence = 99,
-                status = "OK"
-            )
-            return@withContext compiledSkill.copy(id = newId)
+                val newId = db.learnedSkillDao().upsert(compiledSkill)
+                logAction(
+                    stage = "PLANNER",
+                    command = "Auto-Shortcut Compiled!",
+                    detail = "Compiled '${compiledSkill.name}' (trigger='$normalizedTrigger') after ${existingNode}x repeats",
+                    confidence = 99,
+                    status = "OK"
+                )
+                compiledSkill.copy(id = newId)
+            } else {
+                null
+            }
         }
-        null
     }
 
     suspend fun exportAllSkillsToGokuJson(): String = withContext(Dispatchers.IO) {
@@ -1299,28 +1621,30 @@ class GokuVaultRepository(context: Context) {
         }
         var imported = 0
         val seenTriggers = HashSet<String>()
-        for (i in 0 until arr.length()) {
-            val obj = arr.optJSONObject(i) ?: continue
-            val name = obj.optString("name", "Imported Skill ${i + 1}").trim().ifBlank { "Imported Skill ${i + 1}" }
-            val trigger = obj.optString("triggerPhrase", "").trim()
-            val steps = obj.optString("stepsJson", "[]")
-            val normTrigger = trigger.lowercase(Locale.ROOT)
-            if (trigger.isNotEmpty() && seenTriggers.add(normTrigger)) {
-                val existing = db.learnedSkillDao().findByTrigger(trigger)
-                db.learnedSkillDao().upsert(
-                    LearnedSkillEntity(
-                        id = existing?.id ?: 0L,
-                        name = name,
-                        triggerPhrase = trigger,
-                        stepsJson = steps,
-                        preferredEngine = obj.optString("preferredEngine", existing?.preferredEngine ?: "INTENT_ADB"),
-                        adbAvgMs = obj.optLong("adbAvgMs", existing?.adbAvgMs ?: 150L),
-                        adbSuccessRate = obj.optDouble("adbSuccessRate", existing?.adbSuccessRate?.toDouble() ?: 0.95).toFloat(),
-                        a11yAvgMs = obj.optLong("a11yAvgMs", existing?.a11yAvgMs ?: 420L),
-                        a11ySuccessRate = obj.optDouble("a11ySuccessRate", existing?.a11ySuccessRate?.toDouble() ?: 0.90).toFloat()
+        skillWriteMutex.withLock {
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val name = obj.optString("name", "Imported Skill ${i + 1}").trim().ifBlank { "Imported Skill ${i + 1}" }
+                val trigger = obj.optString("triggerPhrase", "").trim()
+                val steps = obj.optString("stepsJson", "[]")
+                val normTrigger = trigger.lowercase(Locale.ROOT)
+                if (trigger.isNotEmpty() && seenTriggers.add(normTrigger)) {
+                    val existing = db.learnedSkillDao().findByTrigger(trigger)
+                    db.learnedSkillDao().upsert(
+                        LearnedSkillEntity(
+                            id = existing?.id ?: 0L,
+                            name = name,
+                            triggerPhrase = trigger,
+                            stepsJson = steps,
+                            preferredEngine = obj.optString("preferredEngine", existing?.preferredEngine ?: "INTENT_ADB"),
+                            adbAvgMs = obj.optLong("adbAvgMs", existing?.adbAvgMs ?: 150L),
+                            adbSuccessRate = obj.optDouble("adbSuccessRate", existing?.adbSuccessRate?.toDouble() ?: 0.95).toFloat(),
+                            a11yAvgMs = obj.optLong("a11yAvgMs", existing?.a11yAvgMs ?: 420L),
+                            a11ySuccessRate = obj.optDouble("a11ySuccessRate", existing?.a11ySuccessRate?.toDouble() ?: 0.90).toFloat()
+                        )
                     )
-                )
-                imported++
+                    imported++
+                }
             }
         }
         imported
@@ -1390,6 +1714,7 @@ class GokuVaultRepository(context: Context) {
 
     companion object {
         private const val AUTO_COMPILE_THRESHOLD = 3
+        private const val MAX_TIMELINE_COMPACT_BATCHES = 50
 
         @Volatile
         private var INSTANCE: GokuVaultRepository? = null
