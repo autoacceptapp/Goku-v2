@@ -7,12 +7,14 @@ import android.content.Context
 import android.content.res.Resources
 import android.graphics.Path
 import android.graphics.Rect
+import android.net.http.SslError
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.webkit.SslErrorHandler
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -24,6 +26,7 @@ import com.goku.ai.voice.GokuKillSwitch
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,6 +38,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 
 // ============================================================================
@@ -54,6 +58,15 @@ object OtpBus {
             _latestOtp.value = digits
             otpTimestamp = System.currentTimeMillis()
         }
+    }
+
+    fun peekFreshOtp(maxAgeMs: Long = 120_000L): String? {
+        val current = _latestOtp.value ?: return null
+        if (System.currentTimeMillis() - otpTimestamp > maxAgeMs) {
+            _latestOtp.value = null
+            return null
+        }
+        return current
     }
 
     fun consumeFreshOtp(maxAgeMs: Long = 120_000L): String? {
@@ -412,10 +425,14 @@ class HeadlessWebAutomationWorker(private val context: Context) {
                         return@suspendCancellableCoroutine
                     }
 
+                    val mainHandler = Handler(Looper.getMainLooper())
+                    var pendingPostLoadRunnable: Runnable? = null
                     var finished = false
                     fun finishWith(res: Result<String>) {
                         if (finished) return
                         finished = true
+                        pendingPostLoadRunnable?.let { mainHandler.removeCallbacks(it) }
+                        pendingPostLoadRunnable = null
                         runCatching {
                             webView.stopLoading()
                             webView.loadUrl("about:blank")
@@ -435,11 +452,39 @@ class HeadlessWebAutomationWorker(private val context: Context) {
                     webView.webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                             if (finished || loadedUrl == "about:blank") return
-                            Handler(Looper.getMainLooper()).postDelayed({
+                            pendingPostLoadRunnable?.let { mainHandler.removeCallbacks(it) }
+                            val r = Runnable {
                                 if (!finished && view != null) {
                                     onLoaded(view) { res -> finishWith(res) }
                                 }
-                            }, 550L)
+                            }
+                            pendingPostLoadRunnable = r
+                            mainHandler.postDelayed(r, 550L)
+                        }
+
+                        override fun shouldOverrideUrlLoading(
+                            view: WebView?,
+                            request: WebResourceRequest?
+                        ): Boolean {
+                            val redirectUrl = request?.url?.toString().orEmpty()
+                            if (!redirectUrl.startsWith("https://", ignoreCase = true)) {
+                                finishWith(Result.failure(IllegalArgumentException("Blocked non-HTTPS redirect")))
+                                return true
+                            }
+                            return false
+                        }
+
+                        override fun onReceivedSslError(
+                            view: WebView?,
+                            handler: SslErrorHandler?,
+                            error: SslError?
+                        ) {
+                            handler?.cancel()
+                            finishWith(
+                                Result.failure(
+                                    IllegalStateException("SSL error: ${error?.primaryError ?: "untrusted"}")
+                                )
+                            )
                         }
 
                         override fun onReceivedError(
@@ -454,9 +499,13 @@ class HeadlessWebAutomationWorker(private val context: Context) {
                     }
 
                     cont.invokeOnCancellation {
-                        Handler(Looper.getMainLooper()).post {
+                        mainHandler.post {
+                            finished = true
+                            pendingPostLoadRunnable?.let { mainHandler.removeCallbacks(it) }
+                            pendingPostLoadRunnable = null
                             runCatching {
                                 webView.stopLoading()
+                                webView.loadUrl("about:blank")
                                 webView.destroy()
                             }
                         }
@@ -550,8 +599,8 @@ class GokuAccessibilityService : AccessibilityService() {
                 }
 
                 // 2. SMS OTP Autopilot Auto-Fill
-                if (vault.settings.otpAutopilotEnabled && OtpBus.latestOtp.value != null) {
-                    tryAutoFillOtp(root)
+                if (vault.settings.otpAutopilotEnabled && OtpBus.peekFreshOtp() != null) {
+                    tryAutoFillOtp(root, pkg)
                 }
 
                 // 3. Event-Driven Visual Memory + Mistake Blocker (throttled to every 4 seconds)
@@ -587,6 +636,7 @@ class GokuAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         if (instance === this) instance = null
         _isConnected.value = false
+        serviceScope.cancel()
         super.onDestroy()
     }
 
@@ -620,18 +670,24 @@ class GokuAccessibilityService : AccessibilityService() {
         return false
     }
 
-    private fun tryAutoFillOtp(root: AccessibilityNodeInfo): Boolean {
+    private fun tryAutoFillOtp(root: AccessibilityNodeInfo, pkg: String): Boolean {
+        if (pkg == packageName || SafeAdSkipGuard.isProtectedPackage(pkg)) return false
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
         val candidate = focused ?: findFirstOtpEditText(root) ?: return false
+        if (!candidate.isEditable || candidate.isPassword) return false
         val hint = ((candidate.hintText?.toString() ?: "") + " " +
             (candidate.viewIdResourceName ?: "") + " " +
             (candidate.contentDescription?.toString() ?: "")).lowercase(Locale.ROOT)
-        if (hint.contains("otp") || hint.contains("code") || hint.contains("verify") || hint.contains("pin")) {
-            val otp = OtpBus.consumeFreshOtp() ?: return false
+        if (hint.contains("otp") || hint.contains("code") || hint.contains("verify")) {
+            val otp = OtpBus.peekFreshOtp() ?: return false
             val args = Bundle().apply {
                 putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, otp)
             }
-            return candidate.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            val applied = candidate.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            if (applied) {
+                OtpBus.consumeFreshOtp()
+            }
+            return applied
         }
         return false
     }
@@ -643,7 +699,7 @@ class GokuAccessibilityService : AccessibilityService() {
         while (queue.isNotEmpty() && visited < 80) {
             visited++
             val node = queue.removeFirst()
-            if (node.isEditable) {
+            if (node.isEditable && !node.isPassword) {
                 val meta = ((node.hintText?.toString() ?: "") + " " + (node.viewIdResourceName ?: ""))
                     .lowercase(Locale.ROOT)
                 if (meta.contains("otp") || meta.contains("code") || meta.contains("verify")) {
@@ -706,8 +762,12 @@ class GokuAccessibilityService : AccessibilityService() {
             if (clickNodeOrParent(matched)) return true
             val bounds = Rect()
             matched.getBoundsInScreen(bounds)
-            if (!bounds.isEmpty) {
-                return performTap(bounds.exactCenterX(), bounds.exactCenterY())
+            val cx = bounds.exactCenterX()
+            val cy = bounds.exactCenterY()
+            val maxW = dm.widthPixels.coerceAtLeast(1).toFloat()
+            val maxH = dm.heightPixels.coerceAtLeast(1).toFloat()
+            if (!bounds.isEmpty && cx in 0f..maxW && cy in 0f..maxH) {
+                return performTap(cx, cy)
             }
         }
         return false
@@ -744,12 +804,27 @@ class GokuAccessibilityService : AccessibilityService() {
     }
 
     fun performTap(x: Float, y: Float): Boolean {
+        val dm = Resources.getSystem().displayMetrics
+        val maxW = dm.widthPixels.coerceAtLeast(1).toFloat()
+        val maxH = dm.heightPixels.coerceAtLeast(1).toFloat()
+        if (!x.isFinite() || !y.isFinite() || x < 0f || y < 0f || x > maxW || y > maxH) {
+            return false
+        }
         val path = Path().apply { moveTo(x, y) }
         val stroke = GestureDescription.StrokeDescription(path, 0L, 60L)
         return dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
     }
 
     fun performSwipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long = 260L): Boolean {
+        val dm = Resources.getSystem().displayMetrics
+        val maxW = dm.widthPixels.coerceAtLeast(1).toFloat()
+        val maxH = dm.heightPixels.coerceAtLeast(1).toFloat()
+        if (!x1.isFinite() || !y1.isFinite() || !x2.isFinite() || !y2.isFinite() ||
+            x1 < 0f || y1 < 0f || x2 < 0f || y2 < 0f ||
+            x1 > maxW || y1 > maxH || x2 > maxW || y2 > maxH
+        ) {
+            return false
+        }
         val path = Path().apply {
             moveTo(x1, y1)
             lineTo(x2, y2)
@@ -833,7 +908,7 @@ class UniversalAppPilot(
     private val context: Context,
     private val adbEngine: LocalAdbEngine
 ) {
-    private var consecutiveFailures = 0
+    private val consecutiveFailures = AtomicInteger(0)
     val headlessWebWorker: HeadlessWebAutomationWorker by lazy {
         HeadlessWebAutomationWorker(context.applicationContext)
     }
@@ -861,7 +936,7 @@ class UniversalAppPilot(
         if (a11y != null) {
             val ok = a11y.findAndTapNode(target)
             if (ok) {
-                consecutiveFailures = 0
+                consecutiveFailures.set(0)
                 return true to "Tapped '$target' via AccessibilityService"
             }
         }
@@ -871,19 +946,19 @@ class UniversalAppPilot(
             if (!adbEngine.useAccessibilityFallback.value) {
                 val res = adbEngine.dispatchAdbTap(coords[0], coords[1])
                 if (res.success) {
-                    consecutiveFailures = 0
+                    consecutiveFailures.set(0)
                     return true to "Tapped (${coords[0]}, ${coords[1]}) via Local ADB"
                 }
             }
             if (a11y != null && a11y.performTap(coords[0].toFloat(), coords[1].toFloat())) {
-                consecutiveFailures = 0
+                consecutiveFailures.set(0)
                 return true to "Tapped (${coords[0]}, ${coords[1]}) via Spatial Gesture"
             }
         }
-        consecutiveFailures++
-        if (consecutiveFailures >= 3) {
-            consecutiveFailures = 0
-            return false to "Loop-Breaker triggered after 3 retries for '$target'; switched strategy."
+        if (consecutiveFailures.incrementAndGet() >= 3) {
+            consecutiveFailures.set(0)
+            scrollDown()
+            return false to "Loop-Breaker triggered after 3 retries for '$target'; scrolled and switched strategy."
         }
         return false to "Could not locate '$target' on active screen."
     }
@@ -902,12 +977,18 @@ class UniversalAppPilot(
     }
 
     suspend fun scrollDown(): Boolean {
+        val dm = Resources.getSystem().displayMetrics
+        val w = dm.widthPixels.coerceAtLeast(720).toFloat()
+        val h = dm.heightPixels.coerceAtLeast(1280).toFloat()
+        val cx = w * 0.5f
+        val y1 = h * 0.72f
+        val y2 = h * 0.25f
         val a11y = GokuAccessibilityService.instance
         if (a11y != null) {
-            return a11y.performSwipe(540f, 1650f, 540f, 550f, 280L)
+            return a11y.performSwipe(cx, y1, cx, y2, 280L)
         }
         if (!adbEngine.useAccessibilityFallback.value) {
-            return adbEngine.dispatchAdbSwipe(540, 1650, 540, 550, 280).success
+            return adbEngine.dispatchAdbSwipe(cx.toInt(), y1.toInt(), cx.toInt(), y2.toInt(), 280).success
         }
         return false
     }
@@ -975,13 +1056,33 @@ class UniversalAppPilot(
                 "adb_shell" -> {
                     val res = adbEngine.execShellCommand(target)
                     log.append("Step ${i + 1} [ADB]: ${res.output}\n")
+                    if (!res.success) return false to log.toString().trim()
                 }
                 "open_app" -> {
-                    val launch = context.packageManager.getLaunchIntentForPackage(target)
+                    var resolvedLabel = target
+                    var launch = context.packageManager.getLaunchIntentForPackage(target)
+                    if (launch == null) {
+                        val low = target.lowercase(Locale.ROOT).trim()
+                        if (low.isNotEmpty()) {
+                            val apps = adbEngine.discoverInstalledApps()
+                            val match = apps.firstOrNull { it.first.lowercase(Locale.ROOT).trim() == low }
+                                ?: apps.firstOrNull {
+                                    it.first.lowercase(Locale.ROOT).contains(low) ||
+                                        it.second.lowercase(Locale.ROOT).contains(low)
+                                }
+                            if (match != null) {
+                                resolvedLabel = "${match.first} (${match.second})"
+                                launch = context.packageManager.getLaunchIntentForPackage(match.second)
+                            }
+                        }
+                    }
                     if (launch != null) {
                         launch.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                         context.startActivity(launch)
-                        log.append("Step ${i + 1}: Opened $target\n")
+                        log.append("Step ${i + 1}: Opened $resolvedLabel\n")
+                    } else {
+                        log.append("Step ${i + 1}: App '$target' not found\n")
+                        return false to log.toString().trim()
                     }
                 }
             }

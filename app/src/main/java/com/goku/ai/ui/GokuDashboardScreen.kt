@@ -1,8 +1,13 @@
 package com.goku.ai.ui
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -42,6 +47,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -106,6 +112,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -157,6 +164,8 @@ import com.google.mlkit.vision.common.InputImage
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 // ============================================================================
 // 1. JARVIS CYBERPUNK DARK DESIGN SYSTEM & CUSTOM GOOGLE FONTS
@@ -440,8 +449,13 @@ fun GokuDashboardScreen(
     }
 
     if (showLiveEyeDialog) {
+        val context = LocalContext.current
+        val hasCameraPermission = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
         CameraLiveEyeDialog(
-            hasCameraPermission = uiState.permissionStatus.runtimePermissionsGranted,
+            hasCameraPermission = hasCameraPermission,
             onRequestPermissions = callbacks.onRequestRuntimePermissions,
             onDismiss = { showLiveEyeDialog = false },
             onTextExtracted = { text ->
@@ -497,7 +511,8 @@ private fun CoreCommandTab(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(top = 36.dp, start = 16.dp, end = 16.dp, bottom = 8.dp)
+            .statusBarsPadding()
+            .padding(top = 12.dp, start = 16.dp, end = 16.dp, bottom = 8.dp)
     ) {
         // Top Header & Telemetry Bar
         Row(
@@ -684,40 +699,65 @@ private fun CoreCommandTab(
 
         Spacer(Modifier.height(6.dp))
 
-        // Compact 24x7 Ear Wake-Word Engine Status Chip
-        val isSherpaNative = uiState.voiceState.kwsEngineBackend.contains("Sherpa-ONNX Native", ignoreCase = true)
+        // Compact 24x7 Ear Wake-Word Engine Status Chip (Native Sherpa-ONNX vs Hybrid VAD Clarity)
+        val isSherpaNative = uiState.voiceState.isNativeKwsActive ||
+            uiState.voiceState.kwsEngineBackend.contains("Sherpa-ONNX Native", ignoreCase = true)
+        val missingParts = buildList {
+            if (!uiState.voiceState.isSherpaAarPresent) add("app/libs/sherpa-onnx-android.aar")
+            if (!uiState.voiceState.hasKwsOnnxModels) add("files/models/kws/*.onnx")
+        }
         Surface(
             color = GokuSurfaceDark,
             shape = RoundedCornerShape(12.dp),
             border = BorderStroke(
                 1.dp,
-                if (isSherpaNative) GokuEmerald.copy(alpha = 0.65f) else GokuCyan.copy(alpha = 0.35f)
+                if (isSherpaNative) GokuEmerald.copy(alpha = 0.65f) else GokuAmber.copy(alpha = 0.55f)
             ),
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("ear_kws_status_chip")
         ) {
             Row(
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
                     imageVector = Icons.Filled.Mic,
                     contentDescription = "24x7 Wake Word Ear Status",
-                    tint = if (isSherpaNative) GokuEmerald else GokuCyan,
-                    modifier = Modifier.size(14.dp)
+                    tint = if (isSherpaNative) GokuEmerald else GokuAmber,
+                    modifier = Modifier.size(16.dp)
                 )
+                Spacer(Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (isSherpaNative) {
+                            "24x7 Ear: Sherpa-ONNX Native KWS Active"
+                        } else {
+                            "24x7 Ear: Acoustic VAD + SpeechRecognizer Hybrid"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = GokuTextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (!isSherpaNative) {
+                        Text(
+                            text = if (missingParts.isNotEmpty()) {
+                                "Native KWS inactive (${missingParts.joinToString(" & ")} absent)"
+                            } else {
+                                "Hybrid VAD fallback active instead of native KWS"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = GokuTextMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
                 Spacer(Modifier.width(6.dp))
-                Text(
-                    text = if (isSherpaNative) {
-                        "24x7 Ear: Sherpa-ONNX Native KWS Active"
-                    } else {
-                        "24x7 Ear: Acoustic VAD Ready (Drop .onnx in models/kws for Sherpa)"
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = GokuTextPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                TelemetryPill(
+                    text = if (isSherpaNative) "NATIVE KWS" else "HYBRID VAD",
+                    color = if (isSherpaNative) GokuEmerald else GokuAmber
                 )
             }
         }
@@ -1086,7 +1126,8 @@ private fun SetupWizardTab(
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .padding(top = 36.dp, start = 16.dp, end = 16.dp),
+            .statusBarsPadding()
+            .padding(top = 12.dp, start = 16.dp, end = 16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
         contentPadding = PaddingValues(bottom = 24.dp)
     ) {
@@ -1274,7 +1315,8 @@ private fun GokuStudioDebuggerTab(
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .padding(top = 36.dp, start = 16.dp, end = 16.dp),
+            .statusBarsPadding()
+            .padding(top = 12.dp, start = 16.dp, end = 16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
         contentPadding = PaddingValues(bottom = 24.dp)
     ) {
@@ -1397,7 +1439,7 @@ private fun GokuStudioDebuggerTab(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text("Financial & Bill Guardian", style = MaterialTheme.typography.titleMedium, color = GokuAmber)
-                        Text("₹${"%.0f".format(totalSpent)}", style = MaterialTheme.typography.titleMedium, color = GokuEmerald)
+                        Text("₹${"%.0f".format(Locale.US, totalSpent)}", style = MaterialTheme.typography.titleMedium, color = GokuEmerald)
                     }
                     Spacer(Modifier.height(4.dp))
                     if (uiState.expenses.isEmpty()) {
@@ -1409,7 +1451,7 @@ private fun GokuStudioDebuggerTab(
                     } else {
                         uiState.expenses.take(4).forEach { exp ->
                             Text(
-                                "• ${exp.category}: ₹${"%.0f".format(exp.amountInr)} @ ${exp.merchant}",
+                                "• ${exp.category}: ₹${"%.0f".format(Locale.US, exp.amountInr)} @ ${exp.merchant}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = GokuTextPrimary
                             )
@@ -1482,21 +1524,22 @@ private fun VaultAndSettingsTab(
     var showImportDialog by rememberSaveable { mutableStateOf(false) }
     var importJsonText by rememberSaveable { mutableStateOf("") }
 
-    var geminiKey by remember(uiState.settings.geminiKey) { mutableStateOf(uiState.settings.geminiKey) }
-    var groqKey by remember(uiState.settings.groqKey) { mutableStateOf(uiState.settings.groqKey) }
-    var deepSeekKey by remember(uiState.settings.deepSeekKey) { mutableStateOf(uiState.settings.deepSeekKey) }
-    var openRouterKey by remember(uiState.settings.openRouterKey) { mutableStateOf(uiState.settings.openRouterKey) }
-    var sosContacts by remember(uiState.settings.sosContacts) { mutableStateOf(uiState.settings.sosContacts) }
-    var smartCallPolicy by remember(uiState.settings.smartCallPolicy) { mutableStateOf(uiState.settings.smartCallPolicy) }
-    var githubRepo by remember(uiState.settings.githubRepo) { mutableStateOf(uiState.settings.githubRepo) }
-    var githubToken by remember(uiState.settings.githubToken) { mutableStateOf(uiState.settings.githubToken) }
-    var localModelPath by remember(uiState.settings.localModelPath) { mutableStateOf(uiState.settings.localModelPath) }
+    var geminiKey by rememberSaveable(uiState.settings.geminiKey) { mutableStateOf(uiState.settings.geminiKey) }
+    var groqKey by rememberSaveable(uiState.settings.groqKey) { mutableStateOf(uiState.settings.groqKey) }
+    var deepSeekKey by rememberSaveable(uiState.settings.deepSeekKey) { mutableStateOf(uiState.settings.deepSeekKey) }
+    var openRouterKey by rememberSaveable(uiState.settings.openRouterKey) { mutableStateOf(uiState.settings.openRouterKey) }
+    var sosContacts by rememberSaveable(uiState.settings.sosContacts) { mutableStateOf(uiState.settings.sosContacts) }
+    var smartCallPolicy by rememberSaveable(uiState.settings.smartCallPolicy) { mutableStateOf(uiState.settings.smartCallPolicy) }
+    var githubRepo by rememberSaveable(uiState.settings.githubRepo) { mutableStateOf(uiState.settings.githubRepo) }
+    var githubToken by rememberSaveable(uiState.settings.githubToken) { mutableStateOf(uiState.settings.githubToken) }
+    var localModelPath by rememberSaveable(uiState.settings.localModelPath) { mutableStateOf(uiState.settings.localModelPath) }
     val ctx = LocalContext.current
 
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .padding(top = 36.dp, start = 16.dp, end = 16.dp),
+            .statusBarsPadding()
+            .padding(top = 12.dp, start = 16.dp, end = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(bottom = 28.dp)
     ) {
@@ -1990,10 +2033,10 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                             color = GokuCyan,
                             trackColor = GokuSurfaceElevated
                         )
-                        val totalText = if (st.totalMb > 0f) "${"%.1f".format(st.totalMb)} MB" else "..."
-                        val speedText = if (st.speedMbps > 0.01f) " • ${"%.2f".format(st.speedMbps)} MB/s" else ""
+                        val totalText = if (st.totalMb > 0f) "${"%.1f".format(Locale.US, st.totalMb)} MB" else "..."
+                        val speedText = if (st.speedMbps > 0.01f) " • ${"%.2f".format(Locale.US, st.speedMbps)} MB/s" else ""
                         Text(
-                            text = "${"%.1f".format(st.downloadedMb)} MB / $totalText$speedText",
+                            text = "${"%.1f".format(Locale.US, st.downloadedMb)} MB / $totalText$speedText",
                             style = MaterialTheme.typography.labelMedium,
                             color = GokuTextMuted
                         )
@@ -2023,7 +2066,7 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                 is ModelDownloadState.Paused -> {
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text(
-                            text = "Paused: ${st.modelName} (${st.progressPercent}% • ${"%.1f".format(st.downloadedMb)} / ${"%.1f".format(st.totalMb)} MB)",
+                            text = "Paused: ${st.modelName} (${st.progressPercent}% • ${"%.1f".format(Locale.US, st.downloadedMb)} / ${"%.1f".format(Locale.US, st.totalMb)} MB)",
                             style = MaterialTheme.typography.bodySmall,
                             color = GokuAmber
                         )
@@ -2083,7 +2126,7 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                                         color = GokuTextPrimary
                                     )
                                     Text(
-                                        text = "${"%.1f".format(st.sizeMb)} MB on disk • Auto-unloads from RAM after 15s idle",
+                                        text = "${"%.1f".format(Locale.US, st.sizeMb)} MB on disk • Auto-unloads from RAM after 15s idle",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = GokuEmerald
                                     )
@@ -2151,6 +2194,14 @@ private fun LatestOfflineAiBrainCard(isLoadedInRam: Boolean) {
                                     color = GokuObsidianBg,
                                     fontWeight = FontWeight.Bold
                                 )
+                            }
+                            OutlinedButton(
+                                onClick = { localModelPicker.launch(arrayOf("*/*")) },
+                                modifier = Modifier.heightIn(min = 48.dp)
+                            ) {
+                                Icon(Icons.Filled.FolderOpen, contentDescription = "Import Local .task")
+                                Spacer(Modifier.width(4.dp))
+                                Text("Import")
                             }
                             OutlinedButton(
                                 onClick = { downloadManager.deleteModel() },
@@ -2234,13 +2285,28 @@ private fun CameraLiveEyeDialog(
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val mainExecutor = remember(context) { ContextCompat.getMainExecutor(context) }
+    val captureExecutor = remember { Executors.newSingleThreadExecutor() }
+    var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
     var imageCapture by remember { mutableStateOf<ImageCapture?>(null) }
+    val isDisposed = remember { AtomicBoolean(false) }
+    var isScanning by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("Point camera at a medicine strip, bike part, or document...") }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            isDisposed.set(true)
+            runCatching { cameraProvider?.unbindAll() }
+            cameraProvider = null
+            imageCapture = null
+            runCatching { captureExecutor.shutdown() }
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = GokuSurfaceDark,
-        title = { Text("Goku Camera Live-Eye (ML Kit OCR)", color = GokuAmber) },
+        title = { Text("Goku Camera Live-Eye (Vision + OCR)", color = GokuAmber) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!hasCameraPermission) {
@@ -2258,8 +2324,11 @@ private fun CameraLiveEyeDialog(
                                 val previewView = PreviewView(ctx)
                                 val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
                                 cameraProviderFuture.addListener({
+                                    if (isDisposed.get()) return@addListener
                                     runCatching {
                                         val provider = cameraProviderFuture.get()
+                                        if (isDisposed.get()) return@addListener
+                                        cameraProvider = provider
                                         val preview = Preview.Builder().build().also {
                                             it.surfaceProvider = previewView.surfaceProvider
                                         }
@@ -2273,7 +2342,9 @@ private fun CameraLiveEyeDialog(
                                             capture
                                         )
                                     }.onFailure {
-                                        statusText = "Camera preview unavailable: ${it.message}"
+                                        if (!isDisposed.get()) {
+                                            statusText = "Camera preview unavailable: ${it.message}"
+                                        }
                                     }
                                 }, ContextCompat.getMainExecutor(ctx))
                                 previewView
@@ -2287,49 +2358,98 @@ private fun CameraLiveEyeDialog(
         },
         confirmButton = {
             if (hasCameraPermission) {
-                Button(onClick = {
-                    val cap = imageCapture ?: return@Button
-                    statusText = "Scanning with on-device ML Kit..."
-                    cap.takePicture(
-                        ContextCompat.getMainExecutor(context),
-                        object : ImageCapture.OnImageCapturedCallback() {
-                            @androidx.camera.core.ExperimentalGetImage
-                            override fun onCaptureSuccess(image: ImageProxy) {
-                                val mediaImage = image.image
-                                if (mediaImage != null) {
-                                    val inputImage = InputImage.fromMediaImage(mediaImage, image.imageInfo.rotationDegrees)
+                Button(
+                    enabled = !isScanning,
+                    onClick = {
+                        val cap = imageCapture ?: return@Button
+                        if (isScanning || isDisposed.get()) return@Button
+                        isScanning = true
+                        statusText = "Scanning with Vision & on-device ML Kit..."
+                        cap.takePicture(
+                            captureExecutor,
+                            object : ImageCapture.OnImageCapturedCallback() {
+                                override fun onCaptureSuccess(image: ImageProxy) {
+                                    if (isDisposed.get()) {
+                                        runCatching { image.close() }
+                                        return
+                                    }
+                                    // Runs off the Main thread on captureExecutor
+                                    val rotationDegrees = image.imageInfo.rotationDegrees
+                                    val bitmap = try {
+                                        imageProxyToBitmapSafe(image)
+                                    } finally {
+                                        runCatching { image.close() }
+                                    }
+                                    if (isDisposed.get()) return
+                                    if (bitmap == null) {
+                                        mainExecutor.execute {
+                                            if (!isDisposed.get()) {
+                                                isScanning = false
+                                                statusText = "Could not decode camera frame; please try again."
+                                            }
+                                        }
+                                        return
+                                    }
+                                    val inputImage = InputImage.fromBitmap(bitmap, rotationDegrees)
                                     CameraLiveEyeOcr.recognize(
                                         image = inputImage,
                                         onResult = { txt ->
-                                            image.close()
-                                            if (txt.isBlank()) {
-                                                statusText = "No readable text found; try closer lighting."
-                                            } else {
-                                                onTextExtracted(txt)
+                                            mainExecutor.execute {
+                                                if (!isDisposed.get()) {
+                                                    isScanning = false
+                                                    if (txt.isBlank()) {
+                                                        statusText = "No readable text found; try closer lighting."
+                                                    } else {
+                                                        onTextExtracted(txt)
+                                                    }
+                                                }
                                             }
                                         },
                                         onError = { err ->
-                                            image.close()
-                                            statusText = "OCR error: ${err.message}"
+                                            mainExecutor.execute {
+                                                if (!isDisposed.get()) {
+                                                    isScanning = false
+                                                    statusText = "OCR error: ${err.message}"
+                                                }
+                                            }
                                         }
                                     )
-                                } else {
-                                    image.close()
+                                }
+
+                                override fun onError(exception: ImageCaptureException) {
+                                    mainExecutor.execute {
+                                        if (!isDisposed.get()) {
+                                            isScanning = false
+                                            statusText = "Capture failed: ${exception.message}"
+                                        }
+                                    }
                                 }
                             }
-
-                            override fun onError(exception: ImageCaptureException) {
-                                statusText = "Capture failed: ${exception.message}"
-                            }
-                        }
-                    )
-                }) { Text("Scan & Explain") }
+                        )
+                    }
+                ) { Text(if (isScanning) "Scanning..." else "Scan & Explain") }
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Close") }
         }
     )
+}
+
+private fun imageProxyToBitmapSafe(image: ImageProxy): Bitmap? {
+    return runCatching {
+        if (image.format == ImageFormat.JPEG) {
+            val buffer = image.planes.firstOrNull()?.buffer ?: return@runCatching null
+            buffer.rewind()
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        } else {
+            image.toBitmap()
+        }
+    }.getOrElse {
+        runCatching { image.toBitmap() }.getOrNull()
+    }
 }
 
 @Composable

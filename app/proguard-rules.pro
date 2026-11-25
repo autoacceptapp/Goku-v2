@@ -5,17 +5,44 @@
 # For more details, see
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+-keepattributes SourceFile,LineNumberTable
+-keepattributes Signature,InnerClasses,EnclosingMethod,*Annotation*
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# ============================================================================
+# GOKU V10.1 RELEASE R8/PROGUARD KEEP RULES
+# ============================================================================
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# 1. Mozilla Rhino Embedded JavaScript Engine + GokuJsBridge reflection target
+-keep class org.mozilla.javascript.** { *; }
+-dontwarn org.mozilla.javascript.**
+-keep class com.goku.ai.automation.GokuJsBridge { *; }
+
+# 2. Native Zstd-JNI Compression (Memory Vault & Screen Timeline)
+-keep class com.github.luben.zstd.** { *; }
+-dontwarn com.github.luben.zstd.**
+
+# 3. MediaPipe GenAI / LiteRT On-Device LLM Runtime
+-keep class com.google.mediapipe.** { *; }
+-keep class com.google.mediapipe.tasks.genai.** { *; }
+-keep class com.google.ai.edge.** { *; }
+-dontwarn com.google.mediapipe.**
+-dontwarn com.google.ai.edge.**
+
+# 4. Optional Sherpa-ONNX Wake-Word Reflection Bridge
+-keep class com.k2fsa.sherpa.onnx.** { *; }
+-dontwarn com.k2fsa.sherpa.onnx.**
+
+# 5. BouncyCastle & Conscrypt (Local ADB TLS 1.3 + Ed25519/SPAKE2)
+-keep class org.bouncycastle.** { *; }
+-dontwarn org.bouncycastle.**
+-dontwarn org.conscrypt.**
+
+# 6. Room Database Entities, DAOs, FTS4 & Serialization / JSON Models
+-keep class com.goku.ai.data.** { *; }
+-keepclassmembers class * extends androidx.room.RoomDatabase {
+    <init>(...);
+}
+-keep @kotlinx.serialization.Serializable class * { *; }
+-keepclassmembers class * {
+    @kotlinx.serialization.SerialName <fields>;
+}

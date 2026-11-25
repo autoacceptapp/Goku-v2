@@ -1,6 +1,7 @@
 package com.goku.ai.automation
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.app.NotificationManager
 import android.app.admin.DeviceAdminReceiver
 import android.app.admin.DevicePolicyManager
@@ -30,6 +31,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.UserHandle
 import android.telephony.SmsManager
 import android.util.Base64
@@ -56,12 +58,16 @@ import com.goku.ai.voice.GokuKillSwitch
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -83,6 +89,7 @@ import java.util.Calendar
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 
 // ============================================================================
@@ -108,6 +115,8 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
 
     private var registered = false
     private var batteryReceiverRegistered = false
+    private var previousRingerMode: Int? = null
+    private var previousInterruptionFilter: Int? = null
 
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
@@ -149,7 +158,12 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
         }
         if (!batteryReceiverRegistered) {
             runCatching {
-                context.registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                ContextCompat.registerReceiver(
+                    context,
+                    batteryReceiver,
+                    IntentFilter(Intent.ACTION_BATTERY_CHANGED),
+                    ContextCompat.RECEIVER_NOT_EXPORTED
+                )
                 batteryReceiverRegistered = true
             }
         }
@@ -183,6 +197,7 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
                 val inPocketNow = dist < minOf(2.5f, maxRange)
                 if (inPocketNow != _state.value.isInPocket) {
                     _state.value = _state.value.copy(isInPocket = inPocketNow)
+                    applySilentReflexIfPermitted(_state.value.isFaceDown || inPocketNow)
                 }
             }
         }
@@ -193,16 +208,32 @@ class SensorReflexManager(private val context: Context) : SensorEventListener {
     private fun applySilentReflexIfPermitted(enableQuiet: Boolean) {
         val nm = notificationManager ?: return
         if (nm.isNotificationPolicyAccessGranted) {
+            previousRingerMode = null
             runCatching {
                 if (enableQuiet) {
+                    if (previousInterruptionFilter == null) {
+                        previousInterruptionFilter = nm.currentInterruptionFilter
+                    }
                     nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_PRIORITY)
                 } else {
-                    nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALL)
+                    val restoreFilter = previousInterruptionFilter ?: return@runCatching
+                    previousInterruptionFilter = null
+                    nm.setInterruptionFilter(restoreFilter)
                 }
             }
         } else if (enableQuiet) {
             runCatching {
-                audioManager?.ringerMode = AudioManager.RINGER_MODE_VIBRATE
+                val am = audioManager ?: return@runCatching
+                if (previousRingerMode == null) {
+                    previousRingerMode = am.ringerMode
+                }
+                am.ringerMode = AudioManager.RINGER_MODE_VIBRATE
+            }
+        } else {
+            val savedMode = previousRingerMode ?: return
+            previousRingerMode = null
+            runCatching {
+                audioManager?.ringerMode = savedMode
             }
         }
     }
@@ -257,6 +288,9 @@ class EmergencySosManager(
         } else {
             @Suppress("DEPRECATION")
             SmsManager.getDefault()
+        } ?: run {
+            vault.logAction("SYSTEM", "Emergency SOS", "SmsManager unavailable on device", 100, "ERROR")
+            return@withContext "SmsManager unavailable on this device; SOS SMS could not be sent."
         }
 
         var sentCount = 0
@@ -273,11 +307,15 @@ class EmergencySosManager(
         msg
     }
 
-    suspend fun triggerIntruderAlert(failedAttempts: Int, photoPath: String?): String {
-        val photoNote = if (!photoPath.isNullOrBlank()) {
-            "Front-camera snapshot saved: ${File(photoPath).name}."
-        } else {
-            "Camera capture skipped/unavailable."
+    suspend fun triggerIntruderAlert(
+        failedAttempts: Int,
+        photoPath: String?,
+        diagnosticReason: String? = null
+    ): String {
+        val photoNote = when {
+            !photoPath.isNullOrBlank() -> "Front-camera snapshot saved: ${File(photoPath).name}."
+            !diagnosticReason.isNullOrBlank() -> "$diagnosticReason."
+            else -> "Camera capture skipped/unavailable."
         }
         return triggerSosBeacon(
             customPrefix = "ANTI-THEFT ALERT (Goku V10.1): $failedAttempts failed lock-screen unlock attempts! $photoNote"
@@ -426,10 +464,22 @@ class AntiTheftIntruderGuard(private val context: Context) {
         if (attempts >= INTRUDER_THRESHOLD && (now - lastAlertTimeMs) >= ALERT_COOLDOWN_MS) {
             lastAlertTimeMs = now
             prefs.edit().putLong(KEY_LAST_ALERT_MS, now).apply()
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val wakeLock = runCatching {
+                pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "goku:IntruderGuard")?.apply {
+                    setReferenceCounted(false)
+                    acquire(15_000L)
+                }
+            }.getOrNull()
             scope.launch {
                 try {
-                    executeIntruderResponse(attempts)
+                    withTimeoutOrNull(8_500L) {
+                        executeIntruderResponse(attempts)
+                    }
                 } finally {
+                    runCatching {
+                        if (wakeLock?.isHeld == true) wakeLock.release()
+                    }
                     onComplete?.invoke()
                 }
             }
@@ -442,8 +492,8 @@ class AntiTheftIntruderGuard(private val context: Context) {
         val vault = GokuVaultRepository.getInstance(context)
         val sos = EmergencySosManager(context, vault)
 
-        // 1. Silent front-camera snapshot via CameraX (no Preview UI)
-        val photoFile = captureSilentFrontCameraPhoto()
+        // 1. Silent front-camera snapshot via CameraX (with explicit lock-screen policy diagnostic)
+        val (photoFile, diagnosticReason) = captureSilentFrontCameraPhotoWithDiagnostic()
         val photoPath = photoFile?.absolutePath
         val gpsSummary = sos.getBestLastKnownLocationSummary()
 
@@ -451,12 +501,13 @@ class AntiTheftIntruderGuard(private val context: Context) {
             prefs.edit().putString(KEY_LAST_PHOTO, photoPath).apply()
         }
 
-        val logDetail = "Failed attempts=$attempts | GPS=$gpsSummary | Photo=${photoPath ?: "unavailable"}"
+        val photoStatus = photoPath ?: (diagnosticReason ?: "unavailable")
+        val logDetail = "Failed attempts=$attempts | GPS=$gpsSummary | Photo=$photoStatus"
         vault.logAction("SYSTEM", "Anti-Theft Intruder Guard", logDetail, 100, "WARN")
         vault.saveMemory("last_intruder_event", logDetail, category = "SECURITY")
 
-        // 2. Trigger offline Emergency SOS SMS to saved family contacts
-        val smsReport = sos.triggerIntruderAlert(attempts, photoPath)
+        // 2. Always send offline Emergency SOS SMS immediately (even if Android 11+ blocked background camera)
+        val smsReport = sos.triggerIntruderAlert(attempts, photoPath, diagnosticReason)
 
         _state.value = _state.value.copy(
             failedAttempts = attempts,
@@ -472,23 +523,57 @@ class AntiTheftIntruderGuard(private val context: Context) {
      * bound to a temporary `HeadlessCameraLifecycleOwner` without any UI surface/preview.
      */
     suspend fun captureSilentFrontCameraPhoto(): File? {
+        return captureSilentFrontCameraPhotoWithDiagnostic().first
+    }
+
+    suspend fun captureSilentFrontCameraPhotoWithDiagnostic(): Pair<File?, String?> {
         val hasCamera = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
             PackageManager.PERMISSION_GRANTED
-        if (!hasCamera) return null
+        if (!hasCamera) {
+            return null to "CAMERA permission not granted"
+        }
+
+        val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
+        if (runCatching { dpm?.getCameraDisabled(null) == true }.getOrDefault(false)) {
+            return null to "Camera blocked by Android lock-screen background policy"
+        }
+
+        val keyguard = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val isDeviceLocked = runCatching {
+            keyguard?.isKeyguardLocked == true || keyguard?.isDeviceLocked == true
+        }.getOrDefault(false)
 
         val intruderDir = File(context.filesDir, "intruder").apply { mkdirs() }
         val outFile = File(intruderDir, "intruder_${System.currentTimeMillis()}.jpg")
 
-        return withTimeoutOrNull(10_000L) {
-            suspendCancellableCoroutine { cont ->
+        val outcome = withTimeoutOrNull(4_500L) {
+            suspendCancellableCoroutine<Pair<File?, String?>> { cont ->
                 val providerFuture = ProcessCameraProvider.getInstance(context)
                 val mainExecutor = ContextCompat.getMainExecutor(context)
+                val activeProvider = AtomicReference<ProcessCameraProvider?>(null)
+                val activeLifecycle = AtomicReference<HeadlessCameraLifecycleOwner?>(null)
+
+                cont.invokeOnCancellation {
+                    mainHandler.post {
+                        runCatching { activeProvider.get()?.unbindAll() }
+                        activeLifecycle.get()?.moveToDestroyed()
+                    }
+                    runCatching { outFile.delete() }
+                }
 
                 providerFuture.addListener({
+                    if (!cont.isActive) return@addListener
                     var cameraProvider: ProcessCameraProvider? = null
                     val lifecycleOwner = HeadlessCameraLifecycleOwner()
+                    activeLifecycle.set(lifecycleOwner)
                     try {
                         cameraProvider = providerFuture.get()
+                        activeProvider.set(cameraProvider)
+                        if (!cont.isActive) {
+                            runCatching { cameraProvider.unbindAll() }
+                            lifecycleOwner.moveToDestroyed()
+                            return@addListener
+                        }
                         lifecycleOwner.moveToResumed()
 
                         val selector = if (cameraProvider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) {
@@ -514,7 +599,8 @@ class AntiTheftIntruderGuard(private val context: Context) {
                                         runCatching { cameraProvider.unbindAll() }
                                         lifecycleOwner.moveToDestroyed()
                                     }
-                                    if (cont.isActive) cont.resume(outFile)
+                                    if (cont.isActive) cont.resume(outFile to null)
+                                    else runCatching { outFile.delete() }
                                 }
 
                                 override fun onError(exception: ImageCaptureException) {
@@ -523,20 +609,40 @@ class AntiTheftIntruderGuard(private val context: Context) {
                                         lifecycleOwner.moveToDestroyed()
                                     }
                                     runCatching { outFile.delete() }
-                                    if (cont.isActive) cont.resume(null)
+                                    val reason = classifyCameraFailure(exception, isDeviceLocked)
+                                    if (cont.isActive) cont.resume(null to reason)
                                 }
                             }
                         )
-                    } catch (_: Throwable) {
+                    } catch (err: Throwable) {
                         mainHandler.post {
                             runCatching { cameraProvider?.unbindAll() }
                             lifecycleOwner.moveToDestroyed()
                         }
                         runCatching { outFile.delete() }
-                        if (cont.isActive) cont.resume(null)
+                        val reason = classifyCameraFailure(err, isDeviceLocked)
+                        if (cont.isActive) cont.resume(null to reason)
                     }
                 }, mainExecutor)
             }
+        }
+        return outcome ?: run {
+            runCatching { outFile.delete() }
+            null to "Camera blocked by Android lock-screen background policy"
+        }
+    }
+
+    private fun classifyCameraFailure(err: Throwable, isDeviceLocked: Boolean): String {
+        val msg = err.message.orEmpty().lowercase()
+        return if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            (isDeviceLocked || err is SecurityException || err is IllegalStateException ||
+                msg.contains("policy") || msg.contains("background") ||
+                msg.contains("disabled") || msg.contains("camera") || msg.contains("closed"))
+        ) {
+            "Camera blocked by Android lock-screen background policy"
+        } else {
+            "Camera capture failed: ${err.message ?: err.javaClass.simpleName}"
         }
     }
 
@@ -622,16 +728,21 @@ class GokuJsBridge(
     private val pilot: UniversalAppPilot,
     private val voiceEngine: GokuEarAndVoiceEngine,
     private val dryRun: Boolean,
-    private val outputLog: StringBuilder
+    private val outputLog: StringBuilder,
+    private val deadlineMs: Long = System.currentTimeMillis() + MAX_JS_WALL_MS
 ) {
-    fun tap(target: String): Boolean {
+    fun tap(target: String?): Boolean {
         checkNotStopped()
+        val safeTarget = target?.trim().orEmpty()
+        if (safeTarget.isEmpty()) return false
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.tap($target)\n")
+            outputLog.append("[DRY-JS] goku.tap($safeTarget)\n")
             return true
         }
-        val (ok, msg) = runBlocking(Dispatchers.IO) { pilot.tapTarget(target) }
-        outputLog.append("JS tap($target): $msg\n")
+        val result = runBoundedBridgeCall("tap($safeTarget)") { pilot.tapTarget(safeTarget) }
+            ?: return false
+        val (ok, msg) = result
+        outputLog.append("JS tap($safeTarget): $msg\n")
         return ok
     }
 
@@ -641,69 +752,169 @@ class GokuJsBridge(
             outputLog.append("[DRY-JS] goku.tapXY($x, $y)\n")
             return true
         }
-        val res = runBlocking(Dispatchers.IO) { adbEngine.dispatchAdbTap(x, y) }
+        val res = runBoundedBridgeCall("tapXY($x,$y)") { adbEngine.dispatchAdbTap(x, y) }
+            ?: return false
         outputLog.append("JS tapXY($x,$y): ${res.output}\n")
         return res.success
     }
 
-    fun adb(command: String): String {
+    fun adb(command: String?): String {
         checkNotStopped()
+        val safeCmd = command?.trim().orEmpty()
+        if (safeCmd.isEmpty()) return "Empty command"
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.adb($command)\n")
-            return "[DRY] $command"
+            outputLog.append("[DRY-JS] goku.adb($safeCmd)\n")
+            return "[DRY] $safeCmd"
         }
-        val res = runBlocking(Dispatchers.IO) { adbEngine.execShellCommand(command) }
-        outputLog.append("JS adb($command): ${res.output.take(120)}\n")
+        val res = runBoundedBridgeCall("adb($safeCmd)") { adbEngine.execShellCommand(safeCmd) }
+            ?: return "Timeout (${BRIDGE_CALL_TIMEOUT_MS}ms)"
+        outputLog.append("JS adb($safeCmd): ${res.output.take(120)}\n")
         return res.output
     }
 
-    fun speak(text: String) {
+    fun speak(text: String?) {
         checkNotStopped()
+        val safeText = text?.trim().orEmpty()
+        if (safeText.isEmpty()) return
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.speak($text)\n")
+            outputLog.append("[DRY-JS] goku.speak($safeText)\n")
             return
         }
-        voiceEngine.speak(text)
-        outputLog.append("JS spoke: $text\n")
+        voiceEngine.speak(safeText)
+        outputLog.append("JS spoke: $safeText\n")
+        checkNotStopped()
     }
 
-    fun saveMemory(key: String, value: String) {
+    fun saveMemory(key: String?, value: String?) {
         checkNotStopped()
+        val safeKey = key?.trim().orEmpty()
+        val safeVal = value?.trim().orEmpty()
+        if (safeKey.isEmpty() || safeVal.isEmpty()) return
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.saveMemory($key, $value)\n")
+            outputLog.append("[DRY-JS] goku.saveMemory($safeKey, $safeVal)\n")
             return
         }
-        runBlocking(Dispatchers.IO) { vault.saveMemory(key, value, "PLUGIN_JS") }
-        outputLog.append("JS saved memory [$key]\n")
+        val saved = runBoundedBridgeCall("saveMemory($safeKey)") {
+            vault.saveMemory(safeKey, safeVal, "PLUGIN_JS")
+            true
+        }
+        if (saved == true) {
+            outputLog.append("JS saved memory [$safeKey]\n")
+        }
     }
 
-    fun openApp(appName: String): Boolean {
+    fun openApp(appName: String?): Boolean {
         checkNotStopped()
+        val safeApp = appName?.trim().orEmpty()
+        if (safeApp.isEmpty()) return false
         if (dryRun) {
-            outputLog.append("[DRY-JS] goku.openApp($appName)\n")
+            outputLog.append("[DRY-JS] goku.openApp($safeApp)\n")
             return true
         }
-        val stepArr = JSONArray().put(JSONObject().put("action", "open_app").put("target", appName)).toString()
-        val (ok, msg) = runBlocking(Dispatchers.IO) { pilot.executeStepsJson(stepArr, dryRun = false) }
-        outputLog.append("JS openApp($appName): $msg\n")
+        val stepArr = JSONArray().put(JSONObject().put("action", "open_app").put("target", safeApp)).toString()
+        val result = runBoundedBridgeCall("openApp($safeApp)") {
+            pilot.executeStepsJson(stepArr, dryRun = false)
+        } ?: return false
+        val (ok, msg) = result
+        outputLog.append("JS openApp($safeApp): $msg\n")
         return ok
     }
 
     fun sleep(ms: Long) {
-        checkNotStopped()
-        val clamped = ms.coerceIn(0L, 3000L)
-        if (!dryRun && clamped > 0L) {
-            Thread.sleep(clamped)
-        }
+        sleepWithKillSwitch(ms, dryRun = dryRun, deadlineMs = deadlineMs)
     }
 
-    fun log(message: String) {
-        outputLog.append("JS log: ").append(message.take(240)).append("\n")
+    fun log(message: String?) {
+        val safeMsg = message?.take(240).orEmpty()
+        outputLog.append("JS log: ").append(safeMsg).append("\n")
+    }
+
+    private fun <T> runBoundedBridgeCall(
+        label: String,
+        timeoutMs: Long = BRIDGE_CALL_TIMEOUT_MS,
+        block: suspend () -> T
+    ): T? {
+        checkNotStopped()
+        val result = runBoundedBridgeCallInternal(timeoutMs, deadlineMs, block)
+        checkNotStopped()
+        if (result == null) {
+            outputLog.append("JS $label timed out after ${timeoutMs}ms\n")
+        }
+        return result
     }
 
     private fun checkNotStopped() {
-        if (GokuKillSwitch.isStopped.value) {
-            throw SecurityException("Stopped by GokuKillSwitch")
+        Companion.checkNotStopped(deadlineMs)
+    }
+
+    companion object {
+        internal const val BRIDGE_CALL_TIMEOUT_MS = 4_000L
+        internal const val MAX_JS_WALL_MS = 6_000L
+
+        fun checkNotStopped(deadlineMs: Long = Long.MAX_VALUE) {
+            if (GokuKillSwitch.isStopped.value) {
+                throw SecurityException("Stopped by GokuKillSwitch")
+            }
+            if (System.currentTimeMillis() > deadlineMs) {
+                throw SecurityException("JS plugin halted: exceeded ${MAX_JS_WALL_MS}ms timeout.")
+            }
+        }
+
+        internal fun <T> runBoundedBridgeCallInternal(
+            timeoutMs: Long = BRIDGE_CALL_TIMEOUT_MS,
+            deadlineMs: Long = Long.MAX_VALUE,
+            block: suspend () -> T
+        ): T? {
+            checkNotStopped(deadlineMs)
+            val remainingWallMs = if (deadlineMs == Long.MAX_VALUE) {
+                timeoutMs
+            } else {
+                (deadlineMs - System.currentTimeMillis()).coerceAtLeast(1L)
+            }
+            val effectiveTimeoutMs = minOf(timeoutMs, remainingWallMs)
+            val outcome = try {
+                runBlocking(Dispatchers.Default) {
+                    withTimeoutOrNull(effectiveTimeoutMs) {
+                        coroutineScope {
+                            val work = async { block() }
+                            val killWatcher = launch {
+                                GokuKillSwitch.isStopped.first { it }
+                                work.cancel(CancellationException("Stopped by GokuKillSwitch"))
+                            }
+                            try {
+                                work.await()
+                            } finally {
+                                killWatcher.cancel()
+                            }
+                        }
+                    }
+                }
+            } catch (ce: CancellationException) {
+                if (GokuKillSwitch.isStopped.value) {
+                    throw SecurityException("Stopped by GokuKillSwitch")
+                }
+                throw ce
+            }
+            checkNotStopped(deadlineMs)
+            return outcome
+        }
+
+        fun sleepWithKillSwitch(
+            ms: Long,
+            dryRun: Boolean = false,
+            deadlineMs: Long = Long.MAX_VALUE
+        ) {
+            checkNotStopped(deadlineMs)
+            val clamped = ms.coerceIn(0L, 3000L)
+            if (dryRun || clamped <= 0L) return
+            var remaining = clamped
+            while (remaining > 0L) {
+                checkNotStopped(deadlineMs)
+                val chunk = minOf(50L, remaining)
+                Thread.sleep(chunk)
+                remaining -= chunk
+                checkNotStopped(deadlineMs)
+            }
         }
     }
 }
@@ -739,7 +950,7 @@ private class GokuSandboxedRhinoContextFactory : ContextFactory() {
 
     companion object {
         private const val MAX_JS_INSTRUCTIONS = 150_000L
-        private const val MAX_JS_WALL_MS = 6_000L
+        internal const val MAX_JS_WALL_MS = GokuJsBridge.MAX_JS_WALL_MS
     }
 }
 
@@ -788,7 +999,7 @@ class SelfCodingPluginEngine(
         val start = System.currentTimeMillis()
         val parsed = runCatching {
             if (trimmed.startsWith("[")) JSONArray(trimmed)
-            else JSONObject(trimmed).optJSONArray("steps") ?: JSONArray()
+            else JSONObject(trimmed).optJSONArray("steps")
         }.getOrNull() ?: return@withContext "Invalid plugin format. Provide JSON {\"steps\":[...]}, {\"script\":\"...\"}, or raw JS."
 
         val report = StringBuilder()
@@ -847,9 +1058,13 @@ class SelfCodingPluginEngine(
      */
     suspend fun runSandboxedJavaScript(jsCode: String, dryRun: Boolean = false): String =
         withContext(Dispatchers.IO) {
+            if (GokuKillSwitch.isStopped.value) {
+                return@withContext "JS plugin aborted by GokuKillSwitch."
+            }
             val start = System.currentTimeMillis()
+            val deadlineMs = start + GokuJsBridge.MAX_JS_WALL_MS
             val logBuilder = StringBuilder()
-            val bridge = GokuJsBridge(vault, adbEngine, pilot, voiceEngine, dryRun, logBuilder)
+            val bridge = GokuJsBridge(vault, adbEngine, pilot, voiceEngine, dryRun, logBuilder, deadlineMs)
 
             val cx = rhinoFactory.enterContext() as GuardedRhinoContext
             val outcome = try {

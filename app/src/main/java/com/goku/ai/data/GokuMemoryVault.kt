@@ -21,6 +21,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import com.github.luben.zstd.Zstd
+import com.github.luben.zstd.ZstdInputStream
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -224,8 +225,9 @@ object TextCompressor {
                         String(out, Charsets.UTF_8)
                     } else {
                         // Streaming fallback for frames without embedded content size
-                        val out = Zstd.decompress(data, (data.size * 8).coerceIn(4096, 2 * 1024 * 1024))
-                        String(out, Charsets.UTF_8)
+                        ZstdInputStream(ByteArrayInputStream(data)).bufferedReader(Charsets.UTF_8).use {
+                            it.readText()
+                        }
                     }
                 }.getOrDefault("")
             }
@@ -278,6 +280,17 @@ object FtsQuerySanitizer {
         return tokens.joinToString(separator) { "$it*" }
     }
 
+    /**
+     * Escapes SQLite LIKE metacharacters (`\`, `%`, `_`) so user queries match literally
+     * when paired with `ESCAPE '\'`.
+     */
+    fun escapeLikeQuery(raw: String): String {
+        return raw
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+    }
+
     private val FTS_RESERVED_WORDS = setOf("and", "or", "not", "near")
 }
 
@@ -293,8 +306,14 @@ interface MemoryNodeDao {
     @Query("SELECT * FROM memory_nodes ORDER BY updatedAt DESC")
     suspend fun getAllSnapshot(): List<MemoryNodeEntity>
 
-    @Query("SELECT * FROM memory_nodes WHERE `key` LIKE '%' || :q || '%' OR value LIKE '%' || :q || '%' OR relationTag LIKE '%' || :q || '%' ORDER BY updatedAt DESC LIMIT 20")
-    suspend fun search(q: String): List<MemoryNodeEntity>
+    @Query("SELECT * FROM memory_nodes WHERE `key` LIKE '%' || :q || '%' ESCAPE '\\' OR value LIKE '%' || :q || '%' ESCAPE '\\' OR relationTag LIKE '%' || :q || '%' ESCAPE '\\' ORDER BY updatedAt DESC LIMIT 20")
+    suspend fun searchRaw(q: String): List<MemoryNodeEntity>
+
+    suspend fun search(q: String): List<MemoryNodeEntity> =
+        searchRaw(FtsQuerySanitizer.escapeLikeQuery(q))
+
+    @Query("SELECT * FROM memory_nodes WHERE id = :id LIMIT 1")
+    suspend fun findById(id: Long): MemoryNodeEntity?
 
     @Query("SELECT * FROM memory_nodes WHERE LOWER(`key`) = LOWER(:key) LIMIT 1")
     suspend fun findByKey(key: String): MemoryNodeEntity?
@@ -322,7 +341,7 @@ interface ScreenTimelineDao {
     )
     suspend fun searchFts(ftsQuery: String, limit: Int = 30): List<ScreenTimelineEntity>
 
-    @Query("SELECT * FROM screen_timeline WHERE keywords LIKE '%' || :q || '%' OR screenTitle LIKE '%' || :q || '%' OR packageName LIKE '%' || :q || '%' OR summary LIKE '%' || :q || '%' ORDER BY timestamp DESC LIMIT 30")
+    @Query("SELECT * FROM screen_timeline WHERE keywords LIKE '%' || :q || '%' ESCAPE '\\' OR screenTitle LIKE '%' || :q || '%' ESCAPE '\\' OR packageName LIKE '%' || :q || '%' ESCAPE '\\' OR summary LIKE '%' || :q || '%' ESCAPE '\\' ORDER BY timestamp DESC LIMIT 30")
     suspend fun searchLike(q: String): List<ScreenTimelineEntity>
 
     /**
@@ -340,7 +359,7 @@ interface ScreenTimelineDao {
                 if (broadHits.isNotEmpty()) return broadHits
             }
         }
-        return searchLike(q)
+        return searchLike(FtsQuerySanitizer.escapeLikeQuery(q))
     }
 
     @Query("SELECT * FROM screen_timeline WHERE isSummarized = 0 AND timestamp < :cutoffMillis LIMIT 200")
@@ -369,8 +388,11 @@ interface RagDocumentDao {
     )
     suspend fun searchFts(ftsQuery: String, limit: Int = 8): List<RagDocumentEntity>
 
-    @Query("SELECT * FROM rag_documents WHERE content LIKE '%' || :q || '%' OR docName LIKE '%' || :q || '%' ORDER BY updatedAt DESC LIMIT :limit")
-    suspend fun searchLike(q: String, limit: Int = 8): List<RagDocumentEntity>
+    @Query("SELECT * FROM rag_documents WHERE content LIKE '%' || :q || '%' ESCAPE '\\' OR docName LIKE '%' || :q || '%' ESCAPE '\\' ORDER BY updatedAt DESC LIMIT :limit")
+    suspend fun searchLikeRaw(q: String, limit: Int = 8): List<RagDocumentEntity>
+
+    suspend fun searchLike(q: String, limit: Int = 8): List<RagDocumentEntity> =
+        searchLikeRaw(FtsQuerySanitizer.escapeLikeQuery(q), limit)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(chunks: List<RagDocumentEntity>)
@@ -571,14 +593,23 @@ class LocalRagDocumentBrain(
     private val memoryNodeDao: MemoryNodeDao? = null,
     private val screenTimelineDao: ScreenTimelineDao? = null
 ) {
+    private val indexLock = Any()
     private val chunks = CopyOnWriteArrayList<RagChunk>()
     private val invertedIndex = ConcurrentHashMap<String, MutableSet<RagChunk>>()
 
     fun indexDocument(docName: String, content: String, chunkSize: Int = 360) {
-        removeFromMemoryIndex(docName)
         val newChunks = buildChunks(docName, content, chunkSize)
-        for (chunk in newChunks) {
-            addChunkToMemoryCache(chunk)
+        synchronized(indexLock) {
+            removeFromMemoryIndexLocked(docName)
+            for (chunk in newChunks) {
+                addChunkToMemoryCacheLocked(chunk)
+            }
+        }
+    }
+
+    fun removeDocument(docName: String) {
+        synchronized(indexLock) {
+            removeFromMemoryIndexLocked(docName)
         }
     }
 
@@ -613,25 +644,28 @@ class LocalRagDocumentBrain(
      */
     fun query(question: String, topK: Int = 3): List<RagChunk> {
         val qTokens = tokenize(question)
-        if (qTokens.isEmpty() || chunks.isEmpty()) return emptyList()
+        if (qTokens.isEmpty()) return emptyList()
 
-        val totalDocs = chunks.size.coerceAtLeast(1).toDouble()
         val scoreByChunk = HashMap<RagChunk, Double>()
+        synchronized(indexLock) {
+            if (chunks.isEmpty()) return emptyList()
+            val totalDocs = chunks.size.coerceAtLeast(1).toDouble()
 
-        for (tok in qTokens) {
-            val postings = invertedIndex[tok]
-            if (!postings.isNullOrEmpty()) {
-                val idf = ln(1.0 + (totalDocs / (postings.size + 1.0)))
-                for (chunk in postings) {
-                    scoreByChunk[chunk] = (scoreByChunk[chunk] ?: 0.0) + idf
-                }
-            } else if (tok.length >= 3) {
-                // Prefix match against inverted index keys for partial/morphological stems
-                for ((indexedTok, postSet) in invertedIndex) {
-                    if (indexedTok.startsWith(tok)) {
-                        val idf = ln(1.0 + (totalDocs / (postSet.size + 1.0))) * 0.75
-                        for (chunk in postSet) {
-                            scoreByChunk[chunk] = (scoreByChunk[chunk] ?: 0.0) + idf
+            for (tok in qTokens) {
+                val postings = invertedIndex[tok]
+                if (!postings.isNullOrEmpty()) {
+                    val idf = ln(1.0 + (totalDocs / (postings.size + 1.0)))
+                    for (chunk in postings) {
+                        scoreByChunk[chunk] = (scoreByChunk[chunk] ?: 0.0) + idf
+                    }
+                } else if (tok.length >= 3) {
+                    // Prefix match against inverted index keys for partial/morphological stems
+                    for ((indexedTok, postSet) in invertedIndex) {
+                        if (indexedTok.startsWith(tok) && postSet.isNotEmpty()) {
+                            val idf = ln(1.0 + (totalDocs / (postSet.size + 1.0))) * 0.75
+                            for (chunk in postSet) {
+                                scoreByChunk[chunk] = (scoreByChunk[chunk] ?: 0.0) + idf
+                            }
                         }
                     }
                 }
@@ -784,9 +818,15 @@ class LocalRagDocumentBrain(
     suspend fun queryFts(question: String, topK: Int = 5): List<RagChunk> =
         queryPersistentFts(question, topK)
 
-    fun indexedCount(): Int = chunks.size
+    fun indexedCount(): Int = synchronized(indexLock) { chunks.size }
 
     private fun addChunkToMemoryCache(chunk: RagChunk) {
+        synchronized(indexLock) {
+            addChunkToMemoryCacheLocked(chunk)
+        }
+    }
+
+    private fun addChunkToMemoryCacheLocked(chunk: RagChunk) {
         val alreadyExists = chunks.any { it.docName == chunk.docName && it.chunkIndex == chunk.chunkIndex }
         if (alreadyExists) return
         chunks.add(chunk)
@@ -811,13 +851,17 @@ class LocalRagDocumentBrain(
         )
     }
 
-    private fun removeFromMemoryIndex(docName: String) {
+    private fun removeFromMemoryIndexLocked(docName: String) {
         val toRemove = chunks.filter { it.docName == docName }
         if (toRemove.isEmpty()) return
         chunks.removeAll(toRemove.toSet())
         for (chunk in toRemove) {
             for (tok in chunk.tokens) {
-                invertedIndex[tok]?.remove(chunk)
+                val postings = invertedIndex[tok] ?: continue
+                postings.remove(chunk)
+                if (postings.isEmpty()) {
+                    invertedIndex.remove(tok)
+                }
             }
         }
     }
@@ -852,25 +896,53 @@ class LocalRagDocumentBrain(
 
 class GokuEncryptedSettings(context: Context) {
     private val appContext = context.applicationContext
-    private val prefs: SharedPreferences = createSecurePrefs(appContext)
+    private val prefs: SharedPreferences by lazy { createSecurePrefs(appContext) }
     private val defaultTaskModelPath: String = File(appContext.filesDir, "models/goku_offline.task").absolutePath
 
     private fun createSecurePrefs(context: Context): SharedPreferences {
-        return runCatching {
+        fun buildEncrypted(): SharedPreferences {
             val masterKey = MasterKey.Builder(context)
                 .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
                 .build()
-            EncryptedSharedPreferences.create(
+            return EncryptedSharedPreferences.create(
                 context,
                 "goku_v10_secure_prefs",
                 masterKey,
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
             )
-        }.getOrElse {
-            // Safe fallback if hardware keystore is unavailable on OEM/emulator
-            context.getSharedPreferences("goku_v10_fallback_prefs", Context.MODE_PRIVATE)
         }
+
+        val secure = runCatching { buildEncrypted() }.getOrElse {
+            // Corrupted XML/keyset after restore/backup: wipe corrupted store once and retry
+            runCatching { context.deleteSharedPreferences("goku_v10_secure_prefs") }
+            runCatching { buildEncrypted() }.getOrNull()
+        }
+
+        val fallback = context.getSharedPreferences("goku_v10_fallback_prefs", Context.MODE_PRIVATE)
+        if (secure != null) {
+            // Migrate any values saved in fallback prefs into encrypted store to avoid split-brain
+            runCatching {
+                val pending = fallback.all
+                if (pending.isNotEmpty()) {
+                    val editor = secure.edit()
+                    pending.forEach { (k, v) ->
+                        when (v) {
+                            is String -> editor.putString(k, v)
+                            is Boolean -> editor.putBoolean(k, v)
+                            is Int -> editor.putInt(k, v)
+                            is Long -> editor.putLong(k, v)
+                            is Float -> editor.putFloat(k, v)
+                            is Set<*> -> @Suppress("UNCHECKED_CAST") editor.putStringSet(k, v as Set<String>)
+                        }
+                    }
+                    editor.apply()
+                    fallback.edit().clear().apply()
+                }
+            }
+            return secure
+        }
+        return fallback
     }
 
     var geminiApiKey: String
@@ -987,7 +1059,7 @@ class GokuVaultRepository(context: Context) {
             MemoryNodeEntity(key = key, value = value, category = category, relationTag = relationTag)
         }
         db.memoryNodeDao().upsert(node)
-        ragBrain.indexDocumentPersistent("memory:$key", "$key: $value ($relationTag)")
+        ragBrain.indexDocumentPersistent("memory:${node.key}", "${node.key}: $value ($relationTag)")
     }
 
     suspend fun searchMemories(query: String): List<MemoryNodeEntity> = withContext(Dispatchers.IO) {
@@ -1016,7 +1088,13 @@ class GokuVaultRepository(context: Context) {
     }
 
     suspend fun deleteMemory(id: Long) = withContext(Dispatchers.IO) {
+        val existing = db.memoryNodeDao().findById(id)
         db.memoryNodeDao().deleteById(id)
+        if (existing != null) {
+            val docName = "memory:${existing.key}"
+            ragBrain.removeDocument(docName)
+            runCatching { db.ragDocumentDao().deleteByDocName(docName) }
+        }
     }
 
     suspend fun recordScreenSnapshot(packageName: String, title: String, rawText: String) = withContext(Dispatchers.IO) {
@@ -1220,22 +1298,26 @@ class GokuVaultRepository(context: Context) {
             if (root.has("triggerPhrase")) put(root)
         }
         var imported = 0
+        val seenTriggers = HashSet<String>()
         for (i in 0 until arr.length()) {
             val obj = arr.optJSONObject(i) ?: continue
-            val name = obj.optString("name", "Imported Skill ${i + 1}")
+            val name = obj.optString("name", "Imported Skill ${i + 1}").trim().ifBlank { "Imported Skill ${i + 1}" }
             val trigger = obj.optString("triggerPhrase", "").trim()
             val steps = obj.optString("stepsJson", "[]")
-            if (trigger.isNotEmpty()) {
+            val normTrigger = trigger.lowercase(Locale.ROOT)
+            if (trigger.isNotEmpty() && seenTriggers.add(normTrigger)) {
+                val existing = db.learnedSkillDao().findByTrigger(trigger)
                 db.learnedSkillDao().upsert(
                     LearnedSkillEntity(
+                        id = existing?.id ?: 0L,
                         name = name,
                         triggerPhrase = trigger,
                         stepsJson = steps,
-                        preferredEngine = obj.optString("preferredEngine", "INTENT_ADB"),
-                        adbAvgMs = obj.optLong("adbAvgMs", 150L),
-                        adbSuccessRate = obj.optDouble("adbSuccessRate", 0.95).toFloat(),
-                        a11yAvgMs = obj.optLong("a11yAvgMs", 420L),
-                        a11ySuccessRate = obj.optDouble("a11ySuccessRate", 0.90).toFloat()
+                        preferredEngine = obj.optString("preferredEngine", existing?.preferredEngine ?: "INTENT_ADB"),
+                        adbAvgMs = obj.optLong("adbAvgMs", existing?.adbAvgMs ?: 150L),
+                        adbSuccessRate = obj.optDouble("adbSuccessRate", existing?.adbSuccessRate?.toDouble() ?: 0.95).toFloat(),
+                        a11yAvgMs = obj.optLong("a11yAvgMs", existing?.a11yAvgMs ?: 420L),
+                        a11ySuccessRate = obj.optDouble("a11ySuccessRate", existing?.a11ySuccessRate?.toDouble() ?: 0.90).toFloat()
                     )
                 )
                 imported++
@@ -1273,8 +1355,8 @@ class GokuVaultRepository(context: Context) {
             .mapValues { (_, v) -> v.sumOf { it.amountInr } }
             .entries.sortedByDescending { it.value }
             .take(3)
-            .joinToString(", ") { "${it.key} ₹${"%.0f".format(it.value)}" }
-        "Pichle 30 din mein kul ₹${"%.0f".format(total)} kharch hue (${items.size} entries). Top categories: $byCat."
+            .joinToString(", ") { "${it.key} ₹${"%.0f".format(Locale.US, it.value)}" }
+        "Pichle 30 din mein kul ₹${"%.0f".format(Locale.US, total)} kharch hue (${items.size} entries). Top categories: $byCat."
     }
 
     suspend fun logAction(

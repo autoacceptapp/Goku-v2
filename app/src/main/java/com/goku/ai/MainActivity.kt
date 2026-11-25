@@ -52,11 +52,16 @@ import com.goku.ai.voice.GokuEarAndVoiceEngine
 import com.goku.ai.voice.GokuKillSwitch
 import com.goku.ai.voice.SherpaOnnxKwsBridge
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 import java.io.File
 
 /**
@@ -69,6 +74,7 @@ fun hasAllCriticalRuntimePermissions(context: Context): Boolean {
         add(Manifest.permission.RECORD_AUDIO)
         add(Manifest.permission.CAMERA)
         add(Manifest.permission.ACCESS_FINE_LOCATION)
+        add(Manifest.permission.ACCESS_COARSE_LOCATION)
         add(Manifest.permission.CALL_PHONE)
         add(Manifest.permission.READ_PHONE_STATE)
         add(Manifest.permission.READ_CALL_LOG)
@@ -167,7 +173,10 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
     private val pluginEngine: SelfCodingPluginEngine = runtime.pluginEngine
     private val brain: HybridBrainAndSwarm = runtime.brain
 
-    private val _uiState = MutableStateFlow(GokuDashboardUiState(settings = loadSettingsSnapshot()))
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val settingsIoDispatcher = Dispatchers.IO.limitedParallelism(1)
+
+    private val _uiState = MutableStateFlow(GokuDashboardUiState())
     val uiState: StateFlow<GokuDashboardUiState> = _uiState.asStateFlow()
 
     init {
@@ -177,6 +186,8 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch(Dispatchers.IO) {
             prepareKwsDirectory(ctx)
+            val snapshot = loadSettingsSnapshot()
+            _uiState.update { it.copy(settings = snapshot) }
         }
 
         pluginEngine.scheduleNightlyDreamMode()
@@ -265,16 +276,15 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
             vault.expenses.collect { ex -> _uiState.update { it.copy(expenses = ex) } }
         }
         viewModelScope.launch {
-            GokuAccessibilityService.isConnected.collect { refreshPermissionStatus() }
-        }
-        viewModelScope.launch {
-            GokuNotificationListenerService.isConnected.collect { refreshPermissionStatus() }
-        }
-        viewModelScope.launch {
-            GokuKeepAliveService.isRunning.collect { refreshPermissionStatus() }
-        }
-        viewModelScope.launch {
-            FloatingOrbOverlayService.isOverlayActive.collect { refreshPermissionStatus() }
+            @OptIn(FlowPreview::class)
+            combine(
+                GokuAccessibilityService.isConnected,
+                GokuNotificationListenerService.isConnected,
+                GokuKeepAliveService.isRunning,
+                FloatingOrbOverlayService.isOverlayActive
+            ) { a11y, notif, keepAlive, orb -> listOf(a11y, notif, keepAlive, orb) }
+                .debounce(120L)
+                .collect { refreshPermissionStatus() }
         }
     }
 
@@ -380,20 +390,42 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleTeachMode(start: Boolean, skillName: String, trigger: String) {
         if (start) {
-            TeachModeRecorder.startRecording(skillName, trigger)
+            val cleanName = skillName.trim()
+            val cleanTrigger = trigger.trim()
+            if (cleanName.isBlank() || cleanTrigger.isBlank()) {
+                voiceEngine.speak("Skill name aur voice trigger dono likhein pehle.")
+                return
+            }
+            TeachModeRecorder.startRecording(cleanName, cleanTrigger)
             voiceEngine.speak("Teach mode shuru ho gaya. Jo steps sikhana hai un par tap karein.")
         } else {
             val (name, trig, stepsJson) = TeachModeRecorder.stopAndExport()
+            val cleanName = name.trim()
+            val cleanTrig = trig.trim()
+            val hasSteps = runCatching { JSONArray(stepsJson).length() > 0 }.getOrDefault(false)
+            if (cleanName.isBlank() || cleanTrig.isBlank() || !hasSteps) {
+                viewModelScope.launch {
+                    vault.logAction(
+                        "SYSTEM",
+                        "Teach Mode Discarded",
+                        "Skipped saving skill (missing name/trigger or 0 steps recorded)",
+                        85,
+                        "WARN"
+                    )
+                }
+                voiceEngine.speak("Koi steps record nahi hue ya naam khaali tha, isliye skill save nahi kiya.")
+                return
+            }
             viewModelScope.launch {
                 vault.upsertSkill(
                     LearnedSkillEntity(
-                        name = name,
-                        triggerPhrase = trig,
+                        name = cleanName,
+                        triggerPhrase = cleanTrig,
                         stepsJson = stepsJson
                     )
                 )
-                vault.logAction("SYSTEM", "Teach Mode Saved", "Skill '$name' trigger '$trig'", 98)
-                voiceEngine.speak("Skill $name save ho gaya boss!")
+                vault.logAction("SYSTEM", "Teach Mode Saved", "Skill '$cleanName' trigger '$cleanTrig'", 98)
+                voiceEngine.speak("Skill $cleanName save ho gaya boss!")
             }
         }
     }
@@ -457,25 +489,27 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateSettings(updated: GokuSettingsSnapshot) {
-        val s = vault.settings
-        s.geminiApiKey = updated.geminiKey
-        s.groqApiKey = updated.groqKey
-        s.deepSeekApiKey = updated.deepSeekKey
-        s.openRouterApiKey = updated.openRouterKey
-        s.sosContactsCsv = updated.sosContacts
-        s.githubRepo = updated.githubRepo
-        s.githubToken = updated.githubToken
-        s.telegramBotToken = updated.telegramBot
-        s.telegramChatId = updated.telegramChatId
-        s.smartCallPolicy = updated.smartCallPolicy
-        s.localModelPath = updated.localModelPath
-        s.dryRunMode = updated.dryRunMode
-        s.autoAdSkipEnabled = updated.autoAdSkip
-        s.otpAutopilotEnabled = updated.otpAutopilot
-        s.mistakeBlockerEnabled = updated.mistakeBlocker
-        s.workFocusMode = updated.workFocusMode
-        s.smartCallEnabled = updated.smartCallEnabled
         _uiState.update { it.copy(settings = updated) }
+        viewModelScope.launch(settingsIoDispatcher) {
+            val s = vault.settings
+            s.geminiApiKey = updated.geminiKey
+            s.groqApiKey = updated.groqKey
+            s.deepSeekApiKey = updated.deepSeekKey
+            s.openRouterApiKey = updated.openRouterKey
+            s.sosContactsCsv = updated.sosContacts
+            s.githubRepo = updated.githubRepo
+            s.githubToken = updated.githubToken
+            s.telegramBotToken = updated.telegramBot
+            s.telegramChatId = updated.telegramChatId
+            s.smartCallPolicy = updated.smartCallPolicy
+            s.localModelPath = updated.localModelPath
+            s.dryRunMode = updated.dryRunMode
+            s.autoAdSkipEnabled = updated.autoAdSkip
+            s.otpAutopilotEnabled = updated.otpAutopilot
+            s.mistakeBlockerEnabled = updated.mistakeBlocker
+            s.workFocusMode = updated.workFocusMode
+            s.smartCallEnabled = updated.smartCallEnabled
+        }
     }
 
     private fun loadSettingsSnapshot(): GokuSettingsSnapshot {
@@ -518,7 +552,6 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         CameraLiveEyeManager.attachContext(applicationContext)
-        prepareKwsDirectory(this)
         GokuKeepAliveService.createNotificationChannels(this)
         GokuKeepAliveService.startSafe(this)
 
@@ -598,6 +631,7 @@ class MainActivity : ComponentActivity() {
             add(Manifest.permission.RECORD_AUDIO)
             add(Manifest.permission.CAMERA)
             add(Manifest.permission.ACCESS_FINE_LOCATION)
+            add(Manifest.permission.ACCESS_COARSE_LOCATION)
             add(Manifest.permission.CALL_PHONE)
             add(Manifest.permission.READ_PHONE_STATE)
             add(Manifest.permission.READ_CALL_LOG)

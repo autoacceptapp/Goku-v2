@@ -139,6 +139,7 @@ dependencies {
   implementation("org.bouncycastle:bcpkix-jdk18on:1.79")
   implementation("org.mozilla:rhino:1.7.15")
   implementation("com.github.luben:zstd-jni:1.5.6-8@aar")
+  implementation(libs.conscrypt.android)
   implementation(libs.mlkit.text.recognition)
   // implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)
@@ -150,6 +151,7 @@ dependencies {
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
   testImplementation(libs.robolectric)
+  testImplementation(libs.conscrypt.openjdk.uber)
   androidTestImplementation(platform(libs.androidx.compose.bom))
   androidTestImplementation(libs.androidx.compose.ui.test.junit4)
   androidTestImplementation(libs.androidx.espresso.core)
@@ -159,4 +161,10 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.tooling)
   "ksp"(libs.androidx.room.compiler)
   // "ksp"(libs.moshi.kotlin.codegen)
+}
+
+configurations.configureEach {
+  if (name.contains("UnitTest", ignoreCase = true)) {
+    exclude(group = "org.conscrypt", module = "conscrypt-android")
+  }
 }

@@ -50,6 +50,10 @@ jobs:
             echo "GRADLE_CMD=gradle" >> "$GITHUB_ENV"
           fi
 
+      - name: Run Unit & Robolectric Tests
+        run: |
+          ${GRADLE_CMD} testDebugUnitTest --no-daemon --stacktrace
+
       - name: Assemble Goku V10 Debug APK
         run: |
           ${GRADLE_CMD} assembleDebug --no-daemon --stacktrace

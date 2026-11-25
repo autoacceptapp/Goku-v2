@@ -30,10 +30,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -89,7 +91,8 @@ data class OfflineModelPreset(
     val name: String,
     val subtitle: String,
     val approxSizeMb: Int,
-    val directUrl: String
+    val directUrl: String,
+    val isVerifiedDefault: Boolean = false
 )
 
 /**
@@ -100,30 +103,31 @@ val OFFLINE_MODEL_PRESETS = listOf(
     OfflineModelPreset(
         id = "qwen25_1_5b",
         name = "Qwen2.5 1.5B Instruct (Q8)",
-        subtitle = "Open-access LiteRT — Best Hinglish + JSON actions",
+        subtitle = "Verified Default • Open-access LiteRT — Best Hinglish + JSON actions",
         approxSizeMb = 1560,
-        directUrl = "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_seq128_q8_ekv1280.task"
+        directUrl = "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_seq128_q8_ekv1280.task",
+        isVerifiedDefault = true
     ),
     OfflineModelPreset(
         id = "qwen25_0_5b",
         name = "Qwen2.5 0.5B Instruct (Q8)",
-        subtitle = "Open-access LiteRT — Fast & light for 4GB+ RAM phones",
-        approxSizeMb = 520,
-        directUrl = "https://huggingface.co/litert-community/Qwen2.5-0.5B-Instruct/resolve/main/Qwen2.5-0.5B-Instruct_seq128_q8_ekv1280.task"
+        subtitle = "Verified Open-Access LiteRT — Fast & lightweight Qwen brain (4GB+ RAM)",
+        approxSizeMb = 540,
+        directUrl = "https://huggingface.co/litert-community/Qwen2.5-0.5B-Instruct/resolve/main/Qwen2.5-0.5B-Instruct_multi-prefill-seq_q8_ekv1280.task"
     ),
     OfflineModelPreset(
-        id = "smollm2_1_7b",
-        name = "SmolLM2 1.7B Instruct (Q8)",
-        subtitle = "Open-access LiteRT — Strong offline reasoning",
-        approxSizeMb = 1720,
-        directUrl = "https://huggingface.co/litert-community/SmolLM2-1.7B-Instruct/resolve/main/SmolLM2-1.7B-Instruct_seq128_q8_ekv1280.task"
+        id = "deepseek_r1_qwen_1_5b",
+        name = "DeepSeek-R1 Qwen 1.5B (Q8)",
+        subtitle = "Community LiteRT Mirror — Strong reasoning (use Default or Import if moved)",
+        approxSizeMb = 1580,
+        directUrl = "https://huggingface.co/litert-community/DeepSeek-R1-Distill-Qwen-1.5B/resolve/main/deepseek_q8_ekv1280.task"
     ),
     OfflineModelPreset(
         id = "smollm_135m",
         name = "SmolLM 135M Instruct (Q8)",
-        subtitle = "Open-access LiteRT — Ultra-compact quick test brain",
+        subtitle = "Community LiteRT Mirror — Ultra-compact test brain (use Default or Import if moved)",
         approxSizeMb = 145,
-        directUrl = "https://huggingface.co/litert-community/SmolLM-135M-Instruct/resolve/main/SmolLM-135M-Instruct_seq128_q8_ekv1280.task"
+        directUrl = "https://huggingface.co/litert-community/SmolLM-135M-Instruct/resolve/main/SmolLM-135M-Instruct_multi-prefill-seq_q8_ekv1280.task"
     )
 )
 
@@ -238,6 +242,9 @@ class OfflineModelDownloadManager(private val context: Context) {
     @Volatile
     var onModelChanged: (() -> Unit)? = null
 
+    private val opMutex = Mutex()
+    private val opLock = Any()
+    private val isTransferActive = AtomicBoolean(false)
     private var activeJob: Job? = null
     @Volatile
     private var activeCall: Call? = null
@@ -302,25 +309,30 @@ class OfflineModelDownloadManager(private val context: Context) {
             return
         }
 
-        // Prevent duplicate rapid taps while already downloading the same model
-        if (activeJob?.isActive == true) return
+        synchronized(opLock) {
+            // Prevent duplicate rapid taps while already downloading/importing
+            if (isTransferActive.get() || (activeJob?.isActive == true && !pauseRequested.get())) return
 
-        // If switching to a different model URL, clear any partial .tmp from previous model
-        if (cleanUrl != lastUrl && tempFile.exists()) {
-            tempFile.delete()
-            lastKnownTotalBytes = 0L
+            // If switching to a different model URL, clear any partial .tmp from previous model
+            if (cleanUrl != lastUrl && tempFile.exists()) {
+                tempFile.delete()
+                lastKnownTotalBytes = 0L
+            }
+
+            lastUrl = cleanUrl
+            lastModelName = modelName.ifBlank { cleanUrl.substringAfterLast('/').ifBlank { "Offline AI Model" } }
+            saveMeta(lastModelName, lastUrl, lastKnownTotalBytes)
+            launchDownloadJobLocked()
         }
-
-        lastUrl = cleanUrl
-        lastModelName = modelName.ifBlank { cleanUrl.substringAfterLast('/').ifBlank { "Offline AI Model" } }
-        saveMeta(lastModelName, lastUrl, lastKnownTotalBytes)
-        launchDownloadJob()
     }
 
     fun pauseDownload() {
-        pauseRequested.set(true)
-        activeCall?.cancel()
-        activeJob?.cancel()
+        synchronized(opLock) {
+            pauseRequested.set(true)
+            activeCall?.cancel()
+            activeJob?.cancel()
+            isTransferActive.set(false)
+        }
         val partialBytes = if (tempFile.exists()) tempFile.length() else 0L
         val total = lastKnownTotalBytes.coerceAtLeast(partialBytes)
         val pct = if (total > 0L) ((partialBytes * 100L) / total).toInt().coerceIn(0, 99) else 0
@@ -333,25 +345,39 @@ class OfflineModelDownloadManager(private val context: Context) {
     }
 
     fun resumeDownload() {
-        if (activeJob?.isActive == true) return
-        loadMeta()
-        if (lastUrl.isBlank()) {
-            lastUrl = OFFLINE_MODEL_PRESETS.first().directUrl
-            lastModelName = OFFLINE_MODEL_PRESETS.first().name
+        synchronized(opLock) {
+            if (isTransferActive.get() || (activeJob?.isActive == true && !pauseRequested.get())) return
+            loadMeta()
+            if (lastUrl.isBlank()) {
+                lastUrl = OFFLINE_MODEL_PRESETS.first().directUrl
+                lastModelName = OFFLINE_MODEL_PRESETS.first().name
+            }
+            launchDownloadJobLocked()
         }
-        launchDownloadJob()
     }
 
     fun deleteModel() {
-        pauseRequested.set(true)
-        activeCall?.cancel()
-        activeJob?.cancel()
-        onModelChanged?.invoke()
-        runCatching { finalModelFile.delete() }
-        runCatching { tempFile.delete() }
-        runCatching { metaFile.delete() }
-        lastKnownTotalBytes = 0L
-        _state.value = ModelDownloadState.Idle(partialMb = 0f, lastModelName = OFFLINE_MODEL_PRESETS.first().name)
+        synchronized(opLock) {
+            pauseRequested.set(true)
+            activeCall?.cancel()
+            val previousJob = activeJob
+            previousJob?.cancel()
+            isTransferActive.set(false)
+            onModelChanged?.invoke()
+            activeJob = scope.launch {
+                runCatching { previousJob?.join() }
+                opMutex.withLock {
+                    runCatching { finalModelFile.delete() }
+                    runCatching { tempFile.delete() }
+                    runCatching { metaFile.delete() }
+                    lastKnownTotalBytes = 0L
+                    _state.value = ModelDownloadState.Idle(
+                        partialMb = 0f,
+                        lastModelName = OFFLINE_MODEL_PRESETS.first().name
+                    )
+                }
+            }
+        }
     }
 
     /**
@@ -359,206 +385,244 @@ class OfflineModelDownloadManager(private val context: Context) {
      * without requiring broad storage permissions.
      */
     fun importLocalModel(uri: Uri) {
-        if (activeJob?.isActive == true) return
-        pauseRequested.set(false)
-        activeJob = scope.launch {
-            runCatching {
-                modelsDir.mkdirs()
-                val resolver = context.contentResolver
-                val displayName = uri.lastPathSegment?.substringAfterLast('/')?.ifBlank { "Imported Local Model" }
-                    ?: "Imported Local Model"
+        synchronized(opLock) {
+            if (isTransferActive.get() || (activeJob?.isActive == true && !pauseRequested.get())) return
+            val previousJob = activeJob
+            pauseRequested.set(false)
+            isTransferActive.set(true)
+            activeJob = scope.launch {
+                try {
+                    previousJob?.cancelAndJoin()
+                    opMutex.withLock {
+                        runCatching {
+                            modelsDir.mkdirs()
+                            val resolver = context.contentResolver
+                            val displayName = uri.lastPathSegment?.substringAfterLast('/')?.ifBlank { "Imported Local Model" }
+                                ?: "Imported Local Model"
 
-                _state.value = ModelDownloadState.Downloading(
-                    modelName = displayName,
-                    progressPercent = 0,
-                    downloadedMb = 0f,
-                    totalMb = 0f
-                )
+                            _state.value = ModelDownloadState.Downloading(
+                                modelName = displayName,
+                                progressPercent = 0,
+                                downloadedMb = 0f,
+                                totalMb = 0f
+                            )
 
-                val totalBytes = runCatching {
-                    resolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
-                }.getOrDefault(-1L)
+                            val totalBytes = runCatching {
+                                resolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
+                            }.getOrDefault(-1L)
 
-                resolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(tempFile, false).use { out ->
-                        val buffer = ByteArray(64 * 1024)
-                        var copied = 0L
-                        var lastEmit = 0L
-                        while (isActive && !pauseRequested.get()) {
-                            val read = input.read(buffer)
-                            if (read == -1) break
-                            out.write(buffer, 0, read)
-                            copied += read
-                            val now = System.currentTimeMillis()
-                            if (now - lastEmit >= 250L) {
-                                lastEmit = now
-                                val pct = if (totalBytes > 0L) ((copied * 100L) / totalBytes).toInt().coerceIn(0, 99) else 50
-                                _state.value = ModelDownloadState.Downloading(
-                                    modelName = displayName,
-                                    progressPercent = pct,
-                                    downloadedMb = bytesToMb(copied),
-                                    totalMb = if (totalBytes > 0L) bytesToMb(totalBytes) else bytesToMb(copied)
+                            resolver.openInputStream(uri)?.use { input ->
+                                FileOutputStream(tempFile, false).use { out ->
+                                    val buffer = ByteArray(64 * 1024)
+                                    var copied = 0L
+                                    var lastEmit = 0L
+                                    while (isActive && !pauseRequested.get()) {
+                                        val read = input.read(buffer)
+                                        if (read == -1) break
+                                        out.write(buffer, 0, read)
+                                        copied += read
+                                        val now = System.currentTimeMillis()
+                                        if (now - lastEmit >= 250L) {
+                                            lastEmit = now
+                                            val pct = if (totalBytes > 0L) ((copied * 100L) / totalBytes).toInt().coerceIn(0, 99) else 50
+                                            _state.value = ModelDownloadState.Downloading(
+                                                modelName = displayName,
+                                                progressPercent = pct,
+                                                downloadedMb = bytesToMb(copied),
+                                                totalMb = if (totalBytes > 0L) bytesToMb(totalBytes) else bytesToMb(copied)
+                                            )
+                                        }
+                                    }
+                                    out.flush()
+                                }
+                            } ?: throw IllegalStateException("Unable to open selected model file.")
+
+                            if (pauseRequested.get() || !isActive) {
+                                runCatching { tempFile.delete() }
+                                refreshStateFromDisk()
+                                return@withLock
+                            }
+
+                            if (tempFile.length() < MIN_VALID_MODEL_BYTES) {
+                                tempFile.delete()
+                                throw IllegalStateException("Selected file is too small to be a valid MediaPipe .task/.bin model.")
+                            }
+
+                            onModelChanged?.invoke()
+                            finalizeAtomicRename(displayName, "local://imported")
+                        }.onFailure { err ->
+                            if (err !is CancellationException) {
+                                _state.value = ModelDownloadState.Error(
+                                    message = "Local import failed: ${err.message ?: "Unknown error"}",
+                                    canResume = false
                                 )
+                            } else {
+                                runCatching { tempFile.delete() }
                             }
                         }
-                        out.flush()
                     }
-                } ?: throw IllegalStateException("Unable to open selected model file.")
-
-                if (tempFile.length() < MIN_VALID_MODEL_BYTES) {
-                    tempFile.delete()
-                    throw IllegalStateException("Selected file is too small to be a valid MediaPipe .task/.bin model.")
-                }
-
-                onModelChanged?.invoke()
-                finalizeAtomicRename(displayName, "local://imported")
-            }.onFailure { err ->
-                if (err !is CancellationException) {
-                    _state.value = ModelDownloadState.Error(
-                        message = "Local import failed: ${err.message ?: "Unknown error"}",
-                        canResume = false
-                    )
+                } finally {
+                    isTransferActive.set(false)
                 }
             }
         }
     }
 
-    private fun launchDownloadJob() {
+    private fun launchDownloadJobLocked() {
+        val previousJob = activeJob
         pauseRequested.set(false)
+        isTransferActive.set(true)
         activeJob = scope.launch {
+            var currentCall: Call? = null
             try {
-                modelsDir.mkdirs()
-                var existingBytes = if (tempFile.exists()) tempFile.length() else 0L
+                previousJob?.cancelAndJoin()
+                opMutex.withLock {
+                    modelsDir.mkdirs()
+                    var existingBytes = if (tempFile.exists()) tempFile.length() else 0L
 
-                val requestBuilder = Request.Builder()
-                    .url(lastUrl)
-                    .header("User-Agent", "Goku-10.1-godmode-Android")
-                if (existingBytes > 0L) {
-                    requestBuilder.header("Range", "bytes=$existingBytes-")
-                }
-
-                val call = httpClient.newCall(requestBuilder.build())
-                activeCall = call
-                val response = call.execute()
-
-                response.use { resp ->
-                    if (resp.code == 416) {
-                        // Partial file mismatch or already complete; restart cleanly
-                        tempFile.delete()
-                        lastKnownTotalBytes = 0L
-                        existingBytes = 0L
-                        _state.value = ModelDownloadState.Error(
-                            message = "Range reset required — tap Resume to restart cleanly.",
-                            canResume = true
-                        )
-                        return@launch
+                    val requestBuilder = Request.Builder()
+                        .url(lastUrl)
+                        .header("User-Agent", "Goku-10.1-godmode-Android")
+                    if (existingBytes > 0L) {
+                        requestBuilder.header("Range", "bytes=$existingBytes-")
                     }
 
-                    if (resp.code == 401 || resp.code == 403) {
-                        _state.value = ModelDownloadState.Error(
-                            message = "HTTP ${resp.code}: Gated repo requires login. Please select an open-access LiteRT preset above.",
-                            canResume = false
-                        )
-                        return@launch
-                    }
+                    val call = httpClient.newCall(requestBuilder.build())
+                    currentCall = call
+                    activeCall = call
+                    val response = call.execute()
 
-                    if (!resp.isSuccessful && resp.code != 206) {
-                        _state.value = ModelDownloadState.Error(
-                            message = "Download failed (HTTP ${resp.code}). Check internet and tap Resume.",
-                            canResume = existingBytes > 0L
-                        )
-                        return@launch
-                    }
-
-                    val body = resp.body ?: throw IllegalStateException("Empty response body from model server.")
-                    val isPartialResume = resp.code == 206 && existingBytes > 0L
-                    if (!isPartialResume) {
-                        existingBytes = 0L
-                    }
-
-                    val contentLength = body.contentLength()
-                    val totalBytes = when {
-                        isPartialResume && contentLength > 0L -> existingBytes + contentLength
-                        !isPartialResume && contentLength > 0L -> contentLength
-                        else -> parseTotalFromContentRange(resp.header("Content-Range")) ?: lastKnownTotalBytes
-                    }
-                    if (totalBytes > 0L) {
-                        lastKnownTotalBytes = totalBytes
-                        saveMeta(lastModelName, lastUrl, totalBytes)
-                    }
-
-                    var downloadedBytes = existingBytes
-                    var windowBytes = 0L
-                    var lastEmitMs = System.currentTimeMillis()
-
-                    _state.value = ModelDownloadState.Downloading(
-                        modelName = lastModelName,
-                        progressPercent = computePercent(downloadedBytes, totalBytes),
-                        downloadedMb = bytesToMb(downloadedBytes),
-                        totalMb = bytesToMb(totalBytes)
-                    )
-
-                    body.byteStream().use { input ->
-                        FileOutputStream(tempFile, isPartialResume).use { output ->
-                            val buffer = ByteArray(64 * 1024)
-                            while (isActive && !pauseRequested.get()) {
-                                val read = input.read(buffer)
-                                if (read == -1) break
-                                output.write(buffer, 0, read)
-                                downloadedBytes += read
-                                windowBytes += read
-
-                                val now = System.currentTimeMillis()
-                                val deltaMs = now - lastEmitMs
-                                if (deltaMs >= 300L) {
-                                    val speedMbPerSec = (windowBytes.toFloat() / (1024f * 1024f)) / (deltaMs / 1000f)
-                                    _state.value = ModelDownloadState.Downloading(
-                                        modelName = lastModelName,
-                                        progressPercent = computePercent(downloadedBytes, totalBytes),
-                                        downloadedMb = bytesToMb(downloadedBytes),
-                                        totalMb = bytesToMb(totalBytes),
-                                        speedMbps = speedMbPerSec
-                                    )
-                                    windowBytes = 0L
-                                    lastEmitMs = now
-                                }
-                            }
-                            output.flush()
+                    response.use { resp ->
+                        if (resp.code == 416) {
+                            // Partial file mismatch or already complete; restart cleanly
+                            tempFile.delete()
+                            lastKnownTotalBytes = 0L
+                            existingBytes = 0L
+                            _state.value = ModelDownloadState.Error(
+                                message = "Range reset required — tap Resume to restart cleanly.",
+                                canResume = true
+                            )
+                            return@withLock
                         }
-                    }
 
-                    if (pauseRequested.get() || !isActive) {
-                        val partial = tempFile.length()
-                        _state.value = ModelDownloadState.Paused(
-                            modelName = lastModelName,
-                            progressPercent = computePercent(partial, totalBytes),
-                            downloadedMb = bytesToMb(partial),
-                            totalMb = bytesToMb(totalBytes)
-                        )
-                        return@launch
-                    }
+                        if (resp.code == 401 || resp.code == 403) {
+                            _state.value = ModelDownloadState.Error(
+                                message = formatHttpErrorMessage(resp.code),
+                                canResume = false
+                            )
+                            return@withLock
+                        }
 
-                    if (totalBytes > 0L && downloadedBytes < totalBytes) {
-                        _state.value = ModelDownloadState.Paused(
+                        if (resp.code == 404) {
+                            runCatching { tempFile.delete() }
+                            lastKnownTotalBytes = 0L
+                            _state.value = ModelDownloadState.Error(
+                                message = formatHttpErrorMessage(404),
+                                canResume = false
+                            )
+                            return@withLock
+                        }
+
+                        if (!resp.isSuccessful && resp.code != 206) {
+                            _state.value = ModelDownloadState.Error(
+                                message = "Download failed (HTTP ${resp.code}). Check internet and tap Resume.",
+                                canResume = existingBytes > 0L
+                            )
+                            return@withLock
+                        }
+
+                        val body = resp.body ?: throw IllegalStateException("Empty response body from model server.")
+                        val isPartialResume = resp.code == 206 && existingBytes > 0L
+                        if (!isPartialResume) {
+                            existingBytes = 0L
+                        }
+
+                        val contentLength = body.contentLength()
+                        val totalBytes = when {
+                            isPartialResume && contentLength > 0L -> existingBytes + contentLength
+                            !isPartialResume && contentLength > 0L -> contentLength
+                            else -> parseTotalFromContentRange(resp.header("Content-Range")) ?: lastKnownTotalBytes
+                        }
+                        if (totalBytes > 0L) {
+                            lastKnownTotalBytes = totalBytes
+                            saveMeta(lastModelName, lastUrl, totalBytes)
+                        }
+
+                        var downloadedBytes = existingBytes
+                        var windowBytes = 0L
+                        var lastEmitMs = System.currentTimeMillis()
+
+                        _state.value = ModelDownloadState.Downloading(
                             modelName = lastModelName,
                             progressPercent = computePercent(downloadedBytes, totalBytes),
                             downloadedMb = bytesToMb(downloadedBytes),
                             totalMb = bytesToMb(totalBytes)
                         )
-                        return@launch
-                    }
 
-                    if (tempFile.length() < MIN_VALID_MODEL_BYTES) {
-                        tempFile.delete()
-                        _state.value = ModelDownloadState.Error(
-                            message = "Downloaded file appears incomplete or invalid (${bytesToMb(tempFile.length())} MB).",
-                            canResume = false
-                        )
-                        return@launch
-                    }
+                        body.byteStream().use { input ->
+                            FileOutputStream(tempFile, isPartialResume).use { output ->
+                                val buffer = ByteArray(64 * 1024)
+                                while (isActive && !pauseRequested.get()) {
+                                    val read = input.read(buffer)
+                                    if (read == -1) break
+                                    output.write(buffer, 0, read)
+                                    downloadedBytes += read
+                                    windowBytes += read
 
-                    onModelChanged?.invoke()
-                    finalizeAtomicRename(lastModelName, lastUrl)
+                                    val now = System.currentTimeMillis()
+                                    val deltaMs = now - lastEmitMs
+                                    if (deltaMs >= 300L) {
+                                        val speedMbPerSec = (windowBytes.toFloat() / (1024f * 1024f)) / (deltaMs / 1000f)
+                                        _state.value = ModelDownloadState.Downloading(
+                                            modelName = lastModelName,
+                                            progressPercent = computePercent(downloadedBytes, totalBytes),
+                                            downloadedMb = bytesToMb(downloadedBytes),
+                                            totalMb = bytesToMb(totalBytes),
+                                            speedMbps = speedMbPerSec
+                                        )
+                                        windowBytes = 0L
+                                        lastEmitMs = now
+                                    }
+                                }
+                                output.flush()
+                            }
+                        }
+
+                        if (pauseRequested.get() || !isActive) {
+                            val partial = tempFile.length()
+                            _state.value = ModelDownloadState.Paused(
+                                modelName = lastModelName,
+                                progressPercent = computePercent(partial, totalBytes),
+                                downloadedMb = bytesToMb(partial),
+                                totalMb = bytesToMb(totalBytes)
+                            )
+                            return@withLock
+                        }
+
+                        if (totalBytes > 0L && downloadedBytes < totalBytes) {
+                            _state.value = ModelDownloadState.Paused(
+                                modelName = lastModelName,
+                                progressPercent = computePercent(downloadedBytes, totalBytes),
+                                downloadedMb = bytesToMb(downloadedBytes),
+                                totalMb = bytesToMb(totalBytes)
+                            )
+                            return@withLock
+                        }
+
+                        val actualBytes = tempFile.length()
+                        if (actualBytes < MIN_VALID_MODEL_BYTES) {
+                            val actualMb = bytesToMb(actualBytes)
+                            tempFile.delete()
+                            _state.value = ModelDownloadState.Error(
+                                message = "Downloaded file appears incomplete or invalid (${"%.2f".format(Locale.US, actualMb)} MB).",
+                                canResume = false
+                            )
+                            return@withLock
+                        }
+
+                        onModelChanged?.invoke()
+                        finalizeAtomicRename(lastModelName, lastUrl)
+                    }
                 }
             } catch (ce: CancellationException) {
                 if (!pauseRequested.get()) {
@@ -572,7 +636,10 @@ class OfflineModelDownloadManager(private val context: Context) {
                     canResume = canResume
                 )
             } finally {
-                activeCall = null
+                if (activeCall === currentCall) {
+                    activeCall = null
+                }
+                isTransferActive.set(false)
             }
         }
     }
@@ -631,6 +698,12 @@ class OfflineModelDownloadManager(private val context: Context) {
 
     companion object {
         private const val MIN_VALID_MODEL_BYTES = 1L * 1024L * 1024L // 1 MB sanity threshold
+
+        fun formatHttpErrorMessage(code: Int): String = when (code) {
+            404 -> "HTTP 404: Model file URL server par nahi mila. Kripya verified default '${OFFLINE_MODEL_PRESETS.first().name}' preset chunein ya 'Import' button se local .task/.bin file (SAF) select karein."
+            401, 403 -> "HTTP $code: Gated repo requires login. Kripya verified open-access '${OFFLINE_MODEL_PRESETS.first().name}' preset ya local .task/.bin SAF Import use karein."
+            else -> "Download failed (HTTP $code). Check internet and tap Resume."
+        }
 
         @Volatile
         private var INSTANCE: OfflineModelDownloadManager? = null
@@ -751,8 +824,10 @@ class OnDeviceLlmEngine(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val engineMutex = Mutex()
+    private val timerLock = Any()
     private var llmInference: LlmInference? = null
     private var loadedModelPath: String? = null
+    @Volatile
     private var unloadTimerJob: Job? = null
 
     private val _isLoadedInRam = MutableStateFlow(false)
@@ -785,9 +860,13 @@ class OnDeviceLlmEngine(
 
     fun isModelAvailable(): Boolean = resolveActiveModelFile() != null
 
-    suspend fun unloadNow() {
-        unloadTimerJob?.cancel()
-        unloadTimerJob = null
+    suspend fun unloadNow(fromTimer: Boolean = false) {
+        if (!fromTimer) {
+            synchronized(timerLock) {
+                unloadTimerJob?.cancel()
+                unloadTimerJob = null
+            }
+        }
         engineMutex.withLock {
             runCatching { llmInference?.close() }
             llmInference = null
@@ -797,10 +876,19 @@ class OnDeviceLlmEngine(
     }
 
     private fun scheduleFifteenSecondIdleUnload() {
-        unloadTimerJob?.cancel()
-        unloadTimerJob = scope.launch {
-            delay(IDLE_UNLOAD_MS)
-            unloadNow()
+        synchronized(timerLock) {
+            unloadTimerJob?.cancel()
+            lateinit var createdJob: Job
+            createdJob = scope.launch {
+                delay(IDLE_UNLOAD_MS)
+                unloadNow(fromTimer = true)
+                synchronized(timerLock) {
+                    if (unloadTimerJob === createdJob) {
+                        unloadTimerJob = null
+                    }
+                }
+            }
+            unloadTimerJob = createdJob
         }
     }
 
@@ -1109,6 +1197,8 @@ class HybridBrainAndSwarm(
     private val _isOnline = MutableStateFlow(false)
     val isOnline: StateFlow<Boolean> = _isOnline.asStateFlow()
 
+    private val commandMutex = Mutex()
+
     private var torchEnabled = false
 
     init {
@@ -1128,23 +1218,31 @@ class HybridBrainAndSwarm(
         return online
     }
 
-    suspend fun confirmPendingAction(approved: Boolean): String {
-        val pending = _pendingConfirmation.value ?: return "Koi pending confirmation nahi hai."
-        _pendingConfirmation.value = null
-        return if (approved) {
-            _brainState.value = BrainVisualState.ACTING
-            val res = pending.onConfirm()
-            appendGokuMessage(res, "SWARM-CONFIRMED", pending.confidence)
-            voiceEngine.speak(res)
-            _brainState.value = BrainVisualState.IDLE
-            res
-        } else {
-            val cancelMsg = "Theek hai boss, action cancel kar diya: ${pending.actionSummary}"
-            vault.logAction("CRITIC", pending.actionSummary, "User rejected via Haan/Nahi gate", 100, "STOPPED")
-            appendGokuMessage(cancelMsg, "SAFETY-GATE", 100)
-            voiceEngine.speak(cancelMsg)
-            _brainState.value = BrainVisualState.IDLE
-            cancelMsg
+    suspend fun confirmPendingAction(approved: Boolean): String = commandMutex.withLock {
+        confirmPendingActionLocked(approved)
+    }
+
+    private suspend fun confirmPendingActionLocked(approved: Boolean): String {
+        val pending = _pendingConfirmation.getAndUpdate { null }
+            ?: return "Koi pending confirmation nahi hai."
+        return try {
+            if (approved) {
+                _brainState.value = BrainVisualState.ACTING
+                val res = pending.onConfirm()
+                appendGokuMessage(res, "SWARM-CONFIRMED", pending.confidence)
+                voiceEngine.speak(res)
+                res
+            } else {
+                val cancelMsg = "Theek hai boss, action cancel kar diya: ${pending.actionSummary}"
+                vault.logAction("CRITIC", pending.actionSummary, "User rejected via Haan/Nahi gate", 100, "STOPPED")
+                appendGokuMessage(cancelMsg, "SAFETY-GATE", 100)
+                voiceEngine.speak(cancelMsg)
+                cancelMsg
+            }
+        } finally {
+            if (_brainState.value != BrainVisualState.STOPPED) {
+                _brainState.value = BrainVisualState.IDLE
+            }
         }
     }
 
@@ -1153,7 +1251,7 @@ class HybridBrainAndSwarm(
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return ""
 
-        // 0. Highest-priority voice emergency stop check
+        // 0. Highest-priority voice emergency stop check (bypasses commandMutex to abort immediately)
         if (GokuKillSwitch.isStopPhrase(trimmed)) {
             GokuKillSwitch.triggerStop("Command: $trimmed")
             val stopReply = "Ruk gaya boss! Saare active actions band kar diye gaye hain."
@@ -1163,115 +1261,121 @@ class HybridBrainAndSwarm(
             return stopReply
         }
 
-        // 0B. Direct Multimodal Gemini Vision Live-Eye Result passthrough
-        if (trimmed.startsWith("[VISION-READY]")) {
-            val visionText = trimmed.removePrefix("[VISION-READY]").trim()
-            appendUserMessage("Camera Live-Eye Vision Scan")
-            vault.workingMemory.addTurn("GOKU", visionText)
-            vault.logAction("EXECUTOR", "Camera Live-Eye Vision", visionText, 97, "OK", System.currentTimeMillis() - startMs)
-            appendGokuMessage(visionText, "GEMINI-VISION", 97)
-            if (speakReply) voiceEngine.speak(visionText)
-            _brainState.value = BrainVisualState.IDLE
-            return visionText
-        }
+        return commandMutex.withLock {
+            try {
+                // 0B. Direct Multimodal Gemini Vision Live-Eye Result passthrough
+                if (trimmed.startsWith("[VISION-READY]")) {
+                    val visionText = trimmed.removePrefix("[VISION-READY]").trim()
+                    appendUserMessage("Camera Live-Eye Vision Scan")
+                    vault.workingMemory.addTurn("GOKU", visionText)
+                    vault.logAction("EXECUTOR", "Camera Live-Eye Vision", visionText, 97, "OK", System.currentTimeMillis() - startMs)
+                    appendGokuMessage(visionText, "GEMINI-VISION", 97)
+                    if (speakReply) voiceEngine.speak(visionText)
+                    return@withLock visionText
+                }
 
-        GokuKillSwitch.reset()
-        appendUserMessage(trimmed)
+                GokuKillSwitch.reset()
+                appendUserMessage(trimmed)
 
-        // Check if awaiting Hindi "Haan" / "Nahi" Safety Confirmation
-        val pending = _pendingConfirmation.value
-        if (pending != null) {
-            val low = trimmed.lowercase(Locale.ROOT)
-            if (low in listOf("haan", "han", "ha", "yes", "ok", "confirm", "kar do", "bhej do", "हां", "हाँ")) {
-                return confirmPendingAction(true)
+                // Check if awaiting Hindi "Haan" / "Nahi" Safety Confirmation
+                val pending = _pendingConfirmation.value
+                if (pending != null) {
+                    val low = trimmed.lowercase(Locale.ROOT)
+                    if (low in listOf("haan", "han", "ha", "yes", "ok", "confirm", "kar do", "bhej do", "हां", "हाँ")) {
+                        return@withLock confirmPendingActionLocked(true)
+                    }
+                    if (low in listOf("nahi", "na", "no", "cancel", "mat karo", "ruko", "नहीं")) {
+                        return@withLock confirmPendingActionLocked(false)
+                    }
+                    // Clear stale pending confirmation when a new unrelated command arrives
+                    _pendingConfirmation.value = null
+                }
+
+                // Resolve pronouns against 15-turn Working Memory
+                val resolvedInput = vault.workingMemory.resolvePronouns(trimmed)
+                vault.workingMemory.addTurn("USER", resolvedInput)
+
+                _brainState.value = BrainVisualState.THINKING
+                val dryRun = vault.settings.dryRunMode
+
+                // --------------------------------------------------------------------
+                // TIER 2: 0-SECOND FAST REFLEX ENGINE (INSTANT LOCAL EXECUTION)
+                // --------------------------------------------------------------------
+                val reflexResult = tryFastReflex(resolvedInput, dryRun)
+                if (reflexResult != null) {
+                    val (reply, badge, confidence) = reflexResult
+                    val elapsed = System.currentTimeMillis() - startMs
+                    vault.logAction("REFLEX", resolvedInput, reply, confidence, if (dryRun) "DRY_RUN" else "OK", elapsed)
+                    vault.workingMemory.addTurn("GOKU", reply)
+                    appendGokuMessage(reply, badge, confidence)
+                    if (speakReply) voiceEngine.speak(reply)
+                    return@withLock reply
+                }
+
+                // --------------------------------------------------------------------
+                // CHECK LEARNED .GOKU SKILLS (WITH A/B ENGINE BENCHMARKING)
+                // --------------------------------------------------------------------
+                val matchedSkill = vault.findMatchingSkill(resolvedInput)
+                if (matchedSkill != null) {
+                    _brainState.value = BrainVisualState.ACTING
+                    val skillStart = System.currentTimeMillis()
+                    val (ok, detail) = pilot.executeStepsJson(matchedSkill.stepsJson, dryRun = dryRun)
+                    val skillMs = System.currentTimeMillis() - skillStart
+                    val usedAdb = !adbEngine.useAccessibilityFallback.value
+                    vault.recordSkillBenchmark(matchedSkill, usedAdb, skillMs, ok)
+                    val reply = if (ok) "Skill '${matchedSkill.name}' complete (${skillMs}ms): $detail"
+                    else "Skill '${matchedSkill.name}' partial issue: $detail"
+                    vault.logAction("EXECUTOR", "Skill:${matchedSkill.name}", reply, if (ok) 96 else 65, if (ok) "OK" else "WARN", skillMs)
+                    appendGokuMessage(reply, "SKILL-MACRO", if (ok) 96 else 65)
+                    if (speakReply) voiceEngine.speak(reply)
+                    return@withLock reply
+                }
+
+                // --------------------------------------------------------------------
+                // TIER 3: MULTI-AGENT SWARM (PLANNER -> EXECUTOR -> CRITIC) + HYBRID AI
+                // --------------------------------------------------------------------
+                val screenSummary = pilot.captureCurrentScreenSummary()
+                val memories = vault.searchMemories(resolvedInput)
+                val ragHits = vault.ragBrain.queryPersistentFts(resolvedInput, topK = 5)
+                val memoryHint = memories.take(4).joinToString("; ") { "${it.key}=${it.value}" }
+                val ragHint = ragHits.take(3).joinToString("; ") { "${it.docName}: ${it.text.take(140)}" }
+                val combinedVaultHint = listOf(memoryHint, ragHint).filter { it.isNotBlank() }.joinToString(" | ")
+                val systemPrompt = DynamicContextCompressor.buildMicroSystemPrompt(
+                    screenSummary = screenSummary,
+                    workingContext = vault.workingMemory.buildCompressedContext(),
+                    memoryHint = combinedVaultHint
+                )
+
+                vault.logAction(
+                    stage = "PLANNER",
+                    command = resolvedInput,
+                    detail = "v10.1-godmode | Online=${isNetworkAvailable()}, LocalModel=${offlineLlm.isModelAvailable()}, VirtualDisplay=${adbEngine.virtualDisplayRunner.isActive.value}(#${adbEngine.virtualDisplayRunner.virtualDisplayId.value ?: -1}), Memories=${memories.size}, PersistentRAG=${ragHits.size}",
+                    confidence = 92,
+                    status = "OK"
+                )
+
+                val structuredResult: OnDeviceLlmResult = if (isNetworkAvailable()) {
+                    onlineRouter.queryWithFailover(resolvedInput, systemPrompt)
+                        ?: offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary)
+                } else {
+                    offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary)
+                }
+
+                val (aiReply, providerBadge) = executeStructuredAction(structuredResult, resolvedInput, dryRun)
+
+                // Critic verification pass
+                val elapsed = System.currentTimeMillis() - startMs
+                vault.logAction("CRITIC", resolvedInput, "Action=${structuredResult.action} verified via $providerBadge", 94, "OK", elapsed)
+                vault.workingMemory.addTurn("GOKU", aiReply)
+                appendGokuMessage(aiReply, providerBadge, 94)
+                if (speakReply) voiceEngine.speak(aiReply)
+                aiReply
+            } finally {
+                if (_brainState.value != BrainVisualState.STOPPED) {
+                    _brainState.value = BrainVisualState.IDLE
+                }
             }
-            if (low in listOf("nahi", "na", "no", "cancel", "mat karo", "ruko", "नहीं")) {
-                return confirmPendingAction(false)
-            }
         }
-
-        // Resolve pronouns against 15-turn Working Memory
-        val resolvedInput = vault.workingMemory.resolvePronouns(trimmed)
-        vault.workingMemory.addTurn("USER", resolvedInput)
-
-        _brainState.value = BrainVisualState.THINKING
-        val dryRun = vault.settings.dryRunMode
-
-        // --------------------------------------------------------------------
-        // TIER 2: 0-SECOND FAST REFLEX ENGINE (INSTANT LOCAL EXECUTION)
-        // --------------------------------------------------------------------
-        val reflexResult = tryFastReflex(resolvedInput, dryRun)
-        if (reflexResult != null) {
-            val (reply, badge, confidence) = reflexResult
-            val elapsed = System.currentTimeMillis() - startMs
-            vault.logAction("REFLEX", resolvedInput, reply, confidence, if (dryRun) "DRY_RUN" else "OK", elapsed)
-            vault.workingMemory.addTurn("GOKU", reply)
-            appendGokuMessage(reply, badge, confidence)
-            if (speakReply) voiceEngine.speak(reply)
-            _brainState.value = BrainVisualState.IDLE
-            return reply
-        }
-
-        // --------------------------------------------------------------------
-        // CHECK LEARNED .GOKU SKILLS (WITH A/B ENGINE BENCHMARKING)
-        // --------------------------------------------------------------------
-        val matchedSkill = vault.findMatchingSkill(resolvedInput)
-        if (matchedSkill != null) {
-            _brainState.value = BrainVisualState.ACTING
-            val skillStart = System.currentTimeMillis()
-            val (ok, detail) = pilot.executeStepsJson(matchedSkill.stepsJson, dryRun = dryRun)
-            val skillMs = System.currentTimeMillis() - skillStart
-            val usedAdb = !adbEngine.useAccessibilityFallback.value
-            vault.recordSkillBenchmark(matchedSkill, usedAdb, skillMs, ok)
-            val reply = if (ok) "Skill '${matchedSkill.name}' complete (${skillMs}ms): $detail"
-            else "Skill '${matchedSkill.name}' partial issue: $detail"
-            vault.logAction("EXECUTOR", "Skill:${matchedSkill.name}", reply, if (ok) 96 else 65, if (ok) "OK" else "WARN", skillMs)
-            appendGokuMessage(reply, "SKILL-MACRO", if (ok) 96 else 65)
-            if (speakReply) voiceEngine.speak(reply)
-            _brainState.value = BrainVisualState.IDLE
-            return reply
-        }
-
-        // --------------------------------------------------------------------
-        // TIER 3: MULTI-AGENT SWARM (PLANNER -> EXECUTOR -> CRITIC) + HYBRID AI
-        // --------------------------------------------------------------------
-        val screenSummary = pilot.captureCurrentScreenSummary()
-        val memories = vault.searchMemories(resolvedInput)
-        val ragHits = vault.ragBrain.queryPersistentFts(resolvedInput, topK = 5)
-        val memoryHint = memories.take(4).joinToString("; ") { "${it.key}=${it.value}" }
-        val ragHint = ragHits.take(3).joinToString("; ") { "${it.docName}: ${it.text.take(140)}" }
-        val combinedVaultHint = listOf(memoryHint, ragHint).filter { it.isNotBlank() }.joinToString(" | ")
-        val systemPrompt = DynamicContextCompressor.buildMicroSystemPrompt(
-            screenSummary = screenSummary,
-            workingContext = vault.workingMemory.buildCompressedContext(),
-            memoryHint = combinedVaultHint
-        )
-
-        vault.logAction(
-            stage = "PLANNER",
-            command = resolvedInput,
-            detail = "v10.1-godmode | Online=${isNetworkAvailable()}, LocalModel=${offlineLlm.isModelAvailable()}, VirtualDisplay=${adbEngine.virtualDisplayRunner.isActive.value}(#${adbEngine.virtualDisplayRunner.virtualDisplayId.value ?: -1}), Memories=${memories.size}, PersistentRAG=${ragHits.size}",
-            confidence = 92,
-            status = "OK"
-        )
-
-        val structuredResult: OnDeviceLlmResult = if (isNetworkAvailable()) {
-            onlineRouter.queryWithFailover(resolvedInput, systemPrompt)
-                ?: offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary)
-        } else {
-            offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary)
-        }
-
-        val (aiReply, providerBadge) = executeStructuredAction(structuredResult, resolvedInput, dryRun)
-
-        // Critic verification pass
-        val elapsed = System.currentTimeMillis() - startMs
-        vault.logAction("CRITIC", resolvedInput, "Action=${structuredResult.action} verified via $providerBadge", 94, "OK", elapsed)
-        vault.workingMemory.addTurn("GOKU", aiReply)
-        appendGokuMessage(aiReply, providerBadge, 94)
-        if (speakReply) voiceEngine.speak(aiReply)
-        _brainState.value = BrainVisualState.IDLE
-        return aiReply
     }
 
     /**
@@ -1372,8 +1476,8 @@ class HybridBrainAndSwarm(
                 val hour = timeMatch?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 23) ?: 7
                 val minute = timeMatch?.groupValues?.get(2)?.toIntOrNull()?.coerceIn(0, 59) ?: 0
                 if (!dryRun) setAlarmIntent(hour, minute)
-                val replyMsg = if (dryRun) "[DRY-RUN] Would set alarm for $hour:${"%02d".format(minute)}"
-                else "Alarm $hour:${"%02d".format(minute)} ke liye set kar diya boss."
+                val replyMsg = if (dryRun) "[DRY-RUN] Would set alarm for $hour:${"%02d".format(Locale.US, minute)}"
+                else "Alarm $hour:${"%02d".format(Locale.US, minute)} ke liye set kar diya boss."
                 replyMsg to "${result.badge}+ALARM"
             }
             "CALL" -> {
@@ -1527,19 +1631,31 @@ class HybridBrainAndSwarm(
         }
 
         // 8. Alarm Fast-Lane
-        if (lower.contains("alarm")) {
-            val timeMatch = Regex("(\\d{1,2})(?::(\\d{2}))?").find(lower)
-            val hour = timeMatch?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 23) ?: 7
-            val minute = timeMatch?.groupValues?.get(2)?.toIntOrNull()?.coerceIn(0, 59) ?: 0
+        if (Regex("\\balarm\\b").containsMatchIn(lower) &&
+            !lower.contains("cancel") &&
+            !lower.contains("delete") &&
+            !lower.contains("band")
+        ) {
+            val timeMatch = Regex("(\\d{1,2})(?::(\\d{2}))?\\s*(a\\.?m\\.?|p\\.?m\\.?|subah|shaam|raat)?", RegexOption.IGNORE_CASE).find(lower)
+            var hour = (timeMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 7).coerceIn(0, 23)
+            val minute = (timeMatch?.groupValues?.getOrNull(2)?.toIntOrNull() ?: 0).coerceIn(0, 59)
+            val period = timeMatch?.groupValues?.getOrNull(3).orEmpty().lowercase(Locale.ROOT)
+            if ((period.startsWith("p") || period == "shaam" || period == "raat") && hour in 1..11) {
+                hour += 12
+            } else if ((period.startsWith("a") || period == "subah") && hour == 12) {
+                hour = 0
+            }
             if (!dryRun) setAlarmIntent(hour, minute)
-            return Triple("Alarm $hour:${"%02d".format(minute)} ke liye set kar diya boss.", "INTENT-0.05S", 97)
+            return Triple("Alarm $hour:${"%02d".format(Locale.US, minute)} ke liye set kar diya boss.", "INTENT-0.05S", 97)
         }
 
         // 9. Call with Dual-Verification & Hindi "Haan" / "Nahi" Safety Gate
-        if (lower.startsWith("call ") || lower.contains("call karo") || lower.contains("phone lagao")) {
+        if (lower.startsWith("call ") ||
+            Regex("\\bcall\\s+karo\\b|\\bphone\\s+lagao\\b").containsMatchIn(lower)
+        ) {
             val targetRaw = input
-                .replace(Regex("^(call|phone lagao|call karo)\\s*", RegexOption.IGNORE_CASE), "")
-                .replace(Regex("\\s*(ko call karo|call karo|ko phone lagao)$", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("^(call|phone\\s+lagao|call\\s+karo)\\s*", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("\\s*(ko\\s+call\\s+karo|call\\s+karo|ko\\s+phone\\s+lagao)$", RegexOption.IGNORE_CASE), "")
                 .trim()
             if (targetRaw.isNotEmpty()) {
                 return prepareCallWithSafetyGate(targetRaw, dryRun)
@@ -1557,8 +1673,10 @@ class HybridBrainAndSwarm(
 
         // 10B. Headless Background WebView Read & Auto-Fill Commands
         if (lower.startsWith("read webpage ") || lower.startsWith("web read ") || lower.startsWith("read url ")) {
-            val url = input.substringAfter(" ").substringAfter(" ").trim()
-                .ifBlank { input.substringAfterLast(" ").trim() }
+            val url = input.replace(
+                Regex("^(read\\s+webpage|web\\s+read|read\\s+url)\\s+", RegexOption.IGNORE_CASE),
+                ""
+            ).trim()
             if (url.isNotBlank()) {
                 _brainState.value = BrainVisualState.ACTING
                 val (ok, text) = if (dryRun) true to "[DRY-RUN] Would read webpage $url in headless WebView."
@@ -1764,10 +1882,23 @@ class HybridBrainAndSwarm(
     }
 
     private suspend fun resolvePhoneNumber(targetRaw: String): String {
-        val digits = targetRaw.filter { it.isDigit() || it == '+' }
-        if (digits.length >= 7) return digits
-        val vaultMatch = vault.searchMemories(targetRaw).firstOrNull { it.value.any { ch -> ch.isDigit() } }
-        return vaultMatch?.value?.filter { it.isDigit() || it == '+' }.orEmpty()
+        extractFirstPhoneNumber(targetRaw)?.let { return it }
+        val vaultMatch = vault.searchMemories(targetRaw).firstOrNull { extractFirstPhoneNumber(it.value) != null }
+        return vaultMatch?.let { extractFirstPhoneNumber(it.value) }.orEmpty()
+    }
+
+    private fun extractFirstPhoneNumber(raw: String): String? {
+        val pattern = Regex(
+            "(?:\\+\\d{1,3}(?:[\\s-]\\d{2,5}){1,4}|\\+?\\d{7,15}|\\d{5}[\\s-]\\d{5}|\\d{3,5}-\\d{5,8}|\\d{3,4}[\\s-]\\d{3,4}[\\s-]\\d{3,4})"
+        )
+        val match = pattern.find(raw)?.value ?: return null
+        val normalized = buildString {
+            match.forEach { ch ->
+                if (ch.isDigit() || (ch == '+' && isEmpty())) append(ch)
+            }
+        }
+        val digits = normalized.count { it.isDigit() }
+        return normalized.takeIf { digits in 7..15 }
     }
 
     private fun setAlarmIntent(hour: Int, minute: Int) {
@@ -1822,7 +1953,7 @@ class HybridBrainAndSwarm(
         } else {
             @Suppress("DEPRECATION")
             SmsManager.getDefault()
-        }
+        } ?: return "SmsManager is device par available nahi hai."
         return runCatching {
             val parts = smsManager.divideMessage(body)
             smsManager.sendMultipartTextMessage(number, null, parts, null, null)
@@ -1849,7 +1980,11 @@ class HybridBrainAndSwarm(
         }
         // Clean fallback to standard foreground launch when Local ADB is not paired
         return launchAppByName(query, dryRun = false)?.let {
-            "$it (Local ADB pair karne par yeh VirtualDisplay #$displayId par invisibly chalega.)"
+            if (displayId != null) {
+                "$it (Local ADB pair karne par yeh VirtualDisplay #$displayId par invisibly chalega.)"
+            } else {
+                "$it (Local ADB pair karne par yeh VirtualDisplay par invisibly chalega.)"
+            }
         }
     }
 

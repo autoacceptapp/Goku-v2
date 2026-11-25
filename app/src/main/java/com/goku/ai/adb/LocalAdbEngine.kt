@@ -31,9 +31,12 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.io.IOException
 import java.math.BigInteger
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.TimeUnit
+import org.conscrypt.Conscrypt
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.KeyFactory
@@ -258,8 +261,14 @@ class AdbKeyManager(context: Context) {
             override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
         }
 
-        val sslContext = runCatching { SSLContext.getInstance("TLSv1.3") }
-            .getOrElse { SSLContext.getInstance("TLSv1.2") }
+        val conscryptProvider = runCatching { Conscrypt.newProvider() }.getOrNull()
+        val sslContext = if (conscryptProvider != null) {
+            runCatching { SSLContext.getInstance("TLSv1.3", conscryptProvider) }
+                .getOrElse { SSLContext.getInstance("TLSv1.2", conscryptProvider) }
+        } else {
+            runCatching { SSLContext.getInstance("TLSv1.3") }
+                .getOrElse { SSLContext.getInstance("TLSv1.2") }
+        }
         sslContext.init(arrayOf<KeyManager>(keyManager), arrayOf<TrustManager>(loopbackTrustManager), SecureRandom())
         return sslContext
     }
@@ -515,29 +524,15 @@ class AdbWirelessPairingClient(private val keyManager: AdbKeyManager) {
      * matching AOSP `adb/pairing_connection/pairing_connection.cpp` ("adb-label\0", 64 bytes).
      */
     private fun exportTlsKeyingMaterial(socket: SSLSocket): ByteArray {
-        val conscryptClasses = listOf(
-            "com.android.org.conscrypt.Conscrypt",
-            "org.conscrypt.Conscrypt"
-        )
-        for (className in conscryptClasses) {
-            val exported = runCatching {
-                val cls = Class.forName(className)
-                val method = cls.getMethod(
-                    "exportKeyingMaterial",
-                    SSLSocket::class.java,
-                    String::class.java,
-                    ByteArray::class.java,
-                    Int::class.javaPrimitiveType
-                )
-                method.invoke(null, socket, "adb-label\u0000", null, 64) as? ByteArray
-            }.getOrNull()
-            if (exported != null && exported.size == 64) {
-                return exported
-            }
+        val exported = runCatching {
+            Conscrypt.exportKeyingMaterial(socket, "adb-label\u0000", null, 64)
+        }.getOrElse { err ->
+            throw IllegalStateException("Conscrypt TLS keying material export failed: ${err.message}", err)
         }
-        // Fallback keying material derived from TLS session ID if Conscrypt hidden API is restricted
-        val sessionId = socket.session?.id ?: ByteArray(0)
-        return hkdfSha256(sessionId, ByteArray(0), "adb-label\u0000".toByteArray(Charsets.UTF_8), 64)
+        if (exported != null && exported.size == 64) {
+            return exported
+        }
+        throw IllegalStateException("Conscrypt TLS keying material export returned invalid length (${exported?.size ?: 0})")
     }
 
     private fun writePairingPacket(out: DataOutputStream, type: Byte, payload: ByteArray) {
@@ -637,8 +632,9 @@ class AdbConnectionClient(private val keyManager: AdbKeyManager) {
     suspend fun connect(host: String = "127.0.0.1", port: Int = 5555, useTls: Boolean = false): Boolean =
         ioMutex.withLock {
             closeLocked()
+            var sock: Socket? = null
             runCatching {
-                val sock: Socket = if (useTls) {
+                sock = if (useTls) {
                     val sslContext = keyManager.createClientSslContext()
                     (sslContext.socketFactory.createSocket() as SSLSocket).apply {
                         soTimeout = 3500
@@ -653,20 +649,23 @@ class AdbConnectionClient(private val keyManager: AdbKeyManager) {
                     }
                 }
 
-                val out = DataOutputStream(sock.getOutputStream())
-                val inp = DataInputStream(sock.getInputStream())
+                val activeSock = sock!!
+                val out = DataOutputStream(activeSock.getOutputStream())
+                val inp = DataInputStream(activeSock.getInputStream())
                 if (!performAdbHandshake(out, inp)) {
-                    runCatching { sock.close() }
+                    runCatching { activeSock.close() }
                     return@withLock false
                 }
 
-                persistentSocket = sock
+                persistentSocket = activeSock
                 persistentOut = out
                 persistentIn = inp
                 connectedPort = port
                 connectedViaTls = useTls
                 nextStreamId = 1
                 true
+            }.onFailure {
+                runCatching { sock?.close() }
             }.getOrDefault(false)
         }
 
@@ -678,49 +677,64 @@ class AdbConnectionClient(private val keyManager: AdbKeyManager) {
         if (!connect("127.0.0.1", tlsConnectPort, useTls = true)) return false
         val resp = runCatching { openAndReadService("tcpip:$targetTcpPort", timeoutMs = 4000L) }.getOrNull()
         disconnect()
-        return resp != null
+        return !resp.isNullOrBlank() && !resp.contains("error", ignoreCase = true)
     }
 
-    suspend fun openAndReadService(service: String, timeoutMs: Long = 4500L): String = ioMutex.withLock {
-        val sock = persistentSocket
-        val out = persistentOut
-        val inp = persistentIn
-        if (sock == null || sock.isClosed || !sock.isConnected || out == null || inp == null) {
-            throw IllegalStateException("ADB persistent socket not connected")
-        }
-
-        return@withLock withTimeout(timeoutMs) {
-            sock.soTimeout = timeoutMs.toInt().coerceIn(1000, 15000)
-            val localId = nextStreamId++
-            val openPayload = "$service\u0000".toByteArray(Charsets.UTF_8)
-            writeAdbPacket(out, CMD_OPEN, localId, 0, openPayload)
-
-            val output = ByteArrayOutputStream()
-            var remoteId = 0
-            var packets = 0
-            while (packets < 256) {
-                packets++
-                val pkt = readFullAdbPacket(inp)
-                when (pkt.command) {
-                    CMD_OKAY -> {
-                        if (pkt.arg1 == localId) remoteId = pkt.arg0
-                    }
-                    CMD_WRTE -> {
-                        if (pkt.arg1 == localId) {
-                            remoteId = pkt.arg0
-                            output.write(pkt.payload)
-                            writeAdbPacket(out, CMD_OKAY, localId, remoteId, ByteArray(0))
-                        }
-                    }
-                    CMD_CLSE -> {
-                        if (pkt.arg1 == localId) {
-                            writeAdbPacket(out, CMD_CLSE, localId, remoteId, ByteArray(0))
-                            break
-                        }
-                    }
-                }
+    suspend fun openAndReadService(service: String, timeoutMs: Long = 4500L): String = withContext(Dispatchers.IO) {
+        ioMutex.withLock {
+            val sock = persistentSocket
+            val out = persistentOut
+            val inp = persistentIn
+            if (sock == null || sock.isClosed || !sock.isConnected || out == null || inp == null) {
+                throw IllegalStateException("ADB persistent socket not connected")
             }
-            output.toString(Charsets.UTF_8.name())
+
+            val localId = nextStreamId++
+            var remoteId = 0
+            var closedCleanly = false
+            try {
+                withTimeout(timeoutMs) {
+                    sock.soTimeout = timeoutMs.toInt().coerceIn(1000, 15000)
+                    val openPayload = "$service\u0000".toByteArray(Charsets.UTF_8)
+                    writeAdbPacket(out, CMD_OPEN, localId, 0, openPayload)
+
+                    val output = ByteArrayOutputStream()
+                    var packets = 0
+                    while (packets < 256) {
+                        packets++
+                        val pkt = readFullAdbPacket(inp)
+                        when (pkt.command) {
+                            CMD_OKAY -> {
+                                if (pkt.arg1 == localId) remoteId = pkt.arg0
+                            }
+                            CMD_WRTE -> {
+                                if (pkt.arg1 == localId) {
+                                    remoteId = pkt.arg0
+                                    output.write(pkt.payload)
+                                    writeAdbPacket(out, CMD_OKAY, localId, remoteId, ByteArray(0))
+                                }
+                            }
+                            CMD_CLSE -> {
+                                if (pkt.arg1 == localId) {
+                                    writeAdbPacket(out, CMD_CLSE, localId, remoteId, ByteArray(0))
+                                    closedCleanly = true
+                                    break
+                                }
+                            }
+                        }
+                    }
+                    if (!closedCleanly) {
+                        throw IOException("ADB stream '$service' did not receive CMD_CLSE within $packets packets")
+                    }
+                    output.toString(Charsets.UTF_8.name())
+                }
+            } catch (t: Throwable) {
+                if (!closedCleanly && remoteId != 0) {
+                    runCatching { writeAdbPacket(out, CMD_CLSE, localId, remoteId, ByteArray(0)) }
+                }
+                closeLocked()
+                throw t
+            }
         }
     }
 
@@ -808,8 +822,14 @@ class AdbConnectionClient(private val keyManager: AdbKeyManager) {
         val arg1 = bb.int
         val len = bb.int
         bb.int // crc
-        bb.int // magic
-        val payload = if (len > 0 && len <= MAX_DATA) {
+        val magic = bb.int
+        if (magic != (cmd xor -1)) {
+            throw IOException("Invalid ADB packet magic: 0x${magic.toString(16)} for cmd=0x${cmd.toString(16)}")
+        }
+        if (len !in 0..MAX_DATA) {
+            throw IOException("Invalid ADB packet payload length: $len")
+        }
+        val payload = if (len > 0) {
             ByteArray(len).also { inp.readFully(it) }
         } else ByteArray(0)
         return AdbPacket(cmd, arg0, arg1, payload)
@@ -969,7 +989,7 @@ class VirtualDisplayBackgroundRunner(
     suspend fun inputTextOnVirtualDisplay(text: String): AdbCommandResult {
         val displayId = ensureVirtualDisplay()
             ?: return AdbCommandResult(false, "GokuVirtualScreen unavailable.", false, 0L)
-        val escaped = text.replace(" ", "%s").replace("\"", "").replace("'", "")
+        val escaped = LocalAdbEngine.escapeAdbInputText(text)
         return adbEngine.execShellCommand("input -d $displayId text $escaped")
     }
 
@@ -1074,6 +1094,9 @@ class LocalAdbEngine(private val context: Context) {
     private val _useAccessibilityFallback = MutableStateFlow(true)
     val useAccessibilityFallback: StateFlow<Boolean> = _useAccessibilityFallback.asStateFlow()
 
+    private val nsdLock = Any()
+    private val resolveQueue = ArrayDeque<Pair<NsdServiceInfo, Boolean>>()
+    private var isResolvingNsd = false
     private var pairingListener: NsdManager.DiscoveryListener? = null
     private var connectListener: NsdManager.DiscoveryListener? = null
 
@@ -1108,6 +1131,10 @@ class LocalAdbEngine(private val context: Context) {
 
     fun stopMdnsDiscovery() {
         val manager = nsdManager ?: return
+        synchronized(nsdLock) {
+            resolveQueue.clear()
+            isResolvingNsd = false
+        }
         pairingListener?.let { runCatching { manager.stopServiceDiscovery(it) } }
         connectListener?.let { runCatching { manager.stopServiceDiscovery(it) } }
         pairingListener = null
@@ -1127,12 +1154,33 @@ class LocalAdbEngine(private val context: Context) {
         }
     }
 
-    @Suppress("DEPRECATION")
     private fun resolveNsdService(serviceInfo: NsdServiceInfo, isPairing: Boolean) {
         val manager = nsdManager ?: return
-        runCatching {
+        synchronized(nsdLock) {
+            resolveQueue.addLast(serviceInfo to isPairing)
+            if (!isResolvingNsd) {
+                dispatchNextResolveLocked(manager)
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun dispatchNextResolveLocked(manager: NsdManager) {
+        val next = resolveQueue.removeFirstOrNull()
+        if (next == null) {
+            isResolvingNsd = false
+            return
+        }
+        isResolvingNsd = true
+        val (serviceInfo, isPairing) = next
+        val dispatched = runCatching {
             manager.resolveService(serviceInfo, object : NsdManager.ResolveListener {
-                override fun onResolveFailed(info: NsdServiceInfo?, errorCode: Int) {}
+                override fun onResolveFailed(info: NsdServiceInfo?, errorCode: Int) {
+                    synchronized(nsdLock) {
+                        isResolvingNsd = false
+                        dispatchNextResolveLocked(manager)
+                    }
+                }
                 override fun onServiceResolved(info: NsdServiceInfo) {
                     val port = info.port
                     if (port > 0) {
@@ -1149,8 +1197,17 @@ class LocalAdbEngine(private val context: Context) {
                             )
                         }
                     }
+                    synchronized(nsdLock) {
+                        isResolvingNsd = false
+                        dispatchNextResolveLocked(manager)
+                    }
                 }
             })
+            true
+        }.getOrDefault(false)
+        if (!dispatched) {
+            isResolvingNsd = false
+            dispatchNextResolveLocked(manager)
         }
     }
 
@@ -1180,6 +1237,7 @@ class LocalAdbEngine(private val context: Context) {
         }
 
         if (ok) {
+            stopMdnsDiscovery()
             _status.value = _status.value.copy(
                 isConnected = true,
                 port = activePort,
@@ -1283,6 +1341,7 @@ class LocalAdbEngine(private val context: Context) {
 
         AdbPairingOverlayBus.dismissOverlay()
         if (connected) {
+            stopMdnsDiscovery()
             AdbCommandResult(
                 success = true,
                 output = "Wireless Debugging paired & Local ADB active on 127.0.0.1:${_status.value.port}.",
@@ -1362,9 +1421,20 @@ class LocalAdbEngine(private val context: Context) {
         val localFallback = runCatching {
             withTimeout(2000L) {
                 val proc = ProcessBuilder("sh", "-c", command).redirectErrorStream(true).start()
-                val output = proc.inputStream.bufferedReader().use { it.readText() }
-                val exit = proc.waitFor()
-                exit to output.trim()
+                try {
+                    val outputFuture = java.util.concurrent.CompletableFuture.supplyAsync {
+                        proc.inputStream.bufferedReader().use { it.readText() }
+                    }
+                    val finished = proc.waitFor(1800L, TimeUnit.MILLISECONDS)
+                    if (!finished) {
+                        proc.destroyForcibly()
+                        throw IOException("Local shell command timed out")
+                    }
+                    val output = runCatching { outputFuture.get(300L, TimeUnit.MILLISECONDS) }.getOrDefault("")
+                    proc.exitValue() to output.trim()
+                } finally {
+                    runCatching { if (proc.isAlive) proc.destroyForcibly() }
+                }
             }
         }.getOrNull()
 
@@ -1420,7 +1490,7 @@ class LocalAdbEngine(private val context: Context) {
         execShellCommand("input swipe $x1 $y1 $x2 $y2 $durationMs")
 
     suspend fun dispatchAdbText(text: String): AdbCommandResult {
-        val escaped = text.replace(" ", "%s").replace("\"", "").replace("'", "")
+        val escaped = escapeAdbInputText(text)
         return execShellCommand("input text $escaped")
     }
 
@@ -1450,6 +1520,28 @@ class LocalAdbEngine(private val context: Context) {
     companion object {
         @Volatile
         private var INSTANCE: LocalAdbEngine? = null
+
+        private val SHELL_METACHARS = setOf(
+            '\\', ';', '&', '|', '$', '`', '"', '\'', '(', ')',
+            '<', '>', '*', '?', '[', ']', '{', '}', '~', '!', '#'
+        )
+
+        fun escapeAdbInputText(text: String): String {
+            val normalized = text
+                .replace("\r\n", " ")
+                .replace('\r', ' ')
+                .replace('\n', ' ')
+                .replace('\t', ' ')
+            val sb = StringBuilder(normalized.length + 16)
+            for (ch in normalized) {
+                when {
+                    ch == ' ' -> sb.append("%s")
+                    ch in SHELL_METACHARS -> sb.append('\\').append(ch)
+                    else -> sb.append(ch)
+                }
+            }
+            return sb.toString()
+        }
 
         fun getInstance(context: Context): LocalAdbEngine {
             return INSTANCE ?: synchronized(this) {

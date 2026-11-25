@@ -17,8 +17,10 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.CallLog
 import android.provider.Settings
@@ -27,6 +29,7 @@ import android.service.notification.StatusBarNotification
 import android.telecom.TelecomManager
 import android.telephony.SmsManager
 import android.telephony.TelephonyManager
+import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -68,6 +71,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
@@ -280,17 +284,16 @@ class GokuKeepAliveService : Service() {
         val hasMic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        val fgStarted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             val primaryType = if (hasMic) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             } else {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             }
-            val started = runCatching {
+            runCatching {
                 ServiceCompat.startForeground(this, NOTIF_ID_KEEP_ALIVE, notification, primaryType)
                 true
-            }.getOrDefault(false)
-            if (!started) {
+            }.getOrElse {
                 // Fallback on Android 14+ background boot if MICROPHONE FGS is temporarily restricted
                 runCatching {
                     ServiceCompat.startForeground(
@@ -299,12 +302,24 @@ class GokuKeepAliveService : Service() {
                         notification,
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                     )
-                }
+                    true
+                }.onFailure { err ->
+                    Log.e("GokuKeepAliveService", "startForeground failed", err)
+                }.getOrDefault(false)
             }
         } else {
             runCatching {
                 ServiceCompat.startForeground(this, NOTIF_ID_KEEP_ALIVE, notification, 0)
-            }
+                true
+            }.onFailure { err ->
+                Log.e("GokuKeepAliveService", "startForeground failed", err)
+            }.getOrDefault(false)
+        }
+
+        if (!fgStarted) {
+            _isRunning.value = false
+            stopSelf()
+            return START_NOT_STICKY
         }
 
         // Always wire headless voice routing & handle 1-tap post-boot mic unlock cleanly
@@ -334,16 +349,27 @@ class GokuKeepAliveService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // Auto-restart via AlarmManager watchdog if swiped from recents
-        val restartIntent = Intent(applicationContext, GokuKeepAliveService::class.java)
-        val pi = PendingIntent.getService(
-            applicationContext,
-            1001,
-            restartIntent,
-            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val am = getSystemService(Context.ALARM_SERVICE) as? AlarmManager
-        am?.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + 2500L, pi)
+        // Auto-restart via AlarmManager watchdog if swiped from recents and background FGS is permitted
+        if (canStartForegroundFromBackground(applicationContext)) {
+            val restartIntent = Intent(applicationContext, GokuKeepAliveService::class.java)
+            val pi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                PendingIntent.getForegroundService(
+                    applicationContext,
+                    1001,
+                    restartIntent,
+                    PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+                )
+            } else {
+                PendingIntent.getService(
+                    applicationContext,
+                    1001,
+                    restartIntent,
+                    PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+                )
+            }
+            val am = getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+            am?.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + 2500L, pi)
+        }
         super.onTaskRemoved(rootIntent)
     }
 
@@ -427,11 +453,61 @@ class GokuKeepAliveService : Service() {
             return builder.build()
         }
 
-        fun startSafe(context: Context) {
-            val intent = Intent(context, GokuKeepAliveService::class.java)
+        fun canStartForegroundFromBackground(context: Context): Boolean {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val batteryExempt = runCatching {
+                pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+            }.getOrDefault(false)
+            val overlayGranted = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false)
+            return batteryExempt || overlayGranted
+        }
+
+        fun postFgsRestrictedNotification(
+            context: Context,
+            title: String,
+            detail: String,
+            notifId: Int = 1014
+        ) {
+            val appCtx = context.applicationContext
+            createNotificationChannels(appCtx)
+            val canNotify = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                ContextCompat.checkSelfPermission(appCtx, Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+            if (!canNotify) return
+
+            val launchIntent = appCtx.packageManager.getLaunchIntentForPackage(appCtx.packageName)?.apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            } ?: Intent()
+            val pi = PendingIntent.getActivity(
+                appCtx,
+                notifId,
+                launchIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notif = NotificationCompat.Builder(appCtx, CHANNEL_ALERTS)
+                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setContentTitle(title)
+                .setContentText(detail)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(detail))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .setContentIntent(pi)
+                .build()
             runCatching {
-                ContextCompat.startForegroundService(context, intent)
+                appCtx.getSystemService(NotificationManager::class.java)?.notify(notifId, notif)
             }
+        }
+
+        fun startSafe(context: Context): Boolean {
+            if (!canStartForegroundFromBackground(context)) {
+                return false
+            }
+            val intent = Intent(context, GokuKeepAliveService::class.java)
+            return runCatching {
+                ContextCompat.startForegroundService(context, intent)
+                true
+            }.getOrDefault(false)
         }
 
         fun scheduleWatchdog(context: Context) {
@@ -451,7 +527,14 @@ class KeepAliveWatchdogWorker(
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
         if (!GokuKeepAliveService.isRunning.value) {
-            GokuKeepAliveService.startSafe(applicationContext)
+            val started = GokuKeepAliveService.startSafe(applicationContext)
+            if (!started) {
+                GokuKeepAliveService.postFgsRestrictedNotification(
+                    context = applicationContext,
+                    title = "Goku Keep-Alive Paused by Android",
+                    detail = "Tap to open Goku or grant Battery Optimization Exemption so 24x7 Keep-Alive stays active."
+                )
+            }
         }
         return Result.success()
     }
@@ -462,7 +545,14 @@ class BootReceiver : BroadcastReceiver() {
         val action = intent?.action ?: return
         when (action) {
             Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
-                GokuKeepAliveService.startSafe(context)
+                val started = GokuKeepAliveService.startSafe(context)
+                if (!started) {
+                    GokuKeepAliveService.postFgsRestrictedNotification(
+                        context = context,
+                        title = "Tap to Resume Goku After Reboot",
+                        detail = "Android restricted background foreground service launch. Tap to resume Goku V10.1."
+                    )
+                }
                 GokuKeepAliveService.scheduleWatchdog(context)
             }
             TelephonyManager.ACTION_PHONE_STATE_CHANGED -> {
@@ -470,28 +560,125 @@ class BootReceiver : BroadcastReceiver() {
                 if (state == TelephonyManager.EXTRA_STATE_RINGING) {
                     val vault = GokuVaultRepository.getInstance(context)
                     if (vault.settings.smartCallEnabled && !GokuKillSwitch.isStopped.value) {
-                        val hasCallLog = ContextCompat.checkSelfPermission(
-                            context,
-                            Manifest.permission.READ_CALL_LOG
-                        ) == PackageManager.PERMISSION_GRANTED
                         @Suppress("DEPRECATION")
                         val rawNumber = intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)?.trim().orEmpty()
-                        // Android 9+ fires TWO RINGING broadcasts when READ_CALL_LOG is granted:
-                        // #1 has null EXTRA_INCOMING_NUMBER, #2 carries the real caller phone number.
-                        if (hasCallLog && rawNumber.isBlank()) {
+                        if (rawNumber.isNotBlank()) {
+                            SmartCallScreenerService.updateIncomingNumberHint(rawNumber)
+                        }
+
+                        val now = SystemClock.elapsedRealtime()
+                        val shouldStart = synchronized(BootReceiver::class.java) {
+                            if (now - lastRingStartMs < RING_DEBOUNCE_MS) {
+                                false
+                            } else {
+                                lastRingStartMs = now
+                                true
+                            }
+                        }
+                        if (!shouldStart) return
+
+                        val callerHint = rawNumber.ifBlank { "Unknown" }
+                        if (!GokuKeepAliveService.canStartForegroundFromBackground(context)) {
+                            postSmartCallFgsBlockedFallback(
+                                context,
+                                vault,
+                                callerHint,
+                                IllegalStateException("Android 12+ background FGS exemption not granted")
+                            )
                             return
                         }
+
                         val svc = Intent(context, SmartCallScreenerService::class.java).apply {
                             putExtra(
                                 SmartCallScreenerService.EXTRA_INCOMING_NUMBER,
-                                rawNumber.ifBlank { "Unknown" }
+                                callerHint
                             )
                         }
-                        runCatching { ContextCompat.startForegroundService(context, svc) }
+                        runCatching {
+                            ContextCompat.startForegroundService(context, svc)
+                        }.onFailure { err ->
+                            postSmartCallFgsBlockedFallback(context, vault, callerHint, err)
+                        }
                     }
                 }
             }
         }
+    }
+
+    private fun postSmartCallFgsBlockedFallback(
+        context: Context,
+        vault: GokuVaultRepository,
+        callerHint: String,
+        error: Throwable
+    ) {
+        val appCtx = context.applicationContext
+        GokuKeepAliveService.createNotificationChannels(appCtx)
+
+        val batteryIntent = Intent(
+            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+            Uri.parse("package:${appCtx.packageName}")
+        ).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val fallbackIntent = appCtx.packageManager.getLaunchIntentForPackage(appCtx.packageName)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        } ?: batteryIntent
+
+        val pi = PendingIntent.getActivity(
+            appCtx,
+            NOTIF_ID_FGS_BLOCKED,
+            runCatching {
+                if (batteryIntent.resolveActivity(appCtx.packageManager) != null) batteryIntent else fallbackIntent
+            }.getOrDefault(fallbackIntent),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(appCtx, GokuKeepAliveService.CHANNEL_ALERTS)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle("Smart Call Blocked by Android Battery Rules")
+            .setContentText("Tap to grant Battery Optimization Exemption so Goku can auto-answer calls ($callerHint).")
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    "Android blocked background Smart Call service for incoming call ($callerHint). Tap to allow unrestricted battery usage in Setup."
+                )
+            )
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(pi)
+            .build()
+
+        val canNotify = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(appCtx, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        if (canNotify) {
+            runCatching {
+                appCtx.getSystemService(NotificationManager::class.java)
+                    ?.notify(NOTIF_ID_FGS_BLOCKED, notification)
+            }
+        }
+
+        val pendingResult = runCatching { goAsync() }.getOrNull()
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                vault.logAction(
+                    stage = "SYSTEM",
+                    command = "SmartCall FGS Blocked",
+                    detail = "Android 12+ background FGS start denied (${error.javaClass.simpleName}: ${error.message}). Grant Battery Optimization Exemption. Caller=$callerHint",
+                    confidence = 100,
+                    status = "WARN"
+                )
+            } finally {
+                runCatching { pendingResult?.finish() }
+            }
+        }
+    }
+
+    companion object {
+        private const val RING_DEBOUNCE_MS = 2_500L
+        private const val NOTIF_ID_FGS_BLOCKED = 1013
+
+        @Volatile
+        private var lastRingStartMs: Long = 0L
     }
 }
 
@@ -510,6 +697,7 @@ class FloatingOrbOverlayService : Service() {
         super.onCreate()
         GokuKeepAliveService.createNotificationChannels(this)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+        observeAdbPairingOverlayRequests()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -517,18 +705,21 @@ class FloatingOrbOverlayService : Service() {
         val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
         } else 0
-        runCatching {
+        val fgStarted = runCatching {
             ServiceCompat.startForeground(this, NOTIF_ID_ORB, notif, fgsType)
-        }
+            true
+        }.onFailure { err ->
+            Log.e("FloatingOrbOverlay", "startForeground failed", err)
+        }.getOrDefault(false)
 
-        if (!Settings.canDrawOverlays(this)) {
+        if (!fgStarted || !Settings.canDrawOverlays(this)) {
+            _isOverlayActive.value = false
             stopSelf()
             return START_NOT_STICKY
         }
 
         GokuHeadlessCommandBus.ensureVoiceCallbackWired(applicationContext)
         showOrbOverlay()
-        observeAdbPairingOverlayRequests()
         _isOverlayActive.value = true
         return START_STICKY
     }
@@ -936,7 +1127,7 @@ class GokuNotificationListenerService : NotificationListenerService() {
 
 class SmartCallScreenerService : Service() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var screeningJob: Job? = null
     @Volatile
     private var activeCallerNumber: String = "Unknown"
@@ -944,44 +1135,97 @@ class SmartCallScreenerService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         GokuKeepAliveService.createNotificationChannels(this)
         val notif = GokuKeepAliveService.buildKeepAliveNotification(this, "Smart Call 30s Auto-Answer Ready")
-        val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        } else 0
-        runCatching {
-            ServiceCompat.startForeground(this, NOTIF_ID_CALL, notif, fgsType)
+        val hasMic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        val fgStarted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val primaryType = if (hasMic) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            }
+            runCatching {
+                ServiceCompat.startForeground(this, NOTIF_ID_CALL, notif, primaryType)
+                true
+            }.getOrElse {
+                runCatching {
+                    ServiceCompat.startForeground(
+                        this,
+                        NOTIF_ID_CALL,
+                        notif,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                    )
+                    true
+                }.onFailure { err ->
+                    Log.e("SmartCallScreener", "startForeground failed", err)
+                }.getOrDefault(false)
+            }
+        } else {
+            runCatching {
+                ServiceCompat.startForeground(this, NOTIF_ID_CALL, notif, 0)
+                true
+            }.onFailure { err ->
+                Log.e("SmartCallScreener", "startForeground failed", err)
+            }.getOrDefault(false)
+        }
+
+        if (!fgStarted) {
+            stopSelf()
+            return START_NOT_STICKY
         }
 
         val incomingNumber = intent?.getStringExtra(EXTRA_INCOMING_NUMBER)?.trim().orEmpty()
-        val resolved = resolveCallerNumber(incomingNumber)
+        val resolvedSync = resolveCallerNumberHintSync(incomingNumber)
         if (screeningJob?.isActive == true) {
             // If Android fired a second RINGING broadcast with the real number, upgrade activeCallerNumber without resetting timer
-            if (isValidDialableNumber(resolved)) {
-                activeCallerNumber = resolved
+            if (isValidDialableNumber(resolvedSync)) {
+                activeCallerNumber = resolvedSync
+            } else {
+                scope.launch {
+                    val resolvedIo = resolveCallerNumber(incomingNumber)
+                    if (isValidDialableNumber(resolvedIo)) {
+                        activeCallerNumber = resolvedIo
+                    }
+                }
             }
         } else {
-            activeCallerNumber = resolved
+            activeCallerNumber = resolvedSync
             startThirtySecondCountdown()
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun isValidDialableNumber(number: String): Boolean {
-        val digits = number.filter { it.isDigit() }
-        return digits.length >= 6 && !number.equals("Unknown", ignoreCase = true)
+        return Companion.isValidDialableNumber(number)
     }
 
-    @SuppressLint("MissingPermission")
-    private fun resolveCallerNumber(intentNumber: String): String {
+    private fun resolveCallerNumberHintSync(intentNumber: String): String {
         val cleaned = intentNumber.trim()
         if (isValidDialableNumber(cleaned)) return cleaned
 
+        val hintFresh = (SystemClock.elapsedRealtime() - latestHintTimeMs) <= 90_000L
+        val hint = if (hintFresh) latestIncomingNumberHint.trim() else ""
+        if (isValidDialableNumber(hint)) return hint
+
+        return cleaned.ifBlank { "Unknown" }
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun resolveCallerNumber(intentNumber: String): String {
+        val syncMatch = resolveCallerNumberHintSync(intentNumber)
+        if (isValidDialableNumber(syncMatch)) return syncMatch
+
+        return resolveCallerNumberFromCallLog() ?: syncMatch
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun resolveCallerNumberFromCallLog(): String? = withContext(Dispatchers.IO) {
         val hasCallLog = ContextCompat.checkSelfPermission(
             applicationContext,
             Manifest.permission.READ_CALL_LOG
         ) == PackageManager.PERMISSION_GRANTED
-        if (!hasCallLog) return cleaned.ifBlank { "Unknown" }
+        if (!hasCallLog) return@withContext null
 
-        return runCatching {
+        runCatching {
             val cutoffMs = System.currentTimeMillis() - 90_000L
             contentResolver.query(
                 CallLog.Calls.CONTENT_URI,
@@ -1004,7 +1248,7 @@ class SmartCallScreenerService : Service() {
                 }
                 null
             }
-        }.getOrNull() ?: cleaned.ifBlank { "Unknown" }
+        }.getOrNull()
     }
 
     @SuppressLint("MissingPermission")
@@ -1031,8 +1275,12 @@ class SmartCallScreenerService : Service() {
 
             // Wait 30 seconds for user to answer first
             for (sec in 30 downTo 1) {
-                if (GokuKillSwitch.isStopped.value) return@launch
+                if (GokuKillSwitch.isStopped.value) {
+                    stopSelf()
+                    return@launch
+                }
                 if (currentCallState() != TelephonyManager.CALL_STATE_RINGING) {
+                    stopSelf()
                     return@launch // User answered or caller hung up
                 }
                 delay(1000L)
@@ -1144,35 +1392,44 @@ class SmartCallScreenerService : Service() {
                             openDirectWindow = false
                         )
                     }
+                    stopSelf()
                 }
             } else {
                 val finalNumber = resolveCallerNumber(callerNumber)
                 sendAutoSmsFallback(finalNumber, vault)
+                stopSelf()
             }
         }
     }
 
-    private fun sendAutoSmsFallback(callerNumber: String, vault: GokuVaultRepository) {
-        val hasSms = ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS) ==
+    private suspend fun sendAutoSmsFallback(callerNumber: String, vault: GokuVaultRepository) = withContext(Dispatchers.IO) {
+        val hasSms = ContextCompat.checkSelfPermission(this@SmartCallScreenerService, Manifest.permission.SEND_SMS) ==
             PackageManager.PERMISSION_GRANTED
         val resolvedNumber = resolveCallerNumber(callerNumber)
         if (!hasSms || !isValidDialableNumber(resolvedNumber)) {
-            scope.launch {
-                vault.logAction(
-                    stage = "EXECUTOR",
-                    command = "SmartCall SMS Fallback",
-                    detail = "SMS skipped (hasSms=$hasSms, number=$resolvedNumber)",
-                    confidence = 60,
-                    status = "WARN"
-                )
-            }
-            return
+            vault.logAction(
+                stage = "EXECUTOR",
+                command = "SmartCall SMS Fallback",
+                detail = "SMS skipped (hasSms=$hasSms, number=$resolvedNumber)",
+                confidence = 60,
+                status = "WARN"
+            )
+            return@withContext
         }
         val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             getSystemService(SmsManager::class.java)
         } else {
             @Suppress("DEPRECATION")
             SmsManager.getDefault()
+        } ?: run {
+            vault.logAction(
+                stage = "EXECUTOR",
+                command = "SmartCall SMS Fallback",
+                detail = "SmsManager unavailable on device; auto-SMS skipped for $resolvedNumber",
+                confidence = 50,
+                status = "WARN"
+            )
+            return@withContext
         }
         runCatching {
             smsManager.sendTextMessage(
@@ -1182,14 +1439,23 @@ class SmartCallScreenerService : Service() {
                 null,
                 null
             )
-            scope.launch {
-                vault.logAction("EXECUTOR", "SmartCall SMS Fallback", "Auto-SMS sent to $resolvedNumber", 94)
-            }
+            vault.logAction("EXECUTOR", "SmartCall SMS Fallback", "Auto-SMS sent to $resolvedNumber", 94)
+        }.onFailure { err ->
+            vault.logAction(
+                stage = "EXECUTOR",
+                command = "SmartCall SMS Fallback",
+                detail = "Auto-SMS failed for $resolvedNumber: ${err.message}",
+                confidence = 55,
+                status = "WARN"
+            )
         }
+        Unit
     }
 
     override fun onDestroy() {
         screeningJob?.cancel()
+        latestIncomingNumberHint = ""
+        latestHintTimeMs = 0L
         scope.cancel()
         super.onDestroy()
     }
@@ -1199,5 +1465,26 @@ class SmartCallScreenerService : Service() {
     companion object {
         const val EXTRA_INCOMING_NUMBER = "extra_incoming_number"
         private const val NOTIF_ID_CALL = 1012
+
+        @Volatile
+        private var latestIncomingNumberHint: String = ""
+
+        @Volatile
+        private var latestHintTimeMs: Long = 0L
+
+        fun isValidDialableNumber(number: String): Boolean {
+            val cleaned = number.trim()
+            if (cleaned.isBlank() || cleaned.equals("Unknown", ignoreCase = true)) return false
+            val digits = cleaned.filter { it.isDigit() }
+            return digits.length >= 6 && !digits.all { it == '0' }
+        }
+
+        fun updateIncomingNumberHint(number: String) {
+            val cleaned = number.trim()
+            if (isValidDialableNumber(cleaned)) {
+                latestIncomingNumberHint = cleaned
+                latestHintTimeMs = SystemClock.elapsedRealtime()
+            }
+        }
     }
 }
