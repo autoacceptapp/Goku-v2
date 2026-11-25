@@ -37,6 +37,9 @@ import com.goku.ai.brain.HybridBrainAndSwarm
 import com.goku.ai.brain.OfflineModelDownloadManager
 import com.goku.ai.data.GokuVaultRepository
 import com.goku.ai.data.LearnedSkillEntity
+import com.goku.ai.persona.GokuEmotionPersonaEngine
+import com.goku.ai.persona.GokuPersonaConfig
+import com.goku.ai.persona.PersonaPresetId
 import com.goku.ai.services.FloatingOrbOverlayService
 import com.goku.ai.services.GokuHeadlessCommandBus
 import com.goku.ai.services.GokuKeepAliveService
@@ -50,7 +53,9 @@ import com.goku.ai.ui.GokuSettingsSnapshot
 import com.goku.ai.ui.PermissionWizardStatus
 import com.goku.ai.voice.GokuEarAndVoiceEngine
 import com.goku.ai.voice.GokuKillSwitch
+import com.goku.ai.voice.OnnxModelDownloader
 import com.goku.ai.voice.SherpaOnnxKwsBridge
+import com.goku.ai.voice.VoicePackManager
 import android.widget.Toast
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -173,7 +178,10 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
     private val intruderGuard = AntiTheftIntruderGuard.getInstance(ctx)
     private val pluginEngine: SelfCodingPluginEngine = runtime.pluginEngine
     private val brain: HybridBrainAndSwarm = runtime.brain
+    private val personaEngine: GokuEmotionPersonaEngine = brain.personaEngine
     private val modelDownloadManager: OfflineModelDownloadManager = OfflineModelDownloadManager.getInstance(ctx)
+    private val voiceModelDownloader: OnnxModelDownloader = OnnxModelDownloader.getInstance(ctx)
+    private val voicePackManager: VoicePackManager = VoicePackManager.getInstance(ctx)
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private val settingsIoDispatcher = Dispatchers.IO.limitedParallelism(1)
@@ -290,6 +298,18 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
             vault.expenses.collect { ex -> _uiState.update { it.copy(expenses = ex) } }
         }
         viewModelScope.launch {
+            personaEngine.state.collect { emo -> _uiState.update { it.copy(emotionState = emo) } }
+        }
+        viewModelScope.launch {
+            voiceModelDownloader.bundles.collect { list -> _uiState.update { it.copy(voiceModelBundles = list) } }
+        }
+        viewModelScope.launch {
+            voiceModelDownloader.progressMap.collect { map -> _uiState.update { it.copy(voiceDownloadProgress = map) } }
+        }
+        viewModelScope.launch {
+            voiceModelDownloader.activeModelId.collect { id -> _uiState.update { it.copy(activeVoiceModelId = id) } }
+        }
+        viewModelScope.launch {
             @OptIn(FlowPreview::class)
             combine(
                 GokuAccessibilityService.isConnected,
@@ -391,6 +411,81 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
 
     fun importLocalOfflineModel(uri: Uri) {
         modelDownloadManager.importLocalModel(uri)
+    }
+
+    fun startOrResumeVoiceModelDownload(modelId: String) {
+        voiceModelDownloader.startOrResumeDownload(modelId)
+    }
+
+    fun pauseVoiceModelDownload(modelId: String) {
+        voiceModelDownloader.pauseDownload(modelId)
+    }
+
+    fun cancelVoiceModelDownload(modelId: String) {
+        voiceModelDownloader.cancelAndClean(modelId)
+    }
+
+    fun activateVoiceModel(modelId: String) {
+        val ok = voiceModelDownloader.activateModel(modelId)
+        viewModelScope.launch(Dispatchers.IO) {
+            vault.logAction(
+                "VOICE",
+                "Activate ONNX Pack",
+                if (ok) "Activated voice pack: $modelId" else "Activation failed (download incomplete): $modelId",
+                if (ok) 100 else 60,
+                if (ok) "OK" else "WARN"
+            )
+        }
+    }
+
+    fun deleteVoiceModel(modelId: String) {
+        voiceModelDownloader.deleteInstalledModel(modelId)
+        viewModelScope.launch(Dispatchers.IO) {
+            vault.logAction("VOICE", "Delete ONNX Pack", "Deleted $modelId storage cleanly", 100, "OK")
+        }
+    }
+
+    fun addCustomVoiceModelUrl(primaryUrl: String, displayName: String, companionUrl: String) {
+        val res = voiceModelDownloader.addCustomUrlBundle(
+            primaryUrl = primaryUrl,
+            displayName = displayName,
+            companionUrl = companionUrl.ifBlank { null },
+            autoStartDownload = true
+        )
+        res.onFailure { err ->
+            viewModelScope.launch(Dispatchers.Main) {
+                Toast.makeText(ctx, err.message ?: "Invalid voice pack URL", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    fun importLocalVoiceModelFile(uri: Uri) {
+        voiceModelDownloader.importLocalFile(uri) { result ->
+            viewModelScope.launch(Dispatchers.Main) {
+                result.onSuccess { bundle ->
+                    Toast.makeText(ctx, "Imported ${bundle.displayName}", Toast.LENGTH_SHORT).show()
+                }.onFailure { err ->
+                    Toast.makeText(ctx, err.message ?: "Import failed", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    fun importReferenceVoiceWav(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = voicePackManager.importReferenceVoiceWav(uri)
+            result.onSuccess { desc ->
+                vault.logAction("VOICE", "Import reference_voice.wav", "Loaded ${desc.displayName} into files/voice_pack/", 100, "OK")
+                launch(Dispatchers.Main) {
+                    Toast.makeText(ctx, "Active voice pack: ${desc.displayName}", Toast.LENGTH_SHORT).show()
+                }
+            }.onFailure { err ->
+                vault.logAction("VOICE", "Import WAV Failed", err.message ?: "Invalid WAV", 60, "WARN")
+                launch(Dispatchers.Main) {
+                    Toast.makeText(ctx, err.message ?: "Invalid WAV file (16kHz/24kHz mono required)", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
     }
 
     fun toggleVirtualDisplay(enable: Boolean) {
@@ -549,6 +644,30 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             sendCommand("Camera Live-Eye ne yeh text dekha hai, isey Hinglish mein samjhao: ${trimmed.take(400)}", speakReply = true)
         }
+    }
+
+    fun savePersonaConfig(config: GokuPersonaConfig) {
+        viewModelScope.launch(Dispatchers.IO) {
+            personaEngine.savePersonaConfig(config)
+        }
+    }
+
+    fun applyPersonaPreset(presetId: PersonaPresetId) {
+        viewModelScope.launch(Dispatchers.IO) {
+            personaEngine.applyPreset(presetId)
+        }
+    }
+
+    fun testPersonaVoice(config: GokuPersonaConfig) {
+        val clean = config.sanitized()
+        val preview = personaEngine.buildVoicePreviewSample(clean)
+        val prosody = personaEngine.computeProsody(
+            feeling = preview.detectedFeeling,
+            mood = _uiState.value.emotionState.lastUserMood,
+            config = clean
+        )
+        GokuKillSwitch.reset()
+        voiceEngine.speak(preview.cleanText, urgent = false, flushQueue = true, prosodyOverride = prosody)
     }
 
     fun updateSettings(updated: GokuSettingsSnapshot) {
@@ -717,7 +836,18 @@ class MainActivity : ComponentActivity() {
                         onPauseModelDownload = { viewModel.pauseOfflineModelDownload() },
                         onResumeModelDownload = { viewModel.resumeOfflineModelDownload() },
                         onDeleteOfflineModel = { viewModel.deleteOfflineModel() },
-                        onImportLocalModelUri = { uri -> viewModel.importLocalOfflineModel(uri) }
+                        onImportLocalModelUri = { uri -> viewModel.importLocalOfflineModel(uri) },
+                        onSavePersonaConfig = { cfg -> viewModel.savePersonaConfig(cfg) },
+                        onApplyPersonaPreset = { preset -> viewModel.applyPersonaPreset(preset) },
+                        onTestPersonaVoice = { cfg -> viewModel.testPersonaVoice(cfg) },
+                        onDownloadVoiceModel = { id -> viewModel.startOrResumeVoiceModelDownload(id) },
+                        onPauseVoiceModel = { id -> viewModel.pauseVoiceModelDownload(id) },
+                        onCancelVoiceModel = { id -> viewModel.cancelVoiceModelDownload(id) },
+                        onActivateVoiceModel = { id -> viewModel.activateVoiceModel(id) },
+                        onDeleteVoiceModel = { id -> viewModel.deleteVoiceModel(id) },
+                        onAddCustomVoiceUrl = { url, name, comp -> viewModel.addCustomVoiceModelUrl(url, name, comp) },
+                        onImportLocalVoiceFile = { uri -> viewModel.importLocalVoiceModelFile(uri) },
+                        onImportReferenceWav = { uri -> viewModel.importReferenceVoiceWav(uri) }
                     )
                 )
             }

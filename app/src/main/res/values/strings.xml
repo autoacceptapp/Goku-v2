@@ -12,5 +12,6 @@
     <string name="tab_core">Core</string>
     <string name="tab_setup">Setup</string>
     <string name="tab_studio">Studio</string>
+    <string name="tab_persona">Persona</string>
     <string name="tab_vault">Vault</string>
 </resources>

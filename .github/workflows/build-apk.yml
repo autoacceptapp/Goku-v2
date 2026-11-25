@@ -46,6 +46,14 @@ jobs:
           gradle-version: '9.3.1'
           cache-read-only: false
 
+      - name: Cache Robolectric Android SDK Jars
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/robolectric
+          key: robolectric-sdk-cache-v1-${{ hashFiles('gradle/libs.versions.toml', 'app/build.gradle.kts') }}
+          restore-keys: |
+            robolectric-sdk-cache-v1-
+
       - name: Restore Cached CI Debug Keystore
         uses: actions/cache@v4
         with:

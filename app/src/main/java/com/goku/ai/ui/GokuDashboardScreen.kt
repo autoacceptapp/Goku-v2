@@ -164,7 +164,12 @@ import com.goku.ai.data.ExpenseRecordEntity
 import com.goku.ai.data.LearnedSkillEntity
 import com.goku.ai.data.MemoryNodeEntity
 import com.goku.ai.data.ScreenTimelineEntity
+import com.goku.ai.persona.EmotionEngineState
+import com.goku.ai.persona.GokuPersonaConfig
+import com.goku.ai.persona.PersonaPresetId
+import com.goku.ai.voice.ModelDownloadProgress
 import com.goku.ai.voice.VoiceEngineState
+import com.goku.ai.voice.VoiceModelBundle
 import com.google.mlkit.vision.common.InputImage
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -329,7 +334,11 @@ data class GokuDashboardUiState(
     val pluginOutput: String = "",
     val isVirtualDisplayActive: Boolean = false,
     val activeVirtualDisplayId: Int? = null,
-    val suggestedHabit: String? = null
+    val suggestedHabit: String? = null,
+    val emotionState: EmotionEngineState = EmotionEngineState(),
+    val voiceModelBundles: List<VoiceModelBundle> = emptyList(),
+    val voiceDownloadProgress: Map<String, ModelDownloadProgress> = emptyMap(),
+    val activeVoiceModelId: String? = null
 )
 
 data class GokuDashboardCallbacks(
@@ -367,7 +376,18 @@ data class GokuDashboardCallbacks(
     val onPauseModelDownload: () -> Unit = {},
     val onResumeModelDownload: () -> Unit = {},
     val onDeleteOfflineModel: () -> Unit = {},
-    val onImportLocalModelUri: (Uri) -> Unit = {}
+    val onImportLocalModelUri: (Uri) -> Unit = {},
+    val onSavePersonaConfig: (GokuPersonaConfig) -> Unit = {},
+    val onApplyPersonaPreset: (PersonaPresetId) -> Unit = {},
+    val onTestPersonaVoice: (GokuPersonaConfig) -> Unit = {},
+    val onDownloadVoiceModel: (String) -> Unit = {},
+    val onPauseVoiceModel: (String) -> Unit = {},
+    val onCancelVoiceModel: (String) -> Unit = {},
+    val onActivateVoiceModel: (String) -> Unit = {},
+    val onDeleteVoiceModel: (String) -> Unit = {},
+    val onAddCustomVoiceUrl: (String, String, String) -> Unit = { _, _, _ -> },
+    val onImportLocalVoiceFile: (Uri) -> Unit = {},
+    val onImportReferenceWav: (Uri) -> Unit = {}
 )
 
 // ============================================================================
@@ -387,6 +407,7 @@ fun GokuDashboardScreen(
         Triple(stringResource(R.string.tab_core), Icons.Filled.Hub, "tab_core"),
         Triple(stringResource(R.string.tab_setup), Icons.Filled.Security, "tab_setup"),
         Triple(stringResource(R.string.tab_studio), Icons.Filled.BugReport, "tab_studio"),
+        Triple(stringResource(R.string.tab_persona), Icons.Filled.AutoAwesome, "tab_persona"),
         Triple(stringResource(R.string.tab_vault), Icons.Filled.Memory, "tab_vault")
     )
 
@@ -444,7 +465,13 @@ fun GokuDashboardScreen(
                     onOpenAdbDialog = { showAdbPairDialog = true }
                 )
                 2 -> GokuStudioDebuggerTab(uiState = uiState, callbacks = callbacks)
-                3 -> VaultAndSettingsTab(uiState = uiState, callbacks = callbacks)
+                3 -> PersonaStudioScreen(
+                    emotionState = uiState.emotionState,
+                    onSaveConfig = callbacks.onSavePersonaConfig,
+                    onApplyPreset = callbacks.onApplyPersonaPreset,
+                    onTestVoiceAndFeeling = callbacks.onTestPersonaVoice
+                )
+                4 -> VaultAndSettingsTab(uiState = uiState, callbacks = callbacks)
             }
         }
     }
@@ -1701,6 +1728,25 @@ private fun VaultAndSettingsTab(
                 isLoadedInRam = uiState.isLocalModelLoaded,
                 downloadState = uiState.modelDownloadState,
                 callbacks = callbacks
+            )
+        }
+
+        // 1-Tap ONNX Voice & KWS Pack Downloader (HTTP Range Resume + Atomic .part + Custom URL/SAF Import)
+        item {
+            ModelManagerSection(
+                bundles = uiState.voiceModelBundles,
+                progressMap = uiState.voiceDownloadProgress,
+                activeModelId = uiState.activeVoiceModelId,
+                activeVoicePackLabel = uiState.voiceState.activeVoicePackName,
+                customVoiceState = uiState.voiceState.customVoiceState,
+                onDownloadOrResume = callbacks.onDownloadVoiceModel,
+                onPause = callbacks.onPauseVoiceModel,
+                onCancel = callbacks.onCancelVoiceModel,
+                onActivate = callbacks.onActivateVoiceModel,
+                onDelete = callbacks.onDeleteVoiceModel,
+                onAddCustomUrl = callbacks.onAddCustomVoiceUrl,
+                onImportLocalUri = callbacks.onImportLocalVoiceFile,
+                onImportReferenceWav = callbacks.onImportReferenceWav
             )
         }
 

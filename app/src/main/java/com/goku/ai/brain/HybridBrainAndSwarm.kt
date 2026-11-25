@@ -25,6 +25,7 @@ import com.goku.ai.body.UniversalAppPilot
 import com.goku.ai.data.GokuVaultRepository
 import com.goku.ai.data.MemoryNodeEntity
 import com.goku.ai.data.RagChunk
+import com.goku.ai.persona.GokuEmotionPersonaEngine
 import com.goku.ai.voice.GokuEarAndVoiceEngine
 import com.goku.ai.voice.GokuKillSwitch
 import com.google.mediapipe.tasks.genai.llminference.LlmInference
@@ -192,7 +193,12 @@ object DynamicContextCompressor {
         return tokens.joinToString(" | ").take(maxChars)
     }
 
-    fun buildMicroSystemPrompt(screenSummary: String, workingContext: String, memoryHint: String): String {
+    fun buildMicroSystemPrompt(
+        screenSummary: String,
+        workingContext: String,
+        memoryHint: String,
+        personaDirective: String = ""
+    ): String {
         val sb = StringBuilder()
         sb.append("You are Goku V10.1 (10.1-godmode), a Jarvis-style personal AI agent on Android. ")
         sb.append("ALWAYS respond with ONLY a single valid compact JSON object (no markdown fences, no extra text): ")
@@ -205,6 +211,7 @@ object DynamicContextCompressor {
         sb.append("ALARM -> target=HH:MM (24h); ")
         sb.append("TORCH -> target=on or off; ")
         sb.append("CHAT -> general Q&A, memory recall, or when no device action is requested. ")
+        if (personaDirective.isNotBlank()) sb.append(personaDirective).append(" ")
         if (memoryHint.isNotBlank()) sb.append("Vault & RAG facts: ").append(memoryHint.take(480)).append(". ")
         if (screenSummary.isNotBlank()) sb.append("Screen: ").append(compressScreenTree(screenSummary, 240)).append(". ")
         if (workingContext.isNotBlank()) sb.append("Recent: ").append(workingContext.take(280))
@@ -215,13 +222,15 @@ object DynamicContextCompressor {
         userPrompt: String,
         memoryHint: String,
         workingContext: String,
-        screenSummary: String
+        screenSummary: String,
+        personaDirective: String = ""
     ): String {
         val sb = StringBuilder()
         sb.append("System: You are Goku V10.1 (10.1-godmode), an offline Android AI assistant. ")
         sb.append("Respond ONLY with valid compact JSON: ")
         sb.append("{\"action\":\"CHAT|CALL|SMS|OPEN_APP|ALARM|TORCH|VIRTUAL_APP\",\"target\":\"\",\"message\":\"\",\"reply\":\"concise Hinglish reply\"}. ")
         sb.append("Use CHAT unless user explicitly asks to call, send sms, open an app, run app in background (VIRTUAL_APP), set alarm, or toggle torch.\n")
+        if (personaDirective.isNotBlank()) sb.append("Persona: ").append(personaDirective).append("\n")
         if (memoryHint.isNotBlank()) sb.append("Vault: ").append(memoryHint.take(260)).append("\n")
         if (screenSummary.isNotBlank()) sb.append("Screen: ").append(compressScreenTree(screenSummary, 160)).append("\n")
         if (workingContext.isNotBlank()) sb.append("Context: ").append(workingContext.take(200)).append("\n")
@@ -1009,7 +1018,8 @@ class OnDeviceLlmEngine(
         userPrompt: String,
         memories: List<MemoryNodeEntity>,
         ragHits: List<RagChunk>,
-        screenSummary: String
+        screenSummary: String,
+        personaDirective: String = ""
     ): OnDeviceLlmResult = withContext(Dispatchers.IO) {
         val modelFile = resolveActiveModelFile()
         if (modelFile != null) {
@@ -1020,7 +1030,8 @@ class OnDeviceLlmEngine(
                 userPrompt = userPrompt,
                 memoryHint = combinedHint,
                 workingContext = vault.workingMemory.buildCompressedContext(),
-                screenSummary = screenSummary
+                screenSummary = screenSummary,
+                personaDirective = personaDirective
             )
 
             val rawLlmOutput = runMediaPipeInference(modelFile, structuredPrompt)
@@ -1355,6 +1366,7 @@ class HybridBrainAndSwarm(
 
     private val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
     private val commandMutex = Mutex()
+    val personaEngine: GokuEmotionPersonaEngine = GokuEmotionPersonaEngine.getInstance(context)
 
     @Volatile
     private var torchEnabled = false
@@ -1504,9 +1516,12 @@ class HybridBrainAndSwarm(
                     _pendingConfirmation.value = null
                 }
 
-                // Resolve pronouns against 15-turn Working Memory
+                // Resolve pronouns against 15-turn Working Memory & run 0ms offline Mood Analyzer
                 val resolvedInput = vault.workingMemory.resolvePronouns(trimmed)
                 vault.workingMemory.addTurn("USER", resolvedInput)
+                val speechMetrics = voiceEngine.consumeLastSpeechProsodyMetrics()
+                val moodResult = personaEngine.analyzeUserMood(resolvedInput, speechMetrics)
+                val personaDirective = personaEngine.buildPersonaPromptDirective(moodResult)
 
                 _brainState.value = BrainVisualState.THINKING
                 val dryRun = vault.settings.dryRunMode
@@ -1517,13 +1532,15 @@ class HybridBrainAndSwarm(
                 val reflexResult = tryFastReflex(resolvedInput, dryRun)
                 if (GokuKillSwitch.isStopped.value) return@withLock "Stopped."
                 if (reflexResult != null) {
-                    val (reply, badge, confidence) = reflexResult
+                    val (rawReply, badge, confidence) = reflexResult
+                    val (adaptedReply, feeling) = personaEngine.adaptReflexReplyForMood(rawReply, moodResult.mood)
+                    val prosody = personaEngine.computeProsody(feeling, moodResult.mood)
                     val elapsed = System.currentTimeMillis() - startMs
-                    vault.logAction("REFLEX", resolvedInput, reply, confidence, if (dryRun) "DRY_RUN" else "OK", elapsed)
-                    vault.workingMemory.addTurn("GOKU", reply)
-                    appendGokuMessage(reply, badge, confidence)
-                    if (speakReply) voiceEngine.speak(reply)
-                    return@withLock reply
+                    vault.logAction("REFLEX", resolvedInput, adaptedReply, confidence, if (dryRun) "DRY_RUN" else "OK", elapsed)
+                    vault.workingMemory.addTurn("GOKU", adaptedReply)
+                    appendGokuMessage(adaptedReply, badge, confidence)
+                    if (speakReply) voiceEngine.speak(adaptedReply, prosodyOverride = prosody)
+                    return@withLock adaptedReply
                 }
 
                 // --------------------------------------------------------------------
@@ -1546,11 +1563,13 @@ class HybridBrainAndSwarm(
                     val skillMs = System.currentTimeMillis() - skillStart
                     val usedAdb = !adbEngine.useAccessibilityFallback.value
                     vault.recordSkillBenchmark(matchedSkill, usedAdb, skillMs, ok)
-                    val reply = if (ok) "Skill '${matchedSkill.name}' complete (${skillMs}ms): $detail"
+                    val rawSkillReply = if (ok) "Skill '${matchedSkill.name}' complete (${skillMs}ms): $detail"
                     else "Skill '${matchedSkill.name}' partial issue: $detail"
+                    val (reply, skillFeeling) = personaEngine.adaptReflexReplyForMood(rawSkillReply, moodResult.mood)
+                    val skillProsody = personaEngine.computeProsody(skillFeeling, moodResult.mood)
                     vault.logAction("EXECUTOR", "Skill:${matchedSkill.name}", reply, if (ok) 96 else 65, if (ok) "OK" else "WARN", skillMs)
                     appendGokuMessage(reply, "SKILL-MACRO", if (ok) 96 else 65)
-                    if (speakReply) voiceEngine.speak(reply)
+                    if (speakReply) voiceEngine.speak(reply, prosodyOverride = skillProsody)
                     return@withLock reply
                 }
 
@@ -1566,22 +1585,23 @@ class HybridBrainAndSwarm(
                 val systemPrompt = DynamicContextCompressor.buildMicroSystemPrompt(
                     screenSummary = screenSummary,
                     workingContext = vault.workingMemory.buildCompressedContext(),
-                    memoryHint = combinedVaultHint
+                    memoryHint = combinedVaultHint,
+                    personaDirective = personaDirective
                 )
 
                 vault.logAction(
                     stage = "PLANNER",
                     command = resolvedInput,
-                    detail = "v10.1-godmode | Online=${isNetworkAvailable()}, LocalModel=${offlineLlm.isModelAvailable()}, VirtualDisplay=${adbEngine.virtualDisplayRunner.isActive.value}(#${adbEngine.virtualDisplayRunner.virtualDisplayId.value ?: -1}), Memories=${memories.size}, PersistentRAG=${ragHits.size}",
+                    detail = "v10.1-godmode | Mood=${moodResult.mood.name} | Online=${isNetworkAvailable()}, LocalModel=${offlineLlm.isModelAvailable()}, VirtualDisplay=${adbEngine.virtualDisplayRunner.isActive.value}(#${adbEngine.virtualDisplayRunner.virtualDisplayId.value ?: -1}), Memories=${memories.size}, PersistentRAG=${ragHits.size}",
                     confidence = 92,
                     status = "OK"
                 )
 
                 val structuredResult: OnDeviceLlmResult = if (isNetworkAvailable()) {
                     onlineRouter.queryWithFailover(resolvedInput, systemPrompt)
-                        ?: offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary)
+                        ?: offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary, personaDirective)
                 } else {
-                    offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary)
+                    offlineLlm.generateOfflineResponse(resolvedInput, memories, ragHits, screenSummary, personaDirective)
                 }
 
                 if (GokuKillSwitch.isStopped.value) return@withLock "Stopped."
@@ -1595,16 +1615,32 @@ class HybridBrainAndSwarm(
                     return@withLock lockMsg
                 }
 
-                val (aiReply, providerBadge) = executeStructuredAction(structuredResult, resolvedInput, dryRun)
+                val (rawAiReply, providerBadge) = executeStructuredAction(structuredResult, resolvedInput, dryRun)
                 if (GokuKillSwitch.isStopped.value) return@withLock "Stopped."
+
+                // Strip LLM emotion tags ([EXCITED]/[CARING]/[SERIOUS]/[PLAYFUL]) & map to live TTS prosody
+                val parsedEmotion = personaEngine.parseAndStripEmotionTag(rawAiReply, moodResult.mood)
+                val finalReply = if (!parsedEmotion.hadExplicitTag && providerBadge.startsWith("OFFLINE-BUILT-IN")) {
+                    personaEngine.adaptReflexReplyForMood(parsedEmotion.cleanText, moodResult.mood).first
+                } else {
+                    parsedEmotion.cleanText
+                }
+                val voiceProsody = personaEngine.computeProsody(parsedEmotion.detectedFeeling, moodResult.mood)
 
                 // Critic verification pass
                 val elapsed = System.currentTimeMillis() - startMs
-                vault.logAction("CRITIC", resolvedInput, "Action=${structuredResult.action} verified via $providerBadge", 94, "OK", elapsed)
-                vault.workingMemory.addTurn("GOKU", aiReply)
-                appendGokuMessage(aiReply, providerBadge, 94)
-                if (speakReply) voiceEngine.speak(aiReply)
-                aiReply
+                vault.logAction(
+                    "CRITIC",
+                    resolvedInput,
+                    "Action=${structuredResult.action} verified via $providerBadge | Mood=${moodResult.mood.name} -> Feeling=${parsedEmotion.detectedFeeling.name}",
+                    94,
+                    "OK",
+                    elapsed
+                )
+                vault.workingMemory.addTurn("GOKU", finalReply)
+                appendGokuMessage(finalReply, providerBadge, 94)
+                if (speakReply) voiceEngine.speak(finalReply, prosodyOverride = voiceProsody)
+                finalReply
             } finally {
                 if (!GokuKillSwitch.isStopped.value && _brainState.value != BrainVisualState.STOPPED) {
                     _brainState.value = BrainVisualState.IDLE

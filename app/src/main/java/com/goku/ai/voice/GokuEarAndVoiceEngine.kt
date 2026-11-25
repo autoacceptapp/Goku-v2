@@ -24,6 +24,8 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import androidx.core.content.ContextCompat
+import com.goku.ai.persona.SpeechProsodyMetrics
+import com.goku.ai.persona.VoiceProsodyProfile
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -150,7 +152,9 @@ data class VoiceEngineState(
     val isNativeKwsActive: Boolean = false,
     val isSherpaAarPresent: Boolean = false,
     val hasKwsOnnxModels: Boolean = false,
-    val isPostBootMicSilenced: Boolean = false
+    val isPostBootMicSilenced: Boolean = false,
+    val activeVoicePackName: String = "",
+    val customVoiceState: GokuCustomVoiceEngine.VoiceEngineState = GokuCustomVoiceEngine.VoiceEngineState.IDLE
 )
 
 typealias GokuVoiceState = VoiceEngineState
@@ -830,6 +834,29 @@ class GokuEarAndVoiceEngine(private val context: Context) {
     private var restartRunnable: Runnable? = null
     private val pendingUtterances = ConcurrentHashMap<String, CompletableDeferred<Unit>>()
     private val activeOneShotRecognizers = CopyOnWriteArrayList<SpeechRecognizer>()
+    @Volatile
+    private var lastSpeechStartMs: Long = 0L
+    @Volatile
+    private var lastSpeechPeakRmsDb: Double = -10.0
+    @Volatile
+    private var lastSpeechProsodyMetrics: SpeechProsodyMetrics? = null
+    @Volatile
+    private var activeVoicePack: ActiveVoicePackDescriptor? = null
+
+    val customVoiceEngine: GokuCustomVoiceEngine = GokuCustomVoiceEngine.getInstance(context.applicationContext)
+
+    fun setActiveVoicePack(descriptor: ActiveVoicePackDescriptor?) {
+        activeVoicePack = descriptor
+        _state.update { it.copy(activeVoicePackName = descriptor?.displayName.orEmpty()) }
+    }
+
+    fun getActiveVoicePack(): ActiveVoicePackDescriptor? = activeVoicePack
+
+    fun consumeLastSpeechProsodyMetrics(): SpeechProsodyMetrics? {
+        val metrics = lastSpeechProsodyMetrics
+        lastSpeechProsodyMetrics = null
+        return metrics
+    }
 
     private val lockScreenWakeWordEngine: LockScreenWakeWordEngine = LockScreenWakeWordEngine(
         context = context.applicationContext,
@@ -944,8 +971,47 @@ class GokuEarAndVoiceEngine(private val context: Context) {
 
     init {
         initTts()
+        attachCustomVoiceBridge()
         refreshWakeWordDiagnostics()
         GokuKillSwitch.registerStopHook(killSwitchStopHook)
+    }
+
+    private fun attachCustomVoiceBridge() {
+        customVoiceEngine.attachFallbackTtsBridge(
+            speaker = { text, urgent, flushQueue, prosody ->
+                speakViaAndroidTts(text, urgent, flushQueue, prosody)
+            },
+            stopper = {
+                stopAndroidTtsOnly()
+            },
+            onPlaybackChanged = { speaking, finishedNaturally ->
+                val stopped = GokuKillSwitch.isStopped.value
+                _state.update {
+                    it.copy(
+                        isSpeaking = speaking,
+                        tier = when {
+                            speaking -> EarTier.SPEAKING
+                            stopped -> EarTier.STOPPED
+                            else -> it.tier
+                        }
+                    )
+                }
+                if (speaking && continuousMode) {
+                    // Keep 24x7 AudioRecord barge-in / KWS ear active DURING custom AudioTrack speech
+                    lockScreenWakeWordEngine.resumeAfterRecognizer()
+                } else if (!speaking && finishedNaturally && continuousMode && !stopped) {
+                    // Open 6-second Continuous Talk window right after custom voice finishes naturally
+                    continuousWindowUntilMs = System.currentTimeMillis() + 6000L
+                    _state.update { it.copy(tier = EarTier.TIER3_CONTINUOUS_TALK) }
+                    scheduleRestartListening(200L)
+                }
+            }
+        )
+        engineScope.launch {
+            customVoiceEngine.engineState.collect { cState ->
+                _state.update { it.copy(customVoiceState = cState) }
+            }
+        }
     }
 
     fun refreshWakeWordDiagnostics() {
@@ -1064,7 +1130,8 @@ class GokuEarAndVoiceEngine(private val context: Context) {
     fun speak(
         text: String,
         urgent: Boolean = false,
-        flushQueue: Boolean = true
+        flushQueue: Boolean = true,
+        prosodyOverride: VoiceProsodyProfile? = null
     ) {
         if (text.isBlank()) return
         if (GokuKillSwitch.isStopped.value && !urgent) return
@@ -1078,17 +1145,54 @@ class GokuEarAndVoiceEngine(private val context: Context) {
             )
         }
 
+        val volumeGain = when {
+            urgent -> 1.0f
+            whisper -> 0.65f
+            nightSoft -> 0.45f
+            else -> 0.92f
+        }
+
+        // Route through pluggable Custom Voice Synthesis & AudioTrack streaming engine when a custom
+        // ONNX / reference_voice.wav pack is configured; falls back seamlessly to Hinglish Android TTS.
+        if (customVoiceEngine.hasCustomPackConfigured()) {
+            customVoiceEngine.speak(
+                text = text,
+                urgent = urgent,
+                flushQueue = flushQueue,
+                prosodyOverride = prosodyOverride,
+                volumeGain = volumeGain
+            )
+            return
+        }
+
+        speakViaAndroidTts(text, urgent, flushQueue, prosodyOverride)
+    }
+
+    private fun speakViaAndroidTts(
+        text: String,
+        urgent: Boolean,
+        flushQueue: Boolean,
+        prosodyOverride: VoiceProsodyProfile?
+    ) {
         val engine = tts
         if (!ttsReady || engine == null) return
 
-        // Natural Hinglish prosody adaptation
+        val whisper = isEarphoneConnected()
+        val nightSoft = isNightOrDnd()
+
+        // Natural Hinglish prosody adaptation blended with active Bi-Directional Emotion Engine
         val speechRate = when {
             urgent -> 1.12f
+            prosodyOverride != null -> prosodyOverride.speechRate.coerceIn(0.68f, 1.55f)
             whisper -> 0.96f
             nightSoft -> 0.92f
             else -> 1.03f
         }
-        val pitch = if (whisper || nightSoft) 0.95f else 1.02f
+        val pitch = when {
+            prosodyOverride != null -> prosodyOverride.pitch.coerceIn(0.68f, 1.45f)
+            whisper || nightSoft -> 0.95f
+            else -> 1.02f
+        }
         engine.setSpeechRate(speechRate)
         engine.setPitch(pitch)
 
@@ -1103,9 +1207,30 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         }
 
         val queueMode = if (flushQueue) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-        val utteranceId = "goku_${UUID.randomUUID()}"
+        val pauseCadenceMs = prosodyOverride?.pauseCadenceMs ?: 0L
+        val sentences = if (!urgent && pauseCadenceMs >= 160L) {
+            text.split(Regex("(?<=[.!?।])\\s+")).map { it.trim() }.filter { it.isNotEmpty() }
+        } else {
+            emptyList()
+        }
+
         runCatching {
-            engine.speak(text, queueMode, params, utteranceId)
+            if (sentences.size >= 2) {
+                sentences.forEachIndexed { idx, part ->
+                    val mode = if (idx == 0) queueMode else TextToSpeech.QUEUE_ADD
+                    engine.speak(part, mode, params, "goku_${UUID.randomUUID()}")
+                    if (idx < sentences.lastIndex) {
+                        engine.playSilentUtterance(
+                            pauseCadenceMs.coerceIn(60L, 420L),
+                            TextToSpeech.QUEUE_ADD,
+                            "goku_pause_${UUID.randomUUID()}"
+                        )
+                    }
+                }
+            } else {
+                val utteranceId = "goku_${UUID.randomUUID()}"
+                engine.speak(text, queueMode, params, utteranceId)
+            }
         }
     }
 
@@ -1264,6 +1389,11 @@ class GokuEarAndVoiceEngine(private val context: Context) {
     }
 
     fun stopSpeaking() {
+        customVoiceEngine.stopImmediately(invokeFallbackStopper = false)
+        stopAndroidTtsOnly()
+    }
+
+    private fun stopAndroidTtsOnly() {
         runCatching { tts?.stop() }
         pendingUtterances.values.forEach { it.complete(Unit) }
         pendingUtterances.clear()
@@ -1480,6 +1610,8 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                 override fun onReadyForSpeech(params: Bundle?) {}
 
                 override fun onBeginningOfSpeech() {
+                    lastSpeechStartMs = System.currentTimeMillis()
+                    lastSpeechPeakRmsDb = -10.0
                     // Barge-In: If Goku is speaking and user interrupts, stop TTS immediately
                     if (_state.value.isSpeaking) {
                         stopSpeaking()
@@ -1487,7 +1619,12 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                     _state.update { it.copy(tier = EarTier.TIER2_PREWARM_REFLEX) }
                 }
 
-                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onRmsChanged(rmsdB: Float) {
+                    val d = rmsdB.toDouble()
+                    if (d > lastSpeechPeakRmsDb) {
+                        lastSpeechPeakRmsDb = d
+                    }
+                }
                 override fun onBufferReceived(buffer: ByteArray?) {}
                 override fun onEndOfSpeech() {}
 
@@ -1595,6 +1732,17 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                     }
 
                     if (spoken.isNotBlank()) {
+                        val endMs = System.currentTimeMillis()
+                        val durationMs = if (lastSpeechStartMs > 0L) (endMs - lastSpeechStartMs).coerceAtLeast(350L) else null
+                        val wordCount = spoken.split(Regex("\\s+")).count { it.isNotBlank() }
+                        val wps = if (durationMs != null && wordCount > 0) {
+                            wordCount.toFloat() / (durationMs.toFloat() / 1000f)
+                        } else null
+                        lastSpeechProsodyMetrics = SpeechProsodyMetrics(
+                            speakingWordsPerSec = wps,
+                            peakEnergyDb = lastSpeechPeakRmsDb.takeIf { it > -9.5 },
+                            utteranceDurationMs = durationMs
+                        )
                         handleTranscript(spoken)
                     } else if (continuousMode && !GokuKillSwitch.isStopped.value) {
                         val locked = keyguardManager?.isKeyguardLocked == true
@@ -1687,6 +1835,7 @@ class GokuEarAndVoiceEngine(private val context: Context) {
         captureStartJob?.cancel()
         captureStartJob = null
         stopListening()
+        customVoiceEngine.release()
         engineScope.cancel()
         pendingUtterances.values.forEach { it.complete(Unit) }
         pendingUtterances.clear()
