@@ -898,29 +898,42 @@ class AntiTheftIntruderGuard(private val context: Context) {
         if ((now - lastAlertTimeMs) < ALERT_COOLDOWN_MS) return
         lastAlertTimeMs = now
         prefs.edit().putLong(KEY_LAST_ALERT_MS, now).apply()
+        val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val wakeLock = runCatching {
+            pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "goku:AirplaneIntruderGuard")?.apply {
+                setReferenceCounted(false)
+                acquire(15_000L)
+            }
+        }.getOrNull()
         scope.launch {
-            withTimeoutOrNull(8_500L) {
-                val vault = GokuVaultRepository.getInstance(context)
-                val sos = EmergencySosManager(context, vault)
-                val (photoFile, diagnosticReason) = captureSilentFrontCameraPhotoWithDiagnostic()
-                val photoPath = photoFile?.absolutePath
-                val gpsSummary = sos.getBestLastKnownLocationSummary()
-                if (photoPath != null) {
-                    prefs.edit().putString(KEY_LAST_PHOTO, photoPath).apply()
+            try {
+                withTimeoutOrNull(8_500L) {
+                    val vault = GokuVaultRepository.getInstance(context)
+                    val sos = EmergencySosManager(context, vault)
+                    val (photoFile, diagnosticReason) = captureSilentFrontCameraPhotoWithDiagnostic()
+                    val photoPath = photoFile?.absolutePath
+                    val gpsSummary = sos.getBestLastKnownLocationSummary()
+                    if (photoPath != null) {
+                        prefs.edit().putString(KEY_LAST_PHOTO, photoPath).apply()
+                    }
+                    val photoStatus = photoPath ?: (diagnosticReason ?: "unavailable")
+                    val logDetail = "Lock-screen Airplane Mode attempt | GPS=$gpsSummary | Photo=$photoStatus"
+                    vault.logAction("SYSTEM", "Anti-Theft Airplane Guard", logDetail, 100, "WARN")
+                    vault.saveMemory("last_intruder_event", logDetail, category = "SECURITY")
+                    val smsReport = sos.triggerSosBeacon(
+                        customPrefix = "ANTI-THEFT ALERT (Goku V10.1): Airplane Mode toggled on lock screen! Photo=${photoFile?.name ?: "skipped"}."
+                    )
+                    _state.value = _state.value.copy(
+                        lastIntruderPhotoPath = photoPath ?: _state.value.lastIntruderPhotoPath,
+                        lastAlertTimestamp = System.currentTimeMillis(),
+                        lastAlertSummary = "$logDetail | $smsReport",
+                        isDeviceAdminActive = isDeviceAdminActive()
+                    )
                 }
-                val photoStatus = photoPath ?: (diagnosticReason ?: "unavailable")
-                val logDetail = "Lock-screen Airplane Mode attempt | GPS=$gpsSummary | Photo=$photoStatus"
-                vault.logAction("SYSTEM", "Anti-Theft Airplane Guard", logDetail, 100, "WARN")
-                vault.saveMemory("last_intruder_event", logDetail, category = "SECURITY")
-                val smsReport = sos.triggerSosBeacon(
-                    customPrefix = "ANTI-THEFT ALERT (Goku V10.1): Airplane Mode toggled on lock screen! Photo=${photoFile?.name ?: "skipped"}."
-                )
-                _state.value = _state.value.copy(
-                    lastIntruderPhotoPath = photoPath ?: _state.value.lastIntruderPhotoPath,
-                    lastAlertTimestamp = System.currentTimeMillis(),
-                    lastAlertSummary = "$logDetail | $smsReport",
-                    isDeviceAdminActive = isDeviceAdminActive()
-                )
+            } finally {
+                runCatching {
+                    if (wakeLock?.isHeld == true) wakeLock.release()
+                }
             }
         }
     }

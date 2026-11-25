@@ -847,6 +847,8 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                         partialTranscript = phrase
                     )
                 }
+                // Speculative Pre-Warming: pre-read UI tree & network state before command finishes
+                runCatching { onWakePreWarm?.invoke() }
                 startRecognizerCapture(openDirectWindow = true)
             }
         },
@@ -1545,6 +1547,11 @@ class GokuEarAndVoiceEngine(private val context: Context) {
                         GokuKillSwitch.triggerStop("Voice: $partial")
                         speak("Ruk gaya, sab band kar diya.", urgent = true)
                         return
+                    }
+
+                    // Speculative Pre-Warming on partial "Hey Goku" wake phrase
+                    if (containsWakePhrase(partial)) {
+                        runCatching { onWakePreWarm?.invoke() }
                     }
 
                     // Strict Wake-Word Gate: Drop background TV / ambient chatter immediately

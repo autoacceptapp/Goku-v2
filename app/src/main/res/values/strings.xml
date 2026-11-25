@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">Goku</string>
     <string name="accessibility_service_label">Goku Phone Body Pilot</string>
-    <string name="accessibility_service_description">Event-driven zero-polling screen vision, ad/popup skipper, OTP autopilot, mistake blocker, and teach-by-example automation for Goku V10.</string>
+    <string name="accessibility_service_description">Event-driven zero-polling screen vision, ad/popup skipper, OTP autopilot, mistake blocker, and teach-by-example automation for Goku V10.1.</string>
     <string name="notification_listener_label">Goku Notification &amp; Expense Brain</string>
     <string name="keep_alive_channel_name">Goku Core Nervous System</string>
     <string name="keep_alive_channel_desc">Keeps Goku voice ear, watchdog, and autonomous services active.</string>

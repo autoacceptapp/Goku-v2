@@ -73,7 +73,7 @@
             android:foregroundServiceType="microphone|specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="autonomous_voice_assistant_watchdog" />
+                android:value="autonomous_assistant_watchdog" />
         </service>
 
         <!-- Floating Jarvis Orb + Red STOP + Local ADB 6-Digit Pairing Overlay -->

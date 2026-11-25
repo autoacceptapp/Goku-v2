@@ -933,8 +933,17 @@ class OnDeviceLlmEngine(
             downloadManager.onModelChanged = null
         }
         cancelIdleUnloadTimer()
-        scope.launch { unloadNow() }
         scope.cancel()
+        // Run native LlmInference cleanup on an independent IO scope so cancelling `scope`
+        // never aborts `llmInference?.close()` and leaks ~600MB-1.5GB native RAM.
+        CoroutineScope(Dispatchers.IO).launch {
+            engineMutex.withLock {
+                runCatching { llmInference?.close() }
+                llmInference = null
+                loadedModelPath = null
+                _isLoadedInRam.value = false
+            }
+        }
     }
 
     private fun resolveActiveModelFile(): File? {
@@ -1058,7 +1067,12 @@ class OnDeviceLlmEngine(
                 _isLoadedInRam.value = false
                 null
             } finally {
-                if (llmInference != null && !GokuKillSwitch.isStopped.value) {
+                if (GokuKillSwitch.isStopped.value) {
+                    runCatching { llmInference?.close() }
+                    llmInference = null
+                    loadedModelPath = null
+                    _isLoadedInRam.value = false
+                } else if (llmInference != null) {
                     scheduleFifteenSecondIdleUnload()
                 }
             }
