@@ -845,4 +845,50 @@ class GokuCoreUnitTest {
         packManager.deleteLocalVoicePackFiles()
         Unit
     }
+
+    @Test
+    fun testTtsPendingUtteranceQueuesSafelyBeforeInitAndClearsOnKillSwitch() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val voice = GokuEarAndVoiceEngine(context)
+        try {
+            GokuKillSwitch.reset()
+            // Under Robolectric, TextToSpeech binder onInit does not complete immediately;
+            // speak() must queue safely without throwing or silently losing the utterance.
+            voice.speak("Namaste Boss, Goku online hai!")
+            assertTrue(
+                "Expected pending TTS utterance to be queued while TTS init is pending",
+                voice.hasPendingTtsUtteranceForTest()
+            )
+
+            // Instant kill-switch must clear queued pending speech immediately without exception
+            GokuKillSwitch.triggerStop("UnitTestTtsPendingClear")
+            assertFalse(
+                "Expected pending TTS utterance to be cleared immediately on GokuKillSwitch",
+                voice.hasPendingTtsUtteranceForTest()
+            )
+
+            // Non-urgent speech while stopped must be ignored and NOT re-queued
+            voice.speak("Should not speak while stopped", urgent = false)
+            assertFalse(
+                "Non-urgent speech must not queue while GokuKillSwitch is active",
+                voice.hasPendingTtsUtteranceForTest()
+            )
+
+            // Urgent stop confirmation speech is allowed even while stopped
+            voice.speak("Ruk gaya, sab band kar diya.", urgent = true)
+            assertTrue(
+                "Urgent confirmation speech should queue/attempt TTS even while stopped",
+                voice.hasPendingTtsUtteranceForTest()
+            )
+
+            // Explicit stopSpeaking() clears pending utterance cleanly
+            voice.stopSpeaking()
+            assertFalse(
+                "stopSpeaking() must clear pending TTS utterance",
+                voice.hasPendingTtsUtteranceForTest()
+            )
+        } finally {
+            voice.release()
+        }
+    }
 }
