@@ -891,4 +891,69 @@ class GokuCoreUnitTest {
             voice.release()
         }
     }
+
+    @Test
+    fun testWakePhraseVariantsAndOfflineHinglishReplies() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val voice = GokuEarAndVoiceEngine(context)
+        try {
+            val validWakeSamples = listOf(
+                "hey goku torch on",
+                "ok goku",
+                "hi goku time batao",
+                "goku",
+                "hey gokul open whatsapp",
+                "ok gokul battery batao",
+                "hey gogu kya haal hai",
+                "hey koku joke sunao",
+                "a goku alarm lagao",
+                "हे गोकू लाइट जलाओ",
+                "हे गोकु समय बताओ",
+                "हे गोकुल",
+                "गोकू",
+                "गोकु मदद करो",
+                "गोकुल आज कौन सा दिन है"
+            )
+            validWakeSamples.forEach { sample ->
+                assertTrue("Expected wake match for: $sample", voice.containsWakePhrase(sample))
+            }
+            assertFalse(voice.containsWakePhrase("aaj ka cricket match bahut zabardast hai"))
+
+            assertEquals("open whatsapp", voice.stripWakePrefix("Hey Gokul, open whatsapp"))
+            assertEquals("kya haal hai", voice.stripWakePrefix("hey gogu kya haal hai"))
+            assertEquals("joke sunao", voice.stripWakePrefix("hey koku joke sunao"))
+            assertEquals("alarm lagao", voice.stripWakePrefix("a goku alarm lagao"))
+            assertEquals("लाइट जलाओ", voice.stripWakePrefix("हे गोकू लाइट जलाओ"))
+            assertEquals("समय बताओ", voice.stripWakePrefix("हे गोकु समय बताओ"))
+            assertEquals("", voice.stripWakePrefix("हे गोकुल"))
+            assertEquals("", voice.stripWakePrefix("Goku"))
+        } finally {
+            voice.release()
+        }
+
+        val vault = GokuVaultRepository(context)
+        val offlineLlm = com.goku.ai.brain.OnDeviceLlmEngine(
+            context,
+            vault,
+            OfflineModelDownloadManager.getInstance(context)
+        )
+        val haalReply = offlineLlm.generateOfflineResponse("kya haal hai", emptyList(), emptyList(), "").reply
+        assertTrue("Expected warm Hinglish reply for kya haal hai, got: $haalReply", haalReply.contains("mast", ignoreCase = true))
+
+        val badhiyaReply = offlineLlm.generateOfflineResponse("sab badhiya", emptyList(), emptyList(), "").reply
+        assertTrue("Expected warm reply for sab badhiya, got: $badhiyaReply", badhiyaReply.contains("Shandar", ignoreCase = true))
+
+        val dateReply = offlineLlm.generateOfflineResponse("aaj kaun sa din hai", emptyList(), emptyList(), "").reply
+        assertTrue("Expected date reply for din, got: $dateReply", dateReply.startsWith("Aaj "))
+
+        val batteryReply = offlineLlm.generateOfflineResponse("battery kitni hai", emptyList(), emptyList(), "").reply
+        assertTrue("Expected battery reply, got: $batteryReply", batteryReply.contains("battery", ignoreCase = true))
+
+        val jokeReply = offlineLlm.generateOfflineResponse("ek joke sunao", emptyList(), emptyList(), "").reply
+        assertFalse("Joke reply should not fall back to generic setup text", jokeReply.contains("Vault tab"))
+
+        val helpReply = offlineLlm.generateOfflineResponse("madad karo", emptyList(), emptyList(), "").reply
+        assertTrue("Expected quick command examples in help reply, got: $helpReply", helpReply.contains("Torch on"))
+        Unit
+    }
 }

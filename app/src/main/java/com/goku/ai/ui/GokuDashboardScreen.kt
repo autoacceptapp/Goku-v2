@@ -804,7 +804,7 @@ private fun CoreCommandTab(
             GokuCoreOrb(
                 visualState = when {
                     uiState.isKillSwitchStopped -> BrainVisualState.STOPPED
-                    uiState.voiceState.isListening -> BrainVisualState.LISTENING
+                    uiState.voiceState.isSpeechRecognizerActive -> BrainVisualState.LISTENING
                     else -> uiState.brainState
                 },
                 onClick = callbacks.onToggleListening,
@@ -818,31 +818,48 @@ private fun CoreCommandTab(
                     .weight(1f)
                     .padding(horizontal = 12.dp)
             ) {
+                val voiceError = uiState.voiceState.lastError?.takeIf { it.isNotBlank() }
                 val stateLabel = when {
                     uiState.isKillSwitchStopped -> "STOPPED (${uiState.lastStopSource.ifBlank { "Manual" }})"
-                    uiState.voiceState.isListening -> "LISTENING • ${uiState.voiceState.tier.name}"
+                    uiState.voiceState.isSpeechRecognizerActive -> "Listening... Bolo boss"
                     uiState.brainState == BrainVisualState.THINKING -> "SWARM THINKING..."
                     uiState.brainState == BrainVisualState.ACTING -> "EXECUTING BODY ACTION..."
+                    uiState.voiceState.isAcousticEarArmed -> "ARMED • Tap Orb or say 'Hey Goku'"
                     else -> "READY • Tap Orb or say 'Hey Goku'"
+                }
+                val stateColor = when {
+                    uiState.isKillSwitchStopped -> GokuCrimson
+                    uiState.voiceState.isSpeechRecognizerActive -> GokuCyan
+                    else -> GokuTextPrimary
                 }
                 Text(
                     text = stateLabel,
                     style = MaterialTheme.typography.titleSmall,
-                    color = if (uiState.isKillSwitchStopped) GokuCrimson else GokuTextPrimary,
+                    color = stateColor,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
                 Spacer(Modifier.height(4.dp))
-                val subInfo = uiState.voiceState.partialTranscript.ifBlank {
-                    buildString {
+                val subInfo = when {
+                    voiceError != null -> voiceError
+                    uiState.voiceState.partialTranscript.isNotBlank() -> uiState.voiceState.partialTranscript
+                    else -> buildString {
                         append(if (uiState.voiceState.isWhisperMode) "Earphone Whisper ON • " else "Speaker Mode • ")
                         append(if (uiState.voiceState.isNightSoftMode) "Night Soft" else "Normal Vol")
                     }
                 }
+                val subColor = when {
+                    voiceError != null -> if (
+                        voiceError.contains("permission", ignoreCase = true) ||
+                        voiceError.contains("audio", ignoreCase = true)
+                    ) GokuCrimson else GokuAmber
+                    uiState.voiceState.partialTranscript.isNotBlank() -> GokuCyan
+                    else -> GokuTextMuted
+                }
                 Text(
                     text = subInfo,
                     style = MaterialTheme.typography.labelMedium,
-                    color = GokuTextMuted,
+                    color = subColor,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )

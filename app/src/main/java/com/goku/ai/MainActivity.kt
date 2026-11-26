@@ -367,8 +367,8 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleListening() {
         val vs = _uiState.value.voiceState
-        if (vs.isListening || vs.isAcousticEarArmed || vs.isSpeechRecognizerActive) {
-            voiceEngine.stopListening()
+        if (vs.isSpeechRecognizerActive) {
+            voiceEngine.cancelActiveRecognizerCapture()
         } else {
             GokuHeadlessCommandBus.startVoiceListeningIfPermitted(ctx, openDirectWindow = true)
         }
@@ -376,7 +376,7 @@ class GokuViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startListeningIfPermitted() {
         val vs = _uiState.value.voiceState
-        if (!vs.isListening && !vs.isAcousticEarArmed && !vs.isSpeechRecognizerActive) {
+        if (!vs.isSpeechRecognizerActive) {
             GokuHeadlessCommandBus.startVoiceListeningIfPermitted(ctx, openDirectWindow = true)
         }
     }
@@ -735,10 +735,11 @@ class MainActivity : ComponentActivity() {
         val anyGranted = permissionsMap.values.any { it }
         val deniedList = permissionsMap.filterValues { !it }.keys
 
+        val micNewlyGranted = permissionsMap[Manifest.permission.RECORD_AUDIO] == true
         if (micGranted || anyGranted) {
             GokuKeepAliveService.startSafe(this, isFromForeground = true)
         }
-        val shouldStartVoice = viewModel.pendingVoiceStartAfterPermission
+        val shouldStartVoice = viewModel.pendingVoiceStartAfterPermission || micNewlyGranted
         viewModel.pendingVoiceStartAfterPermission = false
         if (micGranted && shouldStartVoice) {
             viewModel.startListeningIfPermitted()

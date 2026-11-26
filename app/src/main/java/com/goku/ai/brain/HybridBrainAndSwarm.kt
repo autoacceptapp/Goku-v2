@@ -12,6 +12,7 @@ import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
 import android.provider.AlarmClock
 import android.provider.Settings
@@ -1116,13 +1117,53 @@ class OnDeviceLlmEngine(
 
         // 3. Natural Hindi/Hinglish Conversational & Command Parity
         val reply = when {
-            lower.contains("hello") || lower.contains("hi") || lower.contains("namaste") || lower.contains("kaise ho") ->
-                "Namaste boss! Main Goku V10.1 (10.1-godmode) hoon — 100% ready offline aur online dono mode mein. Bolo kya kaam karna hai?"
+            lower.contains("kya haal") || lower.contains("haal chaal") || lower.contains("kaise ho") || lower.contains("how are you") ->
+                "Main ekdum mast aur full power mein hoon boss! Aap batao, aaj kya kaam karna hai?"
+
+            lower.contains("sab badhiya") || lower.contains("sab thik") || lower.contains("sab theek") || lower.contains("all good") ->
+                "Shandar boss! Sun kar accha laga. Koi bhi command ho toh bas bol dena, main yahin hoon."
+
+            lower.contains("hello") || lower.contains("hi") || lower.contains("namaste") || lower == "hey" ->
+                "Namaste boss! Main Goku ready hoon — offline aur online dono mode mein. Bolo kya karna hai?"
+
+            lower.contains("date") || lower.contains("din") || lower.contains("tarikh") || lower.contains("tareekh") -> {
+                val today = SimpleDateFormat("EEEE, dd MMMM yyyy", Locale.getDefault()).format(Date())
+                "Aaj $today hai boss."
+            }
 
             lower.contains("time") || lower.contains("samay") || lower.contains("baje") -> {
                 val now = SimpleDateFormat("hh:mm a, EEEE dd MMM", Locale.getDefault()).format(Date())
                 "Abhi $now baj rahe hain boss."
             }
+
+            lower.contains("battery") || lower.contains("charge") -> {
+                val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+                val pct = runCatching { bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) }
+                    .getOrNull()
+                    ?.takeIf { it in 0..100 }
+                if (pct != null) {
+                    val tip = when {
+                        pct <= 20 -> " Charger laga lo boss, battery low ho rahi hai!"
+                        pct >= 85 -> " Full power ready hai!"
+                        else -> ""
+                    }
+                    "Abhi phone ki battery $pct% hai boss.$tip"
+                } else {
+                    "Battery level abhi read nahi ho paya, par 'Phone Doctor' bol kar poora device status dekh sakte ho boss."
+                }
+            }
+
+            lower.contains("joke") || lower.contains("chutkula") || lower.contains("hasao") || lower.contains("funny") -> {
+                val jokes = listOf(
+                    "Boss, phone ne mujhse kaha 'meri battery kam hai' — maine kaha fikar mat kar, Goku bina charger ke bhi Saiyan energy pe chalta hai!",
+                    "Ek programmer doctor ke paas gaya aur bola: 'Doctor sahab, neend nahi aati.' Doctor bola: 'Apna Wi-Fi off karo aur dark mode on karo!'",
+                    "Boss, mobile ki battery aur salary mein ek baat common hai — dono 100% se 10% kab pahunch jaate hain, pata hi nahi chalta!"
+                )
+                jokes[((System.currentTimeMillis() / 1000L) % jokes.size).toInt()]
+            }
+
+            lower.contains("madad") || lower.contains("help") || lower.contains("kya kar sakte") ->
+                "Boss, bas bolo: 'Torch on', 'Open WhatsApp', 'Call Mom', 'SMS bhejo', 'Alarm 7 baje', 'Time/Date/Battery batao', 'Screen padho', ya 'Goku stop'. Main bina internet ke bhi turant kaam kar dunga!"
 
             lower.contains("screen") && (lower.contains("padh") || lower.contains("read") || lower.contains("kya hai")) -> {
                 if (screenSummary.isNotBlank()) {
@@ -1133,13 +1174,13 @@ class OnDeviceLlmEngine(
             }
 
             lower.contains("kaun ho") || lower.contains("who are you") || lower.contains("capabilities") ->
-                "Main Goku V10.1 (10.1-godmode) hoon — aapka personal Jarvis agent. Main Qwen2.5/SmolLM2 offline AI, Camera Live-Eye Vision, torch, apps, calls, SMS, alarm, Local ADB Virtual Display, Accessibility taps, Headless WebView, OTP auto-fill, expense tracking, Anti-Theft Intruder Guard, aur Emergency SOS bina internet ke bhi chala sakta hoon."
+                "Main Goku V10.1 hoon — aapka personal offline-first voice assistant. Torch, apps, calls, SMS, alarms, screen reading, expenses aur SOS sab kuch hands-free chala sakta hoon."
 
             lower.contains("thank") || lower.contains("shukriya") || lower.contains("dhanyawad") ->
                 "Hamesha haazir hoon boss! Jab bhi zaroorat ho bas 'Hey Goku' bol dena."
 
             else ->
-                "Maine offline samjha: \"$userPrompt\". Full local AI chat ke liye Vault tab mein 'Latest Offline AI Brain (1-Tap Download)' se Qwen2.5 ya SmolLM2 download karein, ya directly phone commands bolein jaise 'Torch on', 'Open WhatsApp', 'Call Mom', 'SMS Mom hello', 'Expense summary', ya 'Phone Doctor'."
+                "Samjha boss: \"$userPrompt\". Direct commands bolein jaise 'Torch on', 'Open WhatsApp', 'Time/Date/Battery batao', 'Call Mom', ya full local AI chat ke liye Vault tab se offline model download karein."
         }
         return OnDeviceLlmResult(reply = reply, badge = "OFFLINE-NLU-FALLBACK")
     }
